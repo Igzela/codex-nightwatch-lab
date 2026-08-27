@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,29 +33,16 @@ def _json_depth(value: Any, depth: int = 0) -> int:
 
 
 def read_mailbox_json(store: NightwatchStore, name: str) -> Any | None:
-    path = store.mailbox_directory / name
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ValueError("mailbox entry cannot be inspected") from exc
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size > MAX_MAILBOX_BYTES:
-        raise ValueError("mailbox entry is not a safe regular file")
-    try:
-        # lstat alone is not enough: the workspace writer could replace the
-        # entry between inspection and open.  Linux O_NOFOLLOW keeps the
-        # mailbox boundary intact across that race.
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            opened = os.fstat(handle.fileno())
-            if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_MAILBOX_BYTES:
-                raise ValueError("mailbox entry changed while being opened")
-            value = json.load(handle)
+        raw = store.read_mailbox_file(name)
+        if raw is None:
+            return None
+        if len(raw) > MAX_MAILBOX_BYTES:
+            raise ValueError("mailbox entry is too large")
+        value = json.loads(raw.decode("utf-8"))
         _json_depth(value)
         return value
-    except (OSError, json.JSONDecodeError) as exc:
+    except (StateIntegrityError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("mailbox JSON is invalid") from exc
 
 

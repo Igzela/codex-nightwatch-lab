@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -105,8 +107,13 @@ class NightwatchStore:
     def __init__(self, repo: str | Path, state_home: str | Path | None = None):
         self.repo = Path(repo).resolve()
         self.repo_id = repo_identity(self.repo)
-        self.root = Path(state_home).resolve() if state_home else control_plane_root()
+        requested_root = Path(state_home).expanduser() if state_home else control_plane_root()
+        self.root = requested_root.resolve()
+        self._assert_control_plane_outside_workspace()
         self.directory = self.root / self.repo_id
+        if self.directory.resolve() != self.directory:
+            raise StateIntegrityError("trusted control plane directory must not be a symlink")
+        self._assert_path_outside_workspace(self.directory.resolve())
         self.legacy_directory = self.repo / ".nightwatch"
         self.mailbox_directory = self.repo / ".nightwatch-agent"
         self.state_path = self.directory / "state.json"
@@ -171,10 +178,13 @@ class NightwatchStore:
         with self.locked():
             if self.state_path.exists():
                 raise StateIntegrityError("a Nightwatch run already exists in this repository")
-            self.runs_path.mkdir(mode=0o700)
-            self.reports_path.mkdir(mode=0o700)
-            self.mailbox_directory.mkdir(mode=0o700, exist_ok=True)
-            self._write_json(self.mailbox_directory / "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
+            mailbox_fd = self._open_mailbox_directory(create=True)
+            try:
+                self.runs_path.mkdir(mode=0o700)
+                self.reports_path.mkdir(mode=0o700)
+                self._write_json_at(mailbox_fd, "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
+            finally:
+                os.close(mailbox_fd)
             self._write_text(self.goal_path, goal.rstrip() + "\n")
             self._write_json(self.policy_path, policy)
             self._write_json(self.acceptance_path, acceptance)
@@ -300,10 +310,115 @@ class NightwatchStore:
         return path
 
     def _ensure_directory(self) -> None:
+        self._assert_control_plane_outside_workspace()
+        self._assert_path_outside_workspace(self.directory.resolve())
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
+
+    def _assert_control_plane_outside_workspace(self) -> None:
+        self._assert_path_outside_workspace(self.root)
+
+    def _assert_path_outside_workspace(self, path: Path) -> None:
+        try:
+            inside = path == self.repo or path.is_relative_to(self.repo)
+        except ValueError:
+            inside = False
+        if inside:
+            raise StateIntegrityError("trusted control plane must be outside the Codex workspace")
+
+    def _open_mailbox_directory(self, create: bool = False) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        if create:
+            try:
+                os.mkdir(self.mailbox_directory, 0o700)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise StateIntegrityError("cannot create the Nightwatch mailbox directory") from exc
+        try:
+            info = os.lstat(self.mailbox_directory)
+        except FileNotFoundError as exc:
+            raise StateIntegrityError("Nightwatch mailbox directory is missing") from exc
+        except OSError as exc:
+            raise StateIntegrityError("Nightwatch mailbox directory cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise StateIntegrityError("Nightwatch mailbox directory must be a real directory")
+        try:
+            descriptor = os.open(self.mailbox_directory, flags)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(descriptor)
+                raise StateIntegrityError("Nightwatch mailbox directory is not a directory")
+            return descriptor
+        except StateIntegrityError:
+            raise
+        except OSError as exc:
+            raise StateIntegrityError("Nightwatch mailbox directory is unsafe") from exc
+
+    @staticmethod
+    def _mailbox_name(name: str) -> str:
+        if not isinstance(name, str) or not name or Path(name).name != name:
+            raise StateIntegrityError("invalid Nightwatch mailbox filename")
+        return name
+
+    def read_mailbox_file(self, name: str) -> bytes | None:
+        name = self._mailbox_name(name)
+        try:
+            directory_fd = self._open_mailbox_directory()
+        except StateIntegrityError as exc:
+            if "is missing" in str(exc):
+                return None
+            raise
+        try:
+            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            try:
+                descriptor = os.open(name, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return None
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_EVENT_BYTES:
+                    raise StateIntegrityError("unsafe Nightwatch mailbox file")
+                with os.fdopen(descriptor, "rb") as handle:
+                    descriptor = -1
+                    return handle.read(MAX_EVENT_BYTES + 1)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        except StateIntegrityError:
+            raise
+        except OSError as exc:
+            raise StateIntegrityError("Nightwatch mailbox file is unsafe") from exc
+        finally:
+            os.close(directory_fd)
+
+    @classmethod
+    def _write_json_at(cls, directory_fd: int, name: str, value: Any) -> None:
+        cls._write_text_at(directory_fd, name, json.dumps(redact(value), indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _write_text_at(directory_fd: int, name: str, text: str) -> None:
+        temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
     def _append_event_unlocked(self, state: dict[str, Any], event: str, reason: str, metadata: dict[str, Any] | None = None) -> None:
         item = {"seq": self._next_event_seq(), "ts": state["updated_at"], "event": event, "reason": reason, "run_id": state["run_id"], "state": state["state"], "generation": state.get("generation"), "thread_id": state.get("thread_id"), "repo": state.get("repo"), "git_head": state.get("last_git_head")}

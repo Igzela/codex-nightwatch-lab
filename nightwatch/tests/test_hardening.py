@@ -38,6 +38,72 @@ def fixture() -> tuple[tempfile.TemporaryDirectory, Path]:
 
 
 class TrustedControlPlaneTests(unittest.TestCase):
+    def test_symlinked_mailbox_root_is_rejected(self):
+        temporary, root = fixture()
+        outside_temporary = tempfile.TemporaryDirectory(prefix="nightwatch-mailbox-escape-")
+        outside = Path(outside_temporary.name)
+        try:
+            (root / ".nightwatch-agent").symlink_to(outside, target_is_directory=True)
+            store = NightwatchStore(root)
+            with self.assertRaises(StateIntegrityError):
+                store.initialize("mailbox-root-symlink", "goal", str(root), verify_commands=["pytest -q"])
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertTrue((root / ".nightwatch-agent").is_symlink())
+        finally:
+            outside_temporary.cleanup()
+            temporary.cleanup()
+
+    def test_state_home_inside_repo_is_rejected(self):
+        temporary, root = fixture()
+        try:
+            inside = root / ".state"
+            with patch.dict(os.environ, {"NIGHTWATCH_STATE_HOME": str(inside)}, clear=False):
+                with self.assertRaisesRegex(StateIntegrityError, "outside the Codex workspace"):
+                    NightwatchStore(root)
+            self.assertFalse(inside.exists())
+        finally:
+            temporary.cleanup()
+
+    def test_state_home_symlink_resolving_inside_repo_is_rejected(self):
+        temporary, root = fixture()
+        try:
+            target = root / ".state-target"
+            target.mkdir()
+            link = root / ".state-link"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(StateIntegrityError, "outside the Codex workspace"):
+                NightwatchStore(root, state_home=link)
+            self.assertEqual(list(target.iterdir()), [])
+        finally:
+            temporary.cleanup()
+
+    def test_xdg_state_home_inside_repo_is_rejected(self):
+        temporary, root = fixture()
+        try:
+            inside = root / ".xdg-state"
+            clean_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", str(Path.home()))}
+            with patch.dict(os.environ, {**clean_env, "XDG_STATE_HOME": str(inside)}, clear=True):
+                with self.assertRaisesRegex(StateIntegrityError, "outside the Codex workspace"):
+                    NightwatchStore(root)
+            self.assertFalse(inside.exists())
+        finally:
+            temporary.cleanup()
+
+    def test_external_state_home_remains_valid(self):
+        temporary, root = fixture()
+        state_temporary = tempfile.TemporaryDirectory(prefix="nightwatch-external-state-")
+        try:
+            external = Path(state_temporary.name) / "state"
+            with patch.dict(os.environ, {"NIGHTWATCH_STATE_HOME": str(external)}, clear=False):
+                store = NightwatchStore(root)
+                state = store.initialize("external-state", "goal", str(root), verify_commands=["pytest -q"])
+            self.assertTrue(store.directory.is_relative_to(external))
+            self.assertFalse(store.directory.is_relative_to(root))
+            self.assertEqual(store.load_state()["run_id"], state["run_id"])
+        finally:
+            state_temporary.cleanup()
+            temporary.cleanup()
+
     def test_state_is_outside_workspace_and_legacy_state_is_ignored(self):
         temporary, root = fixture()
         try:
@@ -70,6 +136,23 @@ class TrustedControlPlaneTests(unittest.TestCase):
         finally:
             if escaped.exists():
                 escaped.unlink()
+            temporary.cleanup()
+
+    def test_mailbox_root_replacement_is_rejected_on_later_read(self):
+        temporary, root = fixture()
+        outside_temporary = tempfile.TemporaryDirectory(prefix="nightwatch-mailbox-replacement-")
+        outside = Path(outside_temporary.name)
+        try:
+            store = NightwatchStore(root)
+            store.initialize("mailbox-replacement", "goal", str(root), verify_commands=["pytest -q"])
+            original = root / ".nightwatch-agent-original"
+            store.mailbox_directory.rename(original)
+            store.mailbox_directory.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                read_mailbox_json(store, "context.json")
+            self.assertEqual(list(outside.iterdir()), [])
+        finally:
+            outside_temporary.cleanup()
             temporary.cleanup()
 
     def test_frozen_policy_is_not_changed_by_workspace_file(self):

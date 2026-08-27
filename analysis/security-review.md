@@ -26,7 +26,7 @@ it.
 
 ## Evidence
 
-- 55 unit/fake/fault/recovery/security/concurrency tests passed with
+- 61 unit/fake/fault/recovery/security/concurrency tests passed with
   `ResourceWarning` promoted to errors.
 - Fake App Server verifies required initialize response, `initialized`
   notification, request ordering, wrong IDs, notifications, malformed JSON,
@@ -42,6 +42,13 @@ it.
 - User-local install smoke passed: `~/.local/bin/nightwatch`, `doctor`, and
   live App Server rate-limit read all completed. `quota-soak` remains pending
   rather than manufacturing a provider limit.
+- Final path-boundary adversarial smoke passed: a symlinked
+  `repo/.nightwatch-agent` was rejected before Codex launch with zero writes to
+  the outside target; state homes under the repo were rejected; an external
+  state home initialized successfully.
+- Regression coverage also proves that replacing an already initialized
+  mailbox root with a symlink is rejected on later reads, and that a state-home
+  symlink resolving into the workspace is rejected before creation.
 
 ## Residual limits
 

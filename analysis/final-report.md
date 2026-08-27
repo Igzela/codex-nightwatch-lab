@@ -29,13 +29,16 @@ claims, and systemd exit-loop semantics.
 
 ## Validation
 
-- 55 automated tests pass.
+- 61 automated tests pass.
 - Real Codex 0.150.1 App Server rate-limit handshake/read passes.
 - Real user-systemd normal completion and post-thread-capture SIGKILL restart
   fixtures pass, with `TEST-001` exact resume evidence.
 - A fresh schema-2 real Codex calculator fixture captured an exact thread
   externally, rejected an initial failed frozen check, then resumed that same
   thread and reached DONE only after final checks passed.
+- Final path-boundary smoke passed: mailbox-root symlink and in-workspace state
+  homes fail closed before provider launch; an external state home remains
+  valid and initializes successfully.
 
 ## Known limits
 

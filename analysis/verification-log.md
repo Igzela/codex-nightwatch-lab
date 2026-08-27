@@ -4,7 +4,7 @@ Date: 2026-08-28 (Asia/Shanghai)
 
 ## Automated
 
-- `PYTHONWARNINGS=error::ResourceWarning python3 -m unittest discover -s tests -v`: **PASS**, 55 tests.
+- `PYTHONWARNINGS=error::ResourceWarning python3 -m unittest discover -s tests -v`: **PASS**, 61 tests.
 - `python3 -m compileall -q nightwatch`: **PASS**.
 - Trusted-control tests cover external state, repo legacy-state ignorance,
   mailbox command injection, frozen policy, symlink rejection, diff-only DONE
@@ -16,6 +16,9 @@ Date: 2026-08-28 (Asia/Shanghai)
 - Existing fake-Codex, fault matrix, exact-thread recovery, quota lease,
   malformed JSON, Git conflict, Codex child crash and supervisor crash tests
   were migrated to schema 2 and pass.
+- New path-boundary regressions: **PASS**. Mailbox root symlink rejection,
+  `NIGHTWATCH_STATE_HOME` inside repo rejection, `XDG_STATE_HOME` inside repo
+  rejection, and valid external state home are covered.
 
 ## Real Codex / App Server
 
@@ -45,3 +48,12 @@ Date: 2026-08-28 (Asia/Shanghai)
 `REAL_QUOTA_SOAK = PENDING_REAL_QUOTA_SOAK`. No real quota exhaustion was
 manufactured. Future natural quota evidence must show reset authority/probe,
 one lease, and same-thread post-reset success before changing this to PASS.
+
+## Final path-boundary smoke
+
+- Scenario A, `repo/.nightwatch-agent -> outside`: **PASS**; initialization
+  failed closed, outside remained untouched, and Codex was not launched.
+- Scenario B, state home inside repo: **PASS**; initialization failed closed
+  and no trusted state was created in the repo.
+- Scenario C, external state home: **PASS**; schema-2 initialization completed
+  with trusted state outside the workspace.
