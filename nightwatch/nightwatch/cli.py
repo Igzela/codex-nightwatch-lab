@@ -15,7 +15,7 @@ from .git import GitError, repo_root, snapshot
 from .models import State, plan_progress
 from .quota import AppServerQuotaProvider, QuotaError, make_quota_provider
 from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact
-from .supervisor import Supervisor, build_report, pid_alive
+from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -26,9 +26,24 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="start a new supervised goal")
     run.add_argument("goal")
     run.add_argument("--repo", default=None)
+    run.add_argument("--thread", default=None, help="adopt and bind an existing exact thread ID")
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
+
+    watch = sub.add_parser("watch", help="passively monitor an active Codex session in this repo")
+    watch.add_argument("--repo", default=None)
+    watch.add_argument("--json", action="store_true", help="output live snapshot as JSON")
+    watch.add_argument("--once", action="store_true", help="inspect snapshot once and exit")
+    watch.add_argument("--auto-takeover", action="store_true", help="automatically take over and supervise thread when quota runs out or session exits")
+    watch.add_argument("--goal", default=None, help="goal description for auto-takeover")
+    watch.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="verification commands for auto-takeover")
+
+    adopt = sub.add_parser("adopt", help="bind an existing exact thread into Nightwatch control plane")
+    adopt.add_argument("--thread", required=True, help="exact thread ID to adopt")
+    adopt.add_argument("goal", nargs="?", default="Supervise adopted conversation", help="goal description")
+    adopt.add_argument("--repo", default=None)
+    adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
@@ -114,7 +129,7 @@ def _run(args: argparse.Namespace) -> int:
         _validate_install_targets(root)
     else:
         _maybe_inhibit(args, root)
-    state = store.initialize(make_run_id(str(root)), args.goal, str(root), verify_commands=args.verify)
+    state = store.initialize(make_run_id(str(root)), args.goal, str(root), verify_commands=args.verify, thread_id=getattr(args, "thread", None))
     if args.service:
         _install_user_files(root)
         try:
@@ -466,6 +481,85 @@ def _test(args: argparse.Namespace) -> int:
     return 0
 
 
+def _adopt(args: argparse.Namespace) -> int:
+    root = _root(args.repo)
+    store = NightwatchStore(root)
+    if store.exists():
+        state = store.load_state()
+        raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}, thread={state.get('thread_id')})")
+    state = store.initialize(make_run_id(str(root)), args.goal or "Adopted conversation", str(root), verify_commands=args.verify, thread_id=args.thread)
+    print(f"Nightwatch: adopted thread {args.thread} for repo {root} (run_id={state['run_id']})")
+    print("Run `nightwatch resume` to start unattended supervision.")
+    return 0
+
+
+def _print_watch_snapshot(snap: dict[str, Any], root: Path) -> None:
+    print("=" * 60)
+    print(f"REPO         {root}")
+    print(f"THREAD ID    {snap.get('thread_id') or '(none)'}")
+    print(f"PROCESS      PID {snap.get('pid') or '(none)'} ({'ALIVE' if snap.get('pid_alive') else 'NOT RUNNING / EXITED'})")
+    print(f"MODEL        {snap.get('model') or '(unknown)'} [branch: {snap.get('branch') or '(unknown)'}]")
+    if snap.get("title"):
+        print(f"GOAL/TITLE   {str(snap['title'])[:80]}")
+    limits = snap.get("rate_limits") or {}
+    p = limits.get("primary") or {}
+    s = limits.get("secondary") or {}
+    if p:
+        p_pct = p.get('used_percent', 0)
+        p_reset = p.get('resets_at')
+        reset_str = f", reset={p_reset}" if p_reset else ""
+        print(f"QUOTA 5H     {p_pct}% used{reset_str}")
+    if s:
+        s_pct = s.get('used_percent', 0)
+        print(f"QUOTA WEEKLY {s_pct}% used")
+    tokens = snap.get("tokens") or {}
+    if tokens:
+        print(f"TOKENS       total={tokens.get('total_tokens', 0):,}, input={tokens.get('input_tokens', 0):,}, output={tokens.get('output_tokens', 0):,}")
+    subs = snap.get("subagents") or []
+    if subs:
+        sub_str = ", ".join(f"{name} ({sid[:8]}...)" for sid, name in subs)
+        print(f"SUBAGENTS    {sub_str}")
+    print("=" * 60)
+
+
+def _watch(args: argparse.Namespace) -> int:
+    root = _root(args.repo)
+    store = NightwatchStore(root)
+    watcher = PassiveWatcher(store)
+
+    if args.once:
+        snapshot = watcher.inspect_live_snapshot()
+        if args.json:
+            print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+            return 0
+        if not snapshot.get("active"):
+            print(f"Nightwatch watch: no active Codex session found for {root}")
+            if snapshot.get("pid"):
+                print(f"PID {snapshot['pid']} running but no rollout file located")
+            return 1
+        _print_watch_snapshot(snapshot, root)
+        return 0
+
+    print(f"Nightwatch watch: passively monitoring {root} (Ctrl+C to stop)...")
+    try:
+        def on_update(snap: dict[str, Any]) -> None:
+            if args.json:
+                print(json.dumps(snap, ensure_ascii=False))
+            else:
+                _print_watch_snapshot(snap, root)
+
+        watcher.watch(
+            on_update=on_update,
+            poll_interval=2.0,
+            auto_takeover=args.auto_takeover,
+            goal=args.goal,
+            verify_commands=args.verify,
+        )
+    except KeyboardInterrupt:
+        print("\nNightwatch watch stopped.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -481,6 +575,8 @@ def main(argv: list[str] | None = None) -> int:
             "install": _install,
             "uninstall": _uninstall,
             "test": _test,
+            "watch": _watch,
+            "adopt": _adopt,
         }[args.command](args)
     except SupervisorAlreadyRunning:
         print("nightwatch: already supervised by another process; state was not changed", file=sys.stderr)

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .codex import run_codex
 from .git import GitError, GitSnapshot, is_ancestor, repo_root, snapshot
@@ -87,6 +89,64 @@ def process_matches(record: dict[str, Any]) -> bool:
 
 def sys_platform_linux() -> bool:
     return sys.platform.startswith("linux")
+
+
+def find_repo_codex_processes(repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
+    if not sys_platform_linux():
+        return []
+    target = Path(repo).resolve()
+    found: list[dict[str, Any]] = []
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return []
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if exclude_pid and pid == exclude_pid:
+            continue
+        try:
+            cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+            if cwd == target:
+                exe = os.readlink(f"/proc/{pid}/exe")
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace").lower()
+                is_codex = ("codex" in exe.lower() or "codex" in cmdline) and "nightwatch" not in exe.lower() and "nightwatch" not in cmdline and "pytest" not in cmdline and "unittest" not in cmdline
+                if is_codex:
+                    found.append({"pid": pid, "executable": exe, "cmdline": cmdline, "cwd": str(cwd)})
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def find_active_threads_for_repo(repo: str | Path, codex_home: str | Path | None = None) -> list[dict[str, Any]]:
+    target = str(Path(repo).resolve())
+    db_path = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "state_5.sqlite"
+    if not db_path.exists():
+        return []
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, rollout_path, updated_at_ms, model, git_branch, thread_source, first_user_message, title "
+                "FROM threads WHERE cwd = ? ORDER BY updated_at_ms DESC LIMIT 10",
+                (target,),
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "rollout_path": row[1],
+                    "updated_at_ms": row[2],
+                    "model": row[3],
+                    "git_branch": row[4],
+                    "thread_source": row[5],
+                    "first_user_message": row[6],
+                    "title": row[7],
+                }
+                for row in rows
+            ]
+    except Exception:
+        return []
 
 
 def start_prompt(store: NightwatchStore, goal: str) -> str:
@@ -225,6 +285,19 @@ class Supervisor:
         except GitError:
             self._fail_closed("Git preflight failed", ErrorKind.GIT)
             return False
+        if os.environ.get("NIGHTWATCH_IGNORE_CONCURRENT_CODEX") != "1":
+            running_codex = find_repo_codex_processes(current_root, exclude_pid=os.getpid())
+            current_active = state.get("active_process")
+            if isinstance(current_active, dict) and current_active.get("pid"):
+                running_codex = [p for p in running_codex if p["pid"] != current_active["pid"]]
+            if running_codex:
+                pids = ", ".join(str(p["pid"]) for p in running_codex)
+                self._fail_closed(
+                    f"another Codex process (PID {pids}) is active in this repository; "
+                    "use `nightwatch watch` to monitor it passively or wait until it exits",
+                    ErrorKind.STATE,
+                )
+                return False
         binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
         if not (Path(binary).is_file() and os.access(binary, os.X_OK)) and not shutil.which(binary):
             self._fail_closed("Codex CLI was not found", ErrorKind.UNKNOWN)
@@ -546,3 +619,165 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         f"- last verified commit: {state.get('last_verified_commit') or '(none)'}",
         "",
     ])
+
+
+class PassiveWatcher:
+    """Non-invasive observer and automatic takeover supervisor for active Codex sessions."""
+
+    def __init__(self, store: NightwatchStore, codex_home: str | Path | None = None):
+        self.store = store
+        self.codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def discover_active_session(self) -> dict[str, Any] | None:
+        processes = find_repo_codex_processes(self.store.repo, exclude_pid=os.getpid())
+        threads = find_active_threads_for_repo(self.store.repo, self.codex_home)
+        user_threads = [t for t in threads if t.get("thread_source") == "user"]
+        primary = user_threads[0] if user_threads else (threads[0] if threads else None)
+        active_pid = processes[0]["pid"] if processes else None
+        rollout_path = None
+        if active_pid:
+            fd_dir = Path(f"/proc/{active_pid}/fd")
+            if fd_dir.exists():
+                for entry in fd_dir.iterdir():
+                    try:
+                        target = os.readlink(str(entry))
+                        if "rollout-" in target and target.endswith(".jsonl"):
+                            if primary and primary["id"] in target:
+                                rollout_path = Path(target)
+                                break
+                            elif rollout_path is None:
+                                rollout_path = Path(target)
+                    except OSError:
+                        continue
+        if not rollout_path and primary and primary.get("rollout_path"):
+            cand = Path(primary["rollout_path"])
+            if cand.exists():
+                rollout_path = cand
+        if not primary and not rollout_path and not active_pid:
+            return None
+        return {
+            "pid": active_pid,
+            "processes": processes,
+            "thread": primary,
+            "thread_id": primary["id"] if primary else None,
+            "rollout_path": str(rollout_path) if rollout_path else None,
+        }
+
+    def inspect_live_snapshot(self) -> dict[str, Any]:
+        info = self.discover_active_session()
+        if not info or not info.get("rollout_path"):
+            return {
+                "active": bool(info and info.get("processes")),
+                "pid": info.get("pid") if info else None,
+                "processes": info.get("processes", []) if info else [],
+                "thread_id": info.get("thread_id") if info else None,
+            }
+        path = Path(info["rollout_path"])
+        rate_limits = None
+        tokens = None
+        subagents = []
+        last_turn_type = None
+        if path.exists():
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                        t = data.get("type")
+                        payload = data.get("payload", {})
+                        if isinstance(payload, dict):
+                            if "rate_limits" in payload:
+                                rate_limits = payload["rate_limits"]
+                            if "info" in payload and "total_token_usage" in payload["info"]:
+                                tokens = payload["info"]["total_token_usage"]
+                        if "<subagents>" in line:
+                            for sub in re.findall(r"-\s*([0-9a-fA-F-]{36}):\s*(\w+)", line):
+                                if sub not in subagents:
+                                    subagents.append(sub)
+                        last_turn_type = t
+                    except Exception:
+                        pass
+        primary_thread = info.get("thread") or {}
+        return {
+            "active": True,
+            "pid": info.get("pid"),
+            "pid_alive": pid_alive(info.get("pid")) if info.get("pid") else False,
+            "thread_id": info.get("thread_id"),
+            "model": primary_thread.get("model"),
+            "branch": primary_thread.get("git_branch"),
+            "title": primary_thread.get("title") or primary_thread.get("first_user_message"),
+            "rate_limits": rate_limits,
+            "tokens": tokens,
+            "subagents": subagents,
+            "last_turn_type": last_turn_type,
+            "rollout_path": info.get("rollout_path"),
+        }
+
+    def watch(
+        self,
+        on_update: Callable[[dict[str, Any]], None] | None = None,
+        poll_interval: float = 2.0,
+        auto_takeover: bool = False,
+        goal: str | None = None,
+        verify_commands: list[str] | None = None,
+    ) -> dict[str, Any]:
+        info = self.discover_active_session()
+        if not info or not info.get("rollout_path"):
+            snap = {"active": False, "pid": info.get("pid") if info else None}
+            if on_update:
+                on_update(snap)
+            return snap
+
+        last_status_str = ""
+        while not self._stop_requested:
+            snap = self.inspect_live_snapshot()
+            status_str = f"{snap.get('pid')}:{snap.get('pid_alive')}:{snap.get('rate_limits')}:{snap.get('tokens')}"
+            if status_str != last_status_str:
+                last_status_str = status_str
+                if on_update:
+                    on_update(snap)
+
+            limits = snap.get("rate_limits") or {}
+            primary_exhausted = (limits.get("primary", {}).get("used_percent") or 0) >= 100
+            secondary_exhausted = (limits.get("secondary", {}).get("used_percent") or 0) >= 100
+            quota_hit = primary_exhausted or secondary_exhausted
+
+            if quota_hit and auto_takeover:
+                thread_id = snap.get("thread_id")
+                if not thread_id:
+                    break
+                if not self.store.exists():
+                    self.store.initialize(
+                        make_run_id(str(self.store.repo)),
+                        goal or snap.get("title") or "Auto-takeover after quota limit",
+                        str(self.store.repo),
+                        verify_commands=verify_commands or [],
+                        thread_id=thread_id,
+                    )
+                supervisor = Supervisor(self.store)
+                return supervisor.execute(start=False)
+
+            if not snap.get("pid_alive"):
+                if auto_takeover:
+                    thread_id = snap.get("thread_id")
+                    if not self.store.exists() and thread_id:
+                        self.store.initialize(
+                            make_run_id(str(self.store.repo)),
+                            goal or snap.get("title") or "Supervised session continuation",
+                            str(self.store.repo),
+                            verify_commands=verify_commands or [],
+                            thread_id=thread_id,
+                        )
+                    if self.store.exists():
+                        supervisor = Supervisor(self.store)
+                        return supervisor.execute(start=False)
+                break
+
+            time.sleep(poll_interval)
+
+        return self.inspect_live_snapshot()

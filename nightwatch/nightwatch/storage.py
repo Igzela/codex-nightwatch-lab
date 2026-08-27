@@ -162,7 +162,7 @@ class NightwatchStore:
             finally:
                 handle.close()
 
-    def initialize(self, run_id: str, goal: str, repo: str, timestamp: str | None = None, verify_commands: list[str] | None = None) -> dict[str, Any]:
+    def initialize(self, run_id: str, goal: str, repo: str, timestamp: str | None = None, verify_commands: list[str] | None = None, thread_id: str | None = None) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
         policy_core = {"schema_version": 1, "source": "cli", "final_commands": commands}
@@ -170,6 +170,8 @@ class NightwatchStore:
         acceptance = {"schema_version": 1, "goal_hash": hashlib.sha256(goal.encode("utf-8")).hexdigest(), "verification_policy_hash": policy["policy_hash"], "required_final_checks": commands, "plan_minimum": {"milestones": 1}, "baseline_repo": str(self.repo), "created_at": timestamp}
         state = empty_state(run_id, goal, repo, self.repo_id, timestamp)
         state["acceptance_ready"] = sufficient_verification_policy(commands)
+        if thread_id:
+            state["thread_id"] = thread_id
         profile = "default" if commands else "none"
         plan = {"schema_version": 2, "authority": "nightwatch", "policy_hash": policy["policy_hash"], "milestones": [{"id": "M1", "title": "Complete the goal", "weight": 100, "required": True, "status": "pending", "verification_profile": profile, "evidence": []}]}
         metadata = {"schema_version": 2, "repo_id": self.repo_id, "repo_path": str(self.repo), "repo_remote": _git_identity(self.repo), "created_at": timestamp}
