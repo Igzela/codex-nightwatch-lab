@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from nightwatch import cli  # noqa: E402
 from nightwatch.codex import (  # noqa: E402
     build_command,
     classify_failure,
@@ -26,6 +28,60 @@ from nightwatch.supervisor import Supervisor  # noqa: E402
 
 
 class UnitTests(unittest.TestCase):
+    def test_service_cli_and_unit_are_repo_bound_and_fail_closed(self):
+        args = cli._parser().parse_args(["run", "--service", "goal", "--repo", "/repo"])
+        self.assertTrue(args.service)
+        resume = cli._parser().parse_args(["resume", "--repo", "/repo", "--no-inhibit"])
+        self.assertTrue(resume.no_inhibit)
+        unit = cli._service_text(Path("/repo"))
+        self.assertIn("WorkingDirectory=/repo", unit)
+        self.assertIn('resume --repo "/repo"', unit)
+        self.assertIn("Restart=on-abnormal", unit)
+        self.assertNotIn("--last", unit)
+        self.assertNotIn("Restart=on-failure", unit)
+        self.assertEqual(cli._systemd_quote("/repo with space/100%"), '"/repo with space/100%%"')
+        self.assertIn("WorkingDirectory=/repo with space/100%%", cli._service_text(Path("/repo with space/100%")))
+
+    def test_user_service_start_uses_user_manager(self):
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch("nightwatch.cli.shutil.which", return_value="/bin/systemctl"), patch(
+            "nightwatch.cli.subprocess.run", return_value=completed
+        ) as run:
+            cli._start_user_service()
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [["/bin/systemctl", "--user", "daemon-reload"], ["/bin/systemctl", "--user", "enable", "--now", "nightwatch.service"]],
+        )
+
+    def test_run_service_persists_new_goal_then_returns_after_handoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            args = cli._parser().parse_args(["run", "--service", "goal", "--repo", str(root)])
+            with patch("nightwatch.cli._validate_install_targets"), patch(
+                "nightwatch.cli._install_user_files", return_value=(root / "nightwatch", root / "nightwatch.service")
+            ), patch("nightwatch.cli._start_user_service") as start, patch("nightwatch.cli.Supervisor.execute") as execute:
+                self.assertEqual(cli._run(args), 0)
+            state = NightwatchStore(root).load_state()
+            self.assertEqual(state["state"], State.NEW.value)
+            self.assertIsNone(state["thread_id"])
+            start.assert_called_once()
+            execute.assert_not_called()
+
+    def test_run_service_bus_failure_keeps_goal_new_and_does_not_start_codex(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            args = cli._parser().parse_args(["run", "--service", "goal", "--repo", str(root)])
+            with patch("nightwatch.cli._validate_install_targets"), patch(
+                "nightwatch.cli._install_user_files", return_value=(root / "nightwatch", root / "nightwatch.service")
+            ), patch("nightwatch.cli._start_user_service", side_effect=RuntimeError("no user bus")), patch(
+                "nightwatch.cli.Supervisor.execute"
+            ) as execute:
+                self.assertEqual(cli._run(args), 1)
+            self.assertEqual(NightwatchStore(root).load_state()["state"], State.NEW.value)
+            execute.assert_not_called()
+
     def test_reset_epoch_seconds_and_millis(self):
         self.assertEqual(extract_reset('{"resets_at": 1770000000}')[0], 1770000000)
         self.assertEqual(extract_reset('{"resetsAt": 1770000000000}')[0], 1770000000)

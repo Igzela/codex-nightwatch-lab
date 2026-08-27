@@ -51,4 +51,4 @@ The App Server is experimental and may change. Nightwatch validates the RPC resp
 
 ## Security boundaries
 
-Nightwatch never reads or writes `auth.json`, never prints environment variables, never enables `--dangerously-bypass-approvals-and-sandbox`, and never escalates privileges. It passes only a fixed allowlist of Codex arguments plus the user's goal. User-level systemd is optional and uses the foreground CLI.
+Nightwatch never reads or writes `auth.json`, never prints environment variables, never enables `--dangerously-bypass-approvals-and-sandbox`, and never escalates privileges. It passes only a fixed allowlist of Codex arguments plus the user's goal. User-level systemd is optional: `nightwatch run --service` first writes durable `NEW` state, then starts a repo-bound unit which invokes the same `resume` path. The unit restarts only after an abnormal exit, so terminal `BLOCKED`, `FAILED`, and `STOPPED` states do not loop.

@@ -86,6 +86,22 @@ class FakeCodexE2E(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_service_bootstrap_can_start_a_new_durable_goal(self):
+        """The unit executes `resume`; NEW state must start, not create a new thread."""
+        temporary, root, plan, progress = fixture()
+        try:
+            store = NightwatchStore(root)
+            store.initialize("run-service", "implement fixture", str(root))
+            with self.env(plan, progress):
+                final = Supervisor(store, ScriptedQuota()).execute(start=False)
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertEqual(final["thread_id"], "TEST-001")
+            events = [json.loads(line)["event"] for line in store.events_path.read_text().splitlines()]
+            self.assertIn("preflight_started", events)
+            self.assertIn("thread_started", events)
+        finally:
+            temporary.cleanup()
+
     def test_quota_waits_revalidates_then_resumes_same_thread(self):
         temporary, root, plan, progress = fixture()
         try:

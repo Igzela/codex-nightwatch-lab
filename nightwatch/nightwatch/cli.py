@@ -27,6 +27,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("goal")
     run.add_argument("--repo", default=None)
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
+    run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
@@ -35,6 +36,8 @@ def _parser() -> argparse.ArgumentParser:
             cmd.add_argument("--json", action="store_true")
         if name == "log":
             cmd.add_argument("--tail", type=int, default=80)
+        if name == "resume":
+            cmd.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
 
     doctor = sub.add_parser("doctor", help="check Linux, Codex, auth, quota, and local state support")
     doctor.add_argument("--json", action="store_true")
@@ -62,7 +65,7 @@ def _store(value: str | None) -> NightwatchStore:
 
 
 def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
-    if args.no_inhibit or os.environ.get("NIGHTWATCH_INHIBITED") == "1":
+    if getattr(args, "no_inhibit", False) or os.environ.get("NIGHTWATCH_INHIBITED") == "1":
         return
     binary = shutil.which("systemd-inhibit")
     if not binary:
@@ -83,13 +86,15 @@ def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
     env["NIGHTWATCH_INHIBITED"] = "1"
     old_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = source_root + (os.pathsep + old_pythonpath if old_pythonpath else "")
-    child_args = [sys.executable, "-m", "nightwatch.cli", "run", args.goal, "--repo", str(root), "--no-inhibit"]
+    child_args = [sys.executable, "-m", "nightwatch.cli", args.command]
+    if args.command == "run":
+        child_args.append(args.goal)
+    child_args.extend(["--repo", str(root), "--no-inhibit"])
     os.execvpe(binary, [binary, "--what=sleep", "--mode=block", "--why=Nightwatch supervisor", *child_args], env)
 
 
 def _run(args: argparse.Namespace) -> int:
     root = _root(args.repo)
-    _maybe_inhibit(args, root)
     store = NightwatchStore(root)
     if store.exists():
         try:
@@ -97,7 +102,24 @@ def _run(args: argparse.Namespace) -> int:
         except StateIntegrityError as exc:
             raise SystemExit(f"nightwatch: refusing to overwrite invalid durable state: {exc}") from exc
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}); use nightwatch resume")
+    if args.service:
+        _validate_install_targets(root)
+    else:
+        _maybe_inhibit(args, root)
     state = store.initialize(make_run_id(str(root)), args.goal, str(root))
+    if args.service:
+        _install_user_files(root)
+        try:
+            _start_user_service()
+        except RuntimeError as exc:
+            print(
+                "nightwatch: goal was saved as NEW but the user service was not started; "
+                f"run `nightwatch resume --repo {root}` after fixing systemd: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Nightwatch service started: run_id={state['run_id']} repo={root}")
+        return 0
     supervisor = Supervisor(store)
     _install_signal_handlers(supervisor)
     final = supervisor.execute(start=True)
@@ -106,7 +128,9 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _resume(args: argparse.Namespace) -> int:
-    store = _store(args.repo)
+    root = _root(args.repo)
+    _maybe_inhibit(args, root)
+    store = NightwatchStore(root)
     supervisor = Supervisor(store)
     _install_signal_handlers(supervisor)
     final = supervisor.execute(start=False)
@@ -252,48 +276,110 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "ok" else 1
 
 
-def _install(args: argparse.Namespace) -> int:
+def _install_paths() -> tuple[Path, Path]:
+    return (
+        Path.home() / ".local" / "bin" / "nightwatch",
+        Path.home() / ".config" / "systemd" / "user" / "nightwatch.service",
+    )
+
+
+def _service_text(service_root: Path) -> str:
     source_root = Path(__file__).resolve().parents[1]
-    target = Path.home() / ".local" / "bin" / "nightwatch"
-    content = f"#!/bin/sh\n# nightwatch-install: {source_root}\nexec python3 {source_root / 'bin' / 'nightwatch'} \"$@\"\n"
-    service = Path.home() / ".config" / "systemd" / "user" / "nightwatch.service"
-    service_text = None
-    if args.service:
-        service_root = _root(args.repo)
-        template = (source_root / "systemd" / "nightwatch.service").read_text(encoding="utf-8")
-        service_text = template.replace(
-            "ExecStart=%h/.local/bin/nightwatch resume",
-            f"WorkingDirectory={service_root}\nExecStart=%h/.local/bin/nightwatch resume --repo {service_root}",
-        )
-        service_text = "# nightwatch-install\n" + service_text
-    # Validate all targets before creating either one, so a pre-existing
-    # unrelated service cannot leave a half-installed launcher behind.
-    if target.exists() or target.is_symlink():
+    template = (source_root / "systemd" / "nightwatch.service").read_text(encoding="utf-8")
+    # systemd parses ExecStart itself (not through a shell), so quote the repo
+    # there as one argument. WorkingDirectory is a unit path setting: quotes
+    # are literal for that setting, therefore it must remain an absolute raw
+    # path.
+    unit_root = _systemd_quote(str(service_root))
+    directory_root = str(service_root).replace("%", "%%")
+    rendered = template.replace(
+        "ExecStart=%h/.local/bin/nightwatch resume",
+        f"WorkingDirectory={directory_root}\nExecStart=%h/.local/bin/nightwatch resume --repo {unit_root}",
+    )
+    return "# nightwatch-install\n" + rendered
+
+
+def _systemd_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
+def _validate_install_targets(service_root: Path | None = None) -> None:
+    launcher, service = _install_paths()
+    if launcher.exists() or launcher.is_symlink():
         try:
-            existing = target.read_text(encoding="utf-8")
+            existing = launcher.read_text(encoding="utf-8")
         except OSError:
             existing = ""
         if "nightwatch-install:" not in existing:
-            raise SystemExit(f"nightwatch: refusing to overwrite existing {target}")
-    if service_text is not None and service.exists() and "# nightwatch-install" not in service.read_text(encoding="utf-8", errors="replace"):
+            raise SystemExit(f"nightwatch: refusing to overwrite existing {launcher}")
+    if service_root is None or not service.exists():
+        return
+    existing = service.read_text(encoding="utf-8", errors="replace")
+    if "# nightwatch-install" not in existing:
         raise SystemExit(f"nightwatch: refusing to overwrite existing {service}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    existing_root = next((line.removeprefix("WorkingDirectory=").strip('"') for line in existing.splitlines() if line.startswith("WorkingDirectory=")), None)
+    if existing_root is not None and Path(existing_root.replace("%%", "%")).resolve() != service_root.resolve():
+        raise SystemExit(
+            f"nightwatch: existing user service is bound to {existing_root}; refusing to repoint it to {service_root}"
+        )
+
+
+def _atomic_write(path: Path, content: str, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(content, encoding="utf-8")
-    os.chmod(temporary, 0o755)
-    os.replace(temporary, target)
-    print(f"Installed {target}")
-    if service_text is not None:
-        service.parent.mkdir(parents=True, exist_ok=True)
-        service.write_text(service_text, encoding="utf-8")
-        os.chmod(service, 0o600)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def _install_user_files(service_root: Path | None = None) -> tuple[Path, Path | None]:
+    _validate_install_targets(service_root)
+    source_root = Path(__file__).resolve().parents[1]
+    launcher, service = _install_paths()
+    launcher_text = f"#!/bin/sh\n# nightwatch-install: {source_root}\nexec python3 {source_root / 'bin' / 'nightwatch'} \"$@\"\n"
+    _atomic_write(launcher, launcher_text, 0o755)
+    if service_root is not None:
+        _atomic_write(service, _service_text(service_root), 0o600)
+        return launcher, service
+    return launcher, None
+
+
+def _start_user_service() -> None:
+    binary = shutil.which("systemctl")
+    if not binary:
+        raise RuntimeError("systemctl is not installed")
+    for command in (
+        [binary, "--user", "daemon-reload"],
+        [binary, "--user", "enable", "--now", "nightwatch.service"],
+    ):
+        try:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("systemctl --user is unavailable") from exc
+        if result.returncode != 0:
+            raise RuntimeError("systemctl --user could not contact or start the user service")
+
+
+def _install(args: argparse.Namespace) -> int:
+    service_root = _root(args.repo) if args.service else None
+    launcher, service = _install_user_files(service_root)
+    print(f"Installed {launcher}")
+    if service is not None:
         print(f"Installed {service}")
+        print("Enable it with: systemctl --user daemon-reload && systemctl --user enable --now nightwatch.service")
     return 0
 
 
 def _uninstall(_args: argparse.Namespace) -> int:
     removed = []
-    for path in (Path.home() / ".local" / "bin" / "nightwatch", Path.home() / ".config" / "systemd" / "user" / "nightwatch.service"):
+    for path in _install_paths():
         if not path.exists():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")

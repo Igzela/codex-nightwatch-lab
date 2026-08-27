@@ -4,7 +4,7 @@ Date: 2026-08-27 (Asia/Shanghai)
 
 ## Automated
 
-- `PYTHONWARNINGS=error::ResourceWarning python3 -m unittest discover -s tests -v`: **PASS**, 37 tests.
+- `PYTHONWARNINGS=error::ResourceWarning python3 -m unittest discover -s tests -v`: **PASS**, 42 tests.
 - `python3 -m compileall -q nightwatch`: **PASS**.
 - Fake Codex covers normal completion, 5h and weekly limits, quota revalidation,
   quota hit again, temporary 429, capacity, network, auth, blocker, crash,
@@ -49,12 +49,28 @@ Date: 2026-08-27 (Asia/Shanghai)
 
 ## Installation
 
+- Unattended service handoff: **PASS** in automated tests. `nightwatch run
+  --service ...` persists a `NEW` goal before calling the user manager, does
+  not start Codex in the caller, and leaves the goal `NEW` (rather than
+  guessing) if the user manager is unavailable. The generated unit is
+  repo-bound, invokes `nightwatch resume --repo <exact-repo>`, and uses
+  `Restart=on-abnormal`; its `NEW`-state bootstrap path reaches `DONE` in the
+  fake-Codex E2E test.
+- Real user-systemd Fake-Codex E2E: **PASS**. In a disposable Git fixture,
+  `nightwatch run --service` created durable `NEW` state, installed and started
+  the repo-bound unit through `systemctl --user`, then the unit executed its
+  `resume --repo <fixture>` bootstrap and reached `DONE`. It captured only
+  `TEST-001`, adopted the durable milestone plan, verified the implementation,
+  and passed final `git diff --check`. The test service, its manager-scoped fake
+  environment, launcher/unit, and fixtures were then removed; the normal
+  user-local launcher was reinstalled.
 - Temporary-HOME `nightwatch install --service --repo ...` and
   `nightwatch uninstall`: **PASS**. The generated unit was repo-bound and the
   uninstall removed only Nightwatch-marked files.
 - Final user-local install: **PASS**. `command -v nightwatch` resolved to
   `/home/charlie/.local/bin/nightwatch`; installed `--version`, `status`,
   `report`, `doctor --json`, and `test quota-soak` all behaved as expected.
-- `systemd-inhibit` binary exists, but the current container cannot connect to
-  the user/system bus. The CLI probe reports it unusable and continues without
-  a sleep lock; a normal host with a working user bus gets the inhibitor.
+- Real `systemd-inhibit` and user-systemd probes: **PASS** in this environment.
+  The service test confirmed that terminal `DONE` exits normally; its
+  `Restart=on-abnormal` policy does not convert normal terminal outcomes into a
+  retry loop.

@@ -6,15 +6,17 @@ Status: **USABLE_PENDING_REAL_QUOTA_SOAK**
 
 Nightwatch is a small Python 3.11+ standard-library Linux CLI. One Git
 repository owns one `.nightwatch/` state directory and one exact Codex thread.
-The foreground supervisor launches `codex exec --json` with workspace-write
-sandboxing and a prompt on stdin, captures `thread.started.thread_id`, and
-resumes only with `codex exec --json resume <EXACT_THREAD_ID> -`.
+The supervisor launches `codex exec --json` with workspace-write sandboxing
+and a prompt on stdin, captures `thread.started.thread_id`, and resumes only
+with `codex exec --json resume <EXACT_THREAD_ID> -`. It may run in the
+foreground or as a repo-bound user-level systemd service.
 
 State transitions, atomic JSON snapshots, append-only JSONL evidence, file
 locking, bounded retry budgets, Git recovery checks, milestone verification,
 quota generation leases, and final DONE guards are all local and durable.
 `systemd-inhibit` and an optional user-level systemd unit are integrations, not
-correctness prerequisites.
+correctness prerequisites. For unattended use, `nightwatch run --service
+"goal"` durably initializes the goal before it starts the user service.
 
 ## 2. Reference projects audited
 
@@ -54,10 +56,11 @@ Runtime state is `.nightwatch/state.json`, `goal.md`, `plan.json`,
 
 ## 5. Tests
 
-The final automated suite contains **37 tests**, all passing with
+The final automated suite contains **42 tests**, all passing with
 `ResourceWarning` promoted to errors. It includes pure unit tests, fake-Codex
 E2E, the full fault matrix, quota leases, exact-thread recovery, Codex child
-crash recovery, and Nightwatch `SIGKILL` restart recovery.
+crash recovery, Nightwatch `SIGKILL` restart recovery, and user-service
+handoff/fail-closed tests.
 
 ## 6. Real validation
 
@@ -65,6 +68,9 @@ crash recovery, and Nightwatch `SIGKILL` restart recovery.
 - Real Codex calculator smoke and exact-thread manual resume: **PASS**.
 - Real Codex child `SIGKILL` recovery: **PASS**.
 - Nightwatch supervisor crash recovery: **PASS** in isolated automated fixture.
+- Real user-systemd Fake-Codex handoff: **PASS**. `nightwatch run --service`
+  persisted `NEW` state, launched the repo-bound unit with `systemctl --user`,
+  and the unit completed an exact `TEST-001` goal through final verification.
 - DONE guard against failed verification: **PASS**.
 - Secret redaction and no dangerous auto-approval/bypass flags: **PASS**.
 - Doctor: **PASS** for Linux/Codex/auth; quota source was structured
@@ -110,12 +116,14 @@ From the product directory after tests:
 ```bash
 python3 bin/nightwatch install
 cd /path/to/git-repo
-nightwatch run "继续当前仓库规划，完成所有未完成任务并逐阶段验证。"
+nightwatch run --service "继续当前仓库规划，完成所有未完成任务并逐阶段验证。"
 nightwatch status
 nightwatch report
 ```
 
-Optional repo-bound user service:
+The service persists through terminal closure and restarts only after abnormal
+supervisor termination. It deliberately does not restart a `BLOCKED`, `FAILED`,
+or `STOPPED` goal. Equivalent manual setup, without starting it automatically:
 
 ```bash
 nightwatch install --service --repo /path/to/git-repo
