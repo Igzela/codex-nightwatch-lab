@@ -1,0 +1,230 @@
+# 🌙 Nightwatch (守夜人)
+
+<div align="center">
+
+**专为 OpenAI Codex 设计的无损容灾、配额感知、精确会话恢复的 Linux 无人值守守护进程。**  
+*零外部依赖 • 直连官方 App Server JSON-RPC • 预冻结验证门禁 • 宿主系统级原生集成*
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#安装指南)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
+[![Tests: 64 Passing](https://img.shields.io/badge/Tests-64%20Passing-success.svg)](#测试验证)
+[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+
+[**English**](README.md) | [**中文说明**](README_CN.md)
+
+</div>
+
+---
+
+## ⚡ 核心解决的痛点
+
+你睡前给 AI 编程助手分配了一个复杂的工程重构任务，期待醒来时看到全部绿色的测试用例。然而现实往往是：
+- ❌ **5 小时配额瞬间用尽**：运行 20 分钟就触发了 OpenAI 的 `Usage limit`，任务直接停摆；
+- ❌ **终端断连 / 笔记本睡眠中断**：SSH 断开或系统休眠导致后台进程直接被系统回收；
+- ❌ **模型幻觉假装完成**：模型在聊天中宣称*“我已经全部实现并验证完毕”*，实际上根本没有跑通测试；
+- ❌ **重启丢失记忆**：重新开启新会话导致前序上下文全部丢失，浪费海量 Token 且状态分叉。
+
+**Nightwatch (守夜人) 为解决这一整套工程可靠性问题而生。**
+
+```text
+               ┌────────────────────────────────────────────────────────┐
+               │                 Nightwatch 守护进程                    │
+               │  (外部受信任控制面: ~/.local/state/codex-nightwatch/)  │
+               └───────────┬────────────────────────────────┬───────────┘
+                           │                                │
+        [1] 派生与管控子进程                 [2] 原生 JSON-RPC stdio 通信
+        `codex exec --json`                  `account/rateLimits/read`
+                           │                                │
+                           ▼                                ▼
+               ┌───────────────────────┐        ┌───────────────────────┐
+               │    OpenAI Codex CLI   │        │   官方 App Server     │
+               │   (工作区沙箱执行)    │        │     (配额权威源)      │
+               └───────────┬───────────┘        └───────────┬───────────┘
+                           │                                │
+                           │ [3] 触发 5h / 周配额耗尽       │ [4] 窗口刷新到达
+                           ▼                                ▼
+               ┌────────────────────────────────────────────────────────┐
+               │               智能重置探测与自动续跑                   │
+               │        在同一个 exact Thread 上无缝恢复上下文          │
+               │         严格执行用户预冻结的测试验证门禁               │
+               └────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ✨ 核心特性
+
+- 🔄 **官方 App Server 协议直连**：通过 JSON-RPC 2.0 stdio 协议直连 Codex 内部 `account/rateLimits/read`，精准获取 5h 与周配额重置 Epoch，杜绝脆弱的正则表达式或 ANSI 屏幕抓取。
+- 🧵 **精确 Thread ID 级断点续传**：跨配额周期与系统重启时，严格执行 `codex exec --json resume <thread_id> -` 精准接续原会话，坚决拒绝模糊的 `--last` 猜测。
+- 🔒 **受信任控制面物理隔离**：核心状态与验收规则保存在 Git 工作区之外（`~/.local/state/codex-nightwatch/`，`0700` 权限），模型沙箱只能读写信箱，绝无可能篡改验收规则。
+- 🧪 **冻结真实验收门禁**：任务完成（`DONE`）必须严格通过用户预冻结的 `--verify` 命令（如 `pytest -q`、`cargo test`、`git diff --check`），彻底杜绝模型幻觉。
+- 🛡️ **无侵入伴随监听与自动接管（`nightwatch watch`）**：安全监听终端中正在运行的交互式 Codex 会话，在不打断前台的前提下实时统计 Token 与配额，并在触发上限或终端关闭后自动无缝接管夜间续跑。
+- 🔋 **Linux 原生高可靠**：全项目基于 Python 3 标准库（零第三方 pip 依赖），原生支持 `systemctl --user` 服务化守护与 `systemd-inhibit` 阻塞系统休眠。
+
+---
+
+## 🚀 极速安装
+
+### 一键安装脚本
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Igzela/codex-nightwatch-lab/master/install.sh | bash
+```
+
+*或手动克隆安装：*
+
+```bash
+git clone https://github.com/Igzela/codex-nightwatch-lab.git ~/.local/share/codex-nightwatch
+~/.local/share/codex-nightwatch/nightwatch/bin/nightwatch install
+```
+
+### 环境诊断与校验
+
+```bash
+nightwatch doctor
+```
+```text
+Nightwatch doctor: ok
+Codex: codex-cli 0.150.1
+Auth: ok
+Quota authority: LIVE_APP_SERVER (live_app_server)
+5h: 7.0% used, reset=1787866896
+weekly: 1.0% used, reset=1788453696
+systemd-inhibit: available
+```
+
+---
+
+## 📖 核心使用模式
+
+### 模式一：夜间全自主无人值守模式
+
+在 Git 仓库中直接启动带真实验收门禁的守护任务：
+
+```bash
+cd /path/to/my-project
+nightwatch run \
+  --verify "pytest -q" \
+  --verify "git diff --check" \
+  "完成当前模块的重构并确保所有测试全部通过"
+```
+
+如果希望作为后台系统服务运行（关闭终端、注销登录不掉线）：
+
+```bash
+nightwatch run --service \
+  --verify "cargo test" \
+  --verify "git diff --check" \
+  "重构存储引擎底层接口"
+```
+
+### 模式二：交互会话无侵入监听与夜间自动接管
+
+如果你正在终端中与 Codex 交互，无需退出，直接另起窗口监听：
+
+```bash
+# 单次快照当前遥测信息
+nightwatch watch --once
+
+# 实时动态监控
+nightwatch watch
+
+# 开启夜间自动接管：一旦配额用尽或交互退出，Nightwatch 自动接管续跑
+nightwatch watch --auto-takeover --verify "pytest -q"
+```
+
+```text
+============================================================
+REPO         /home/user/projects/my-app
+THREAD ID    01a04416-c7aa-7271-9ede-7fe2d40cf950
+PROCESS      PID 466574 (ALIVE)
+MODEL        gpt-5.6-luna [branch: main]
+QUOTA 5H     7.0% used, reset=1787866896
+QUOTA WEEKLY 1.0% used
+TOKENS       total=15,947,329, input=15,882,347, output=64,982
+SUBAGENTS    Copernicus (01a0442b...), Kepler (01a0442b...)
+============================================================
+```
+
+### 模式三：显式收养已有的会话 Thread
+
+直接将现存的对话 Thread 注入 Nightwatch 控制面：
+
+```bash
+nightwatch adopt --thread 01a04416-c7aa-7271-9ede-7fe2d40cf950 --verify "pytest"
+nightwatch resume
+```
+
+---
+
+## 🛠️ CLI 常用指令表
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `nightwatch run "<goal>" [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
+| `nightwatch watch [--auto-takeover] [--once] [--json]` | 无侵入监听当前仓库中活跃的 Codex 会话 |
+| `nightwatch adopt --thread <id> [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
+| `nightwatch resume` | 恢复并继续当前仓库的精确 Thread 任务 |
+| `nightwatch status [--json]` | 查看当前持久化状态、配额恢复倒计时与里程碑进度 |
+| `nightwatch log [--tail N]` | 查看人类可读的审计与执行日志 |
+| `nightwatch report` | 输出/生成结构化验收报告 |
+| `nightwatch stop` | 安全停止自动执行（保留现场与 Thread 状态） |
+| `nightwatch doctor` | 检查 Linux、Codex CLI、认证状态、配额权威源与系统服务 |
+| `nightwatch test app-server` | 实时测试与 Codex App Server 的 JSON-RPC 协议连接 |
+
+---
+
+## ⚖️ 架构方案深度对比
+
+| 对比维度 | 原生 Codex CLI | Tmux / 屏幕抓取脚本 | **Nightwatch (守夜人)** |
+| :--- | :---: | :---: | :---: |
+| **配额恢复机制** | ❌ 需人工手动重试 | ⚠️ 正则匹配屏幕输出 | **✅ 原生 App Server stdio JSON-RPC 探测** |
+| **会话状态记忆** | ❌ 重新拉起开新会话 | ⚠️ 依赖 `--last` 猜测 | **✅ 精准持久化 `thread_id` 无损续跑** |
+| **验收完成门禁** | ❌ 模型自述假装完成 | ❌ 无验证门禁 | **✅ 用户预冻结命令通过才判定 DONE** |
+| **控制面安全性** | ⚠️ 模型可随意修改测试 | ❌ 状态暴露在仓库内 | **✅ 外部 `~/.local/state/` 独立受信任沙箱** |
+| **进程常驻形态** | ❌ 仅前台，掉线暴毙 | ⚠️ Tmux 输入注入 | **✅ user systemd 服务 + 阻塞系统睡眠** |
+| **第三方依赖** | — | Node / pnpm / Tmux | **✅ 零外部依赖（纯 Python 3 标准库）** |
+
+---
+
+## 🔒 信任边界与安全模型
+
+所有受信任权威数据均存放在 Git 工作区之外：
+
+```text
+~/.local/state/codex-nightwatch/<repo-name>-<repo-hash>/
+├── state.json                 # 持久化状态机 (包含 generation, thread_id, status)
+├── verification-policy.json   # 用户冻结的哈希绑定验证命令
+├── acceptance.json            # 目标与真实验收准则
+├── events.jsonl               # 仅追加的单调自增审计日志
+├── supervisor.lock            # 进程排他锁 (防止 PID 复用漏洞)
+└── runs/                      # 分代脱敏 stdout/stderr 执行记录
+```
+
+代码仓库内部仅包含不可信信箱目录（`.nightwatch-agent/`），任何模型产出的验证脚本均被严格拒绝执行。
+
+---
+
+## 🧪 验证与自动化测试
+
+Nightwatch 经过严密的工程验证与故障注入测试：
+
+```bash
+python3 -m unittest discover -s nightwatch/tests -v
+```
+```text
+Ran 64 tests in 3.563s
+OK
+```
+
+- ✅ 真实 Codex 0.150.1 App Server 实时配额 JSON-RPC 通信验证
+- ✅ 真实多进程并发冲突与竞争防御实测
+- ✅ SIGKILL 异常崩溃后 Linux PID 身份重校验与精确 Thread 恢复
+- ✅ 符号链接穿透与 Mailbox 命令注入反制
+
+---
+
+## 📄 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源 © 2026 Igzela
