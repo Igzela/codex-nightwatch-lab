@@ -133,5 +133,6 @@ preserves unrelated same-name files.
 
 ## 11. Final Git commit
 
-The parent project commit is recorded after the final regression and install
-smoke; see the final handoff for the exact SHA.
+Parent project commit after the final regression and install smoke:
+
+`01ec614b304b8c2308a6c1d912eecf43c9aae709`
