@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightwatch Codex supervisor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nightwatch resume
+Restart=on-failure
+RestartSec=15s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

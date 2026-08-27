@@ -1,0 +1,13 @@
+[build-system]
+requires = []
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "nightwatch"
+version = "0.1.0"
+description = "Linux-first, Codex-only, fail-closed unattended supervisor"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+nightwatch = "nightwatch.cli:main"

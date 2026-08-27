@@ -1,0 +1,6 @@
+test-artifacts/*
+!test-artifacts/fake-codex/
+!test-artifacts/fake-codex/**
+**/__pycache__/
+*.pyc
+refs/*/
