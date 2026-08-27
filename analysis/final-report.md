@@ -133,6 +133,5 @@ preserves unrelated same-name files.
 
 ## 11. Final Git commit
 
-Parent project commit after the final regression and install smoke:
-
-`2d6462701ff19240c1b4ed4470efb665fddd5cbe`
+The final handoff reports the SHA of the commit containing this report. (The
+SHA cannot be embedded self-referentially without changing the commit hash.)
