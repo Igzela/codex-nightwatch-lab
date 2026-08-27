@@ -16,7 +16,8 @@ from .git import GitError, GitSnapshot, is_ancestor, repo_root, snapshot
 from .milestones import adopt_proposed_plan, current_milestone, ingest_progress, verify_milestones
 from .models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State, TERMINAL_STATES
 from .quota import QuotaError, make_quota_provider, quota_recovered
-from .storage import NightwatchStore, StateIntegrityError, now_iso
+from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, now_iso
+from .testing import crash_hook
 
 
 MAX_TRANSIENT_RETRIES = 3
@@ -65,29 +66,58 @@ def pid_alive(pid: int | None) -> bool:
         return False
 
 
+def process_identity(pid: int) -> dict[str, Any] | None:
+    """Linux PID identity resistant to PID reuse."""
+    if not sys_platform_linux() or not pid_alive(pid):
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat_text.rsplit(")", 1)[-1].strip().split()
+        starttime = fields[19]
+        executable = os.readlink(f"/proc/{pid}/exe")
+    except (OSError, IndexError):
+        return None
+    return {"pid": pid, "starttime": starttime, "executable": executable}
+
+
+def process_matches(record: dict[str, Any]) -> bool:
+    observed = process_identity(record.get("pid")) if isinstance(record.get("pid"), int) else None
+    return bool(observed and observed.get("starttime") == record.get("starttime") and observed.get("executable") == record.get("executable"))
+
+
 def sys_platform_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def start_prompt(goal: str) -> str:
+def start_prompt(store: NightwatchStore, goal: str) -> str:
+    goal_hash = store.load_acceptance()["goal_hash"]
+    commands = store.load_policy()["final_commands"]
+    verification = "\n".join(f"- {command}" for command in commands) or "- No trusted automatic verification is configured."
     return f"""You are working under Nightwatch supervision in this Git repository.
 
-Read `.nightwatch/goal.md`, Git status/diff, and any existing `.nightwatch/checkpoint.md` first.
-Before making implementation changes, create `.nightwatch/proposed-plan.json` with this exact shape:
-{{"milestones":[{{"id":"M1","title":"...","weight":1,"required":true,"verification_commands":["..."]}}],"required_verification_commands":["..."]}}
-Use concrete milestone verification commands that are safe and relevant to this repository. Do not claim a milestone is verified; Nightwatch runs commands and owns verified status.
-After each milestone is implemented, update `.nightwatch/progress.json` with `{{"milestones":[{{"id":"M1","status":"implemented"}}]}}`.
+Read Git status/diff and the untrusted mailbox `.nightwatch-agent/context.json` first. Nightwatch's authoritative state, acceptance policy, quota evidence, thread ID, and verification policy are outside the workspace and unavailable to you.
+Before making implementation changes, create `.nightwatch-agent/proposed-plan.json` with this exact shape:
+{{"goal_hash":"{goal_hash}","milestones":[{{"id":"M1","title":"...","weight":1}}]}}
+Do not add verification commands or policy to the proposal: models may suggest task structure but cannot authorize host commands. After each milestone is implemented, update `.nightwatch-agent/progress.json` with `{{"milestones":[{{"id":"M1","status":"implemented"}}]}}`.
 
 Goal:
 {goal}
 
-Work only on unfinished work. Run the relevant verification commands before reporting completion. If a real blocker prevents progress, write `.nightwatch/blocker.json` with a concise reason and explain it. Never use dangerous approval or sandbox bypass flags."""
+The frozen, user-authorized verification commands are:
+{verification}
+Arrange the repository so these exact commands pass.  You may run them yourself, but you may not change their authority.
+
+Work only on unfinished work. If a real blocker prevents progress, write `.nightwatch-agent/blocker.json` with a concise reason and explain it. Never use dangerous approval or sandbox bypass flags."""
 
 
 def resume_prompt(store: NightwatchStore, state: dict[str, Any]) -> str:
-    return f"""Resume the same exact Nightwatch task thread. Read `.nightwatch/goal.md`, `.nightwatch/plan.json`, `.nightwatch/checkpoint.md`, `.nightwatch/progress.json` if present, Git status, Git diff, and recent commits. The durable task state says generation={state['generation']} and thread_id={state.get('thread_id')}.
+    commands = store.load_policy()["final_commands"]
+    verification = "\n".join(f"- {command}" for command in commands) or "- No trusted automatic verification is configured."
+    return f"""Resume the same exact Nightwatch task thread. Read `.nightwatch-agent/context.json`, `.nightwatch-agent/proposed-plan.json`, `.nightwatch-agent/progress.json` if present, Git status, Git diff, and recent commits. Trusted Nightwatch control-plane state is outside the workspace. The durable task state says generation={state['generation']} and thread_id={state.get('thread_id')}.
 
-Determine which milestones are actually verified from Nightwatch evidence. Do not repeat completed work. Continue only unfinished work. Update `.nightwatch/progress.json` only with implemented/working/blocked facts. Run each required verification command before considering a milestone complete. Nightwatch, not the model, decides verified/DONE. If blocked, write `.nightwatch/blocker.json` and explain the missing human decision or external prerequisite."""
+Determine which milestones are actually verified from available repository evidence. Do not repeat completed work. Continue only unfinished work. Update `.nightwatch-agent/progress.json` only with implemented/working/blocked facts. Nightwatch, not the model, decides verified/DONE and only runs frozen user-authorized checks. The frozen user-authorized verification commands are:
+{verification}
+Repair unfinished work until those exact commands pass; do not edit policy or claim verification authority. If blocked, write `.nightwatch-agent/blocker.json` and explain the missing human decision or external prerequisite."""
 
 
 class Supervisor:
@@ -102,14 +132,29 @@ class Supervisor:
             state = self.store.load_state()
         except StateIntegrityError:
             return
-        pid = state.get("active_pid")
-        if pid_alive(pid):
+        active = state.get("active_process")
+        if isinstance(active, dict) and process_matches(active):
             try:
-                os.kill(pid, signal.SIGINT)
+                os.kill(active["pid"], signal.SIGINT)
             except OSError:
                 pass
 
     def execute(self, start: bool = False) -> dict[str, Any]:
+        try:
+            with self.store.supervisor_lease():
+                owner = {"pid": os.getpid(), "acquired_at": now_iso()}
+                self.store.mutate("supervisor_lease_acquired", "supervisor lifetime lease acquired", lambda item: {**item, "supervisor_owner": owner})
+                try:
+                    return self._execute(start)
+                finally:
+                    try:
+                        self.store.mutate("supervisor_lease_released", "supervisor lifetime lease released", lambda item: {**item, "supervisor_owner": None if item.get("supervisor_owner") == owner else item.get("supervisor_owner")})
+                    except StateIntegrityError:
+                        pass
+        except SupervisorAlreadyRunning:
+            raise
+
+    def _execute(self, start: bool = False) -> dict[str, Any]:
         state = self.store.load_state()
         if state["state"] == State.DONE.value:
             return state
@@ -208,16 +253,19 @@ class Supervisor:
 
     def _recover_supervisor_restart(self) -> bool:
         state = self.store.load_state()
-        active_pid = state.get("active_pid")
-        if active_pid:
-            self.store.transition(State.RECOVERING, "active_process_reconciled", "supervisor restart found a prior Codex child", {"active_pid": active_pid})
+        active = state.get("active_process")
+        if isinstance(active, dict):
+            if pid_alive(active.get("pid")) and not process_matches(active):
+                self._fail_closed("active provider PID identity cannot be proven after restart", ErrorKind.STATE)
+                return False
+            self.store.transition(State.RECOVERING, "active_process_reconciled", "supervisor restart found a prior Codex child", {"active_process": active})
             deadline = time.monotonic() + 60
-            while pid_alive(active_pid) and time.monotonic() < deadline:
+            while process_matches(active) and time.monotonic() < deadline:
                 time.sleep(0.25)
-            if pid_alive(active_pid):
+            if process_matches(active):
                 self._fail_closed("prior Codex process is still alive but its output is unobserved", ErrorKind.STATE)
                 return False
-            state = self.store.mutate("active_process_exited", "prior Codex child is no longer alive", lambda item: {**item, "active_pid": None, "active_action": None})
+            state = self.store.mutate("active_process_exited", "prior Codex child is no longer alive", lambda item: {**item, "active_process": None})
             if not state.get("thread_id"):
                 self._fail_closed("supervisor restarted before exact thread_id was durable", ErrorKind.STATE)
                 return False
@@ -228,7 +276,11 @@ class Supervisor:
         if state["state"] == State.RUNNING.value and state.get("thread_id"):
             self.store.transition(State.RECOVERING, "supervisor_restart_recovery", "running state with exact thread recovered from disk")
         if state.get("resume_claim"):
-            self._fail_closed("ambiguous resume claim after supervisor restart; refusing duplicate resume", ErrorKind.STATE)
+            claim = state["resume_claim"]
+            if claim.get("phase") == "claimed":
+                self.store.mutate("resume_claim_proven_not_sent", "claim existed before provider spawn preparation; safe exact-thread retry", lambda item: {**item, "resume_claim": None})
+                return True
+            self._fail_closed("ambiguous resume claim after supervisor restart; run `nightwatch recover --ack-ambiguous` after review", ErrorKind.STATE)
             return False
         return True
 
@@ -243,17 +295,24 @@ class Supervisor:
             if not thread:
                 return self._fail_closed("resume path has no exact thread_id", ErrorKind.STATE)
             action = "resuming exact thread"
-        prompt = start_prompt(state["goal"]) if not thread else resume_prompt(self.store, state)
-        self.store.mutate("provider_launch_prepared", action, lambda item: {**item, "active_action": "resume" if thread else "start", "last_error": None})
+        prompt = start_prompt(self.store, state["goal"]) if not thread else resume_prompt(self.store, state)
+        self.store.mutate("provider_launch_prepared", action, lambda item: {**item, "resume_claim": ({**item["resume_claim"], "phase": "spawn_prepared"} if item.get("resume_claim") else None), "last_error": None})
 
         def on_spawn(pid: int, child_action: str) -> None:
-            self.store.mutate("provider_started", "Codex child process started", lambda item: {**item, "active_pid": pid, "active_action": child_action, "active_started_at": now_iso()})
+            identity = process_identity(pid)
+            if identity is None:
+                raise StateIntegrityError("cannot persist Linux provider process identity")
+            self.store.mutate("provider_started", "Codex child process started", lambda item: {**item, "active_process": {**identity, "action": child_action, "thread_id": item.get("thread_id"), "started_at": now_iso()}, "resume_claim": ({**item["resume_claim"], "phase": "spawned"} if item.get("resume_claim") else None)})
+            crash_hook("AFTER_PROVIDER_SPAWN")
 
         def on_thread(candidate: str) -> None:
             self.store.mutate("thread_started", "exact thread ID captured from Codex JSONL", lambda item: {**item, "thread_id": candidate})
+            crash_hook("AFTER_THREAD_CAPTURE")
 
+        crash_hook("BEFORE_PROVIDER_SPAWN")
         result = run_codex(self.store, state["generation"], prompt, thread, on_spawn, on_thread)
-        self.store.mutate("provider_finished", "Codex child process finished", lambda item: {**item, "active_pid": None, "active_action": None, "last_provider_exit": result.exit_code, "last_provider_signal": result.signal})
+        self.store.mutate("provider_finished", "Codex child process finished", lambda item: {**item, "active_process": None, "last_provider_exit": result.exit_code, "last_provider_signal": result.signal})
+        crash_hook("AFTER_PROVIDER_EXIT")
         self.store.append_event("provider_result", "classified Codex result", {"error_kind": result.error_kind.value if result.error_kind else None, "exit_code": result.exit_code, "signal": result.signal, "event_count": result.event_count, "malformed_count": result.malformed_count})
         return self._handle_result(result)
 
@@ -288,7 +347,7 @@ class Supervisor:
         buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
         next_at = reset + max(0, buffer_seconds)
         generation = state["generation"] + 1
-        return self.store.transition(State.WAIT_QUOTA, "quota_exhausted", result.error_detail or result.error_kind.value, {
+        waiting = self.store.transition(State.WAIT_QUOTA, "quota_exhausted", result.error_detail or result.error_kind.value, {
             "generation": generation,
             "next_resume_at": datetime.fromtimestamp(next_at, timezone.utc).isoformat().replace("+00:00", "Z"),
             "quota_source": source,
@@ -300,6 +359,8 @@ class Supervisor:
             "last_error": result.error_detail,
             "error_kind": result.error_kind.value,
         })
+        crash_hook("AFTER_QUOTA_DETECT")
+        return waiting
 
     def _wait_and_revalidate_quota(self) -> bool:
         state = self.store.load_state()
@@ -308,31 +369,40 @@ class Supervisor:
             self._fail_closed("WAIT_QUOTA has no valid next_resume_at", ErrorKind.STATE)
             return False
         _sleep_until(int(target.timestamp()), float(os.environ.get("NIGHTWATCH_WAIT_POLL_SECONDS", QUOTA_POLL_SECONDS)))
-        failures = 0
         governing = {window.get("name") for window in state.get("quota_windows", []) if isinstance(window, dict) and window.get("name")}
-        while not self._stop_requested:
-            try:
-                quota = self.quota_provider.read()
-                failures = 0
-                self.store.mutate("quota_revalidated", "fresh quota read completed before any resume", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
+        if self._stop_requested:
+            self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested during quota wait")
+            return False
+        try:
+            quota = self.quota_provider.read()
+            self.store.mutate("quota_revalidated", "quota authority queried after reset", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
+            if quota.source == "live_app_server":
                 if not quota_recovered(quota, governing):
                     later = max((window.resets_at or int(time.time()) + QUOTA_POLL_SECONDS for window in quota.windows() if window.name in governing), default=int(time.time()) + QUOTA_POLL_SECONDS)
                     buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
-                    self.store.transition(State.WAIT_QUOTA, "quota_still_exhausted", "quota revalidation is still exhausted; no resume sent", {"next_resume_at": datetime.fromtimestamp(later + max(0, buffer_seconds), timezone.utc).isoformat().replace("+00:00", "Z"), "resume_claim": None})
+                    self.store.transition(State.WAIT_QUOTA, "quota_still_exhausted", "live quota authority is still exhausted; no resume sent", {"next_resume_at": datetime.fromtimestamp(later + max(0, buffer_seconds), timezone.utc).isoformat().replace("+00:00", "Z"), "resume_claim": None})
                     return True
-                if not self._claim_resume():
-                    return False
-                self.store.transition(State.RECOVERING, "resume_started", "single-flight exact-thread resume claimed after quota revalidation")
-                return True
-            except Exception as exc:
-                failures += 1
-                self.store.mutate("quota_revalidation_failed", "quota recovery could not be freshly confirmed", lambda item: {**item, "last_error": f"quota revalidation failed: {type(exc).__name__}", "quota_source": "unavailable"})
-                if failures >= MAX_QUOTA_REVALIDATION_FAILURES:
-                    self._fail_closed("quota recovery cannot be safely confirmed", ErrorKind.STATE)
-                    return False
-                time.sleep(min(QUOTA_POLL_SECONDS, 2 * failures))
-        self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested during quota wait")
-        return False
+                return self._start_quota_recovery("live quota authority confirmed recovery")
+            return self._guarded_quota_probe("live quota authority unavailable; rollout is schedule-only")
+        except Exception as exc:
+            self.store.mutate("quota_revalidation_failed", "live quota authority unavailable after reset", lambda item: {**item, "last_error": f"quota authority unavailable: {type(exc).__name__}", "quota_source": "unavailable"})
+            return self._guarded_quota_probe("live quota authority unavailable after provider-declared reset")
+
+    def _start_quota_recovery(self, reason: str) -> bool:
+        if not self._claim_resume():
+            return False
+        self.store.transition(State.RECOVERING, "resume_started", reason)
+        return True
+
+    def _guarded_quota_probe(self, reason: str) -> bool:
+        state = self.store.load_state()
+        if state.get("resume_claim"):
+            self._fail_closed("quota generation already used its guarded provider availability attempt", ErrorKind.STATE)
+            return False
+        if not self._claim_resume():
+            return False
+        self.store.transition(State.RECOVERING, "quota_guarded_probe_started", reason)
+        return True
 
     def _claim_resume(self) -> bool:
         claimed = False
@@ -345,12 +415,14 @@ class Supervisor:
             existing = state.get("resume_claim")
             if existing and existing.get("generation") == state["generation"]:
                 return state
-            state["resume_claim"] = {"generation": state["generation"], "claim_id": claim_id, "claimed_at": now_iso(), "pid": os.getpid()}
+            state["resume_claim"] = {"generation": state["generation"], "claim_id": claim_id, "claimed_at": now_iso(), "pid": os.getpid(), "phase": "claimed"}
             state["last_error"] = None
             claimed = True
             return state
 
         self.store.mutate("resume_claimed", "single-flight lease claimed for quota generation", mutate)
+        if claimed:
+            crash_hook("AFTER_RESUME_CLAIM")
         return claimed
 
     def _handle_transient(self, result: ProviderResult) -> dict[str, Any]:
@@ -378,6 +450,7 @@ class Supervisor:
 
     def _after_success(self) -> dict[str, Any]:
         if self.store.load_state().get("resume_claim"):
+            crash_hook("BEFORE_CLAIM_CLEAR")
             self.store.mutate("resume_completed", "exact-thread provider result consumed by Nightwatch", lambda item: {**item, "resume_claim": None})
         self._check_git_recovery()
         adopted = adopt_proposed_plan(self.store)
@@ -395,10 +468,12 @@ class Supervisor:
         except (GitError, StateIntegrityError) as exc:
             return self._fail_closed(f"verification precondition failed: {type(exc).__name__}", ErrorKind.GIT)
         attempts = int(state.get("verification_attempts", 0)) + 1
-        all_ok = result["all_milestones_verified"] and result["all_final_checks_passed"] and state.get("plan_ready", False) and not result["git"]["conflicts"]
+        all_ok = result["all_milestones_verified"] and result["all_final_checks_passed"] and state.get("plan_ready", False) and state.get("acceptance_ready", False) and not result["git"]["conflicts"]
         self.store.mutate("verification_completed", "mechanical milestone/final verification completed", lambda item: {**item, "verification_attempts": attempts, "last_verification": result, "last_verified_commit": result["git"].get("head") if all_ok else item.get("last_verified_commit"), "final_verification_passed": all_ok, "last_git_head": result["git"].get("head")})
         if all_ok:
             return self._write_done_report(result)
+        if not state.get("acceptance_ready", False):
+            return self.store.transition(State.AWAITING_ACCEPTANCE, "awaiting_trusted_acceptance", "implementation may be complete but no frozen user verification policy can authorize DONE", {"last_error": "no trusted --verify policy was supplied"})
         if attempts >= MAX_CRASH_RETRIES:
             return self.store.transition(State.BLOCKED, "verification_failed", "verification did not pass within the bounded correction budget", {"last_error": "one or more milestone/final checks failed", "error_kind": ErrorKind.BLOCKER.value})
         return self.store.transition(State.RUNNING, "verification_failed_continue", "verification failed; exact thread must correct the repository")
@@ -422,6 +497,7 @@ class Supervisor:
         return self.store.transition(target, "fail_closed", reason, {"last_error": reason, "error_kind": kind.value, "blocker": reason if target == State.BLOCKED else current.get("blocker")})
 
     def _write_done_report(self, verification: dict[str, Any]) -> dict[str, Any]:
+        crash_hook("BEFORE_DONE_WRITE")
         state = self.store.transition(State.DONE, "done_guard_passed", "all required milestones and final verification passed", {"final_verification_passed": True, "last_verified_commit": verification["git"].get("head")})
         self.store.write_report(build_report(self.store, state, verification))
         self.store.append_event("final_report_written", "final report generated after DONE guard")

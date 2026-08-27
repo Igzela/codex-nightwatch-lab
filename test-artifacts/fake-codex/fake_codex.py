@@ -124,11 +124,15 @@ def main() -> int:
         return 0
 
     plan_file = os.environ.get("FAKE_CODEX_PLAN_FILE")
-    if plan_file and not (Path.cwd() / ".nightwatch" / "proposed-plan.json").exists():
-        Path.cwd().joinpath(".nightwatch", "proposed-plan.json").write_text(Path(plan_file).read_text())
+    mailbox = Path.cwd() / ".nightwatch-agent"
+    if plan_file and not (mailbox / "proposed-plan.json").exists():
+        plan = json.loads(Path(plan_file).read_text())
+        context = json.loads((mailbox / "context.json").read_text())
+        plan["goal_hash"] = context["goal_hash"]
+        mailbox.joinpath("proposed-plan.json").write_text(json.dumps(plan))
     progress_file = os.environ.get("FAKE_CODEX_PROGRESS_FILE")
     if progress_file:
-        Path.cwd().joinpath(".nightwatch", "progress.json").write_text(Path(progress_file).read_text())
+        mailbox.joinpath("progress.json").write_text(Path(progress_file).read_text())
     if scenario in {"normal", "done_but_fails"}:
         Path.cwd().joinpath("fake-implemented.txt").write_text("implemented\n")
         emit({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}})

@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 import sys
 
+TEST_STATE_HOME = tempfile.mkdtemp(prefix="nightwatch-trusted-tests-")
+os.environ["NIGHTWATCH_STATE_HOME"] = TEST_STATE_HOME
+
 PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
 
@@ -40,13 +43,7 @@ def fixture() -> tuple[tempfile.TemporaryDirectory, Path, Path, Path]:
     git_run(root, "add", "README.md")
     git_run(root, "commit", "-qm", "fixture")
     plan = root / "plan.json"
-    plan.write_text(json.dumps({
-        "required_verification_commands": ["git diff --check"],
-        "milestones": [{
-            "id": "M1", "title": "fixture", "weight": 1, "required": True,
-            "verification_commands": ["test -f fake-implemented.txt"],
-        }],
-    }))
+    plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "fixture", "weight": 1}]}))
     progress = root / "progress.json"
     progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
     return temporary, root, plan, progress
@@ -55,7 +52,7 @@ def fixture() -> tuple[tempfile.TemporaryDirectory, Path, Path, Path]:
 class RecoveredQuota:
     def read(self) -> QuotaSnapshot:
         return QuotaSnapshot(
-            "fake-provider", "now",
+            "live_app_server", "now",
             QuotaWindow("5h", 0, 300, int(time.time()) + 1),
             QuotaWindow("weekly", 0, 10080, int(time.time()) + 1),
         )
@@ -68,7 +65,7 @@ class ExhaustedQuota:
     def read(self) -> QuotaSnapshot:
         self.calls += 1
         return QuotaSnapshot(
-            "fake-provider", "now",
+            "live_app_server", "now",
             QuotaWindow("5h", 100, 300, int(time.time()) + 2),
             QuotaWindow("weekly", 0, 10080, int(time.time()) + 2),
         )
@@ -91,12 +88,12 @@ class FaultMatrixTests(unittest.TestCase):
             temporary, root, plan, progress = fixture()
             try:
                 store = NightwatchStore(root)
-                store.initialize(f"run-{scenario}", "goal", str(root))
+                store.initialize(f"run-{scenario}", "goal", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
                 with self.env(plan, progress, scenario):
                     final = Supervisor(store, RecoveredQuota()).execute(start=True)
                 self.assertEqual(final["state"], State.BLOCKED.value, scenario)
                 self.assertNotEqual(final["state"], State.DONE.value)
-                self.assertIsNone(final.get("active_pid"))
+                self.assertIsNone(final.get("active_process"))
             finally:
                 temporary.cleanup()
 
@@ -105,14 +102,14 @@ class FaultMatrixTests(unittest.TestCase):
             temporary, root, _plan, _progress = fixture()
             try:
                 store = NightwatchStore(root)
-                store.initialize(f"run-{kind.value}", "goal", str(root))
+                store.initialize(f"run-{kind.value}", "goal", str(root), verify_commands=["git diff --check"])
                 store.transition(State.PREFLIGHT, "preflight_started", "test")
                 store.transition(State.RUNNING, "provider_launch_ready", "test", {"thread_id": "TEST-001"})
                 supervisor = Supervisor(store, RecoveredQuota())
                 result = supervisor._handle_result(ProviderResult(1, None, "TEST-001", 1, 0, error_kind=kind, error_detail=kind.value))
                 self.assertEqual(result["state"], State.RETRY_BACKOFF.value, kind.value)
                 self.assertGreater(result["next_resume_at"], result["updated_at"], kind.value)
-                self.assertEqual(result["active_pid"], None)
+                self.assertEqual(result["active_process"], None)
             finally:
                 temporary.cleanup()
 
@@ -120,7 +117,7 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, _plan, _progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-still-quota", "goal", str(root))
+            store.initialize("run-still-quota", "goal", str(root), verify_commands=["git diff --check"])
             store.transition(State.PREFLIGHT, "preflight_started", "test")
             store.transition(State.RUNNING, "provider_launch_ready", "test", {"thread_id": "TEST-001"})
             supervisor = Supervisor(store, ExhaustedQuota())
@@ -142,7 +139,7 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, _plan, _progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-duplicate", "goal", str(root))
+            store.initialize("run-duplicate", "goal", str(root), verify_commands=["git diff --check"])
             store.transition(State.PREFLIGHT, "preflight_started", "test")
             store.transition(State.RUNNING, "provider_launch_ready", "test", {"thread_id": "TEST-001"})
             supervisor = Supervisor(store, RecoveredQuota())
@@ -156,7 +153,7 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, _plan, _progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-quota-transient", "goal", str(root))
+            store.initialize("run-quota-transient", "goal", str(root), verify_commands=["git diff --check"])
             store.transition(State.PREFLIGHT, "preflight_started", "test")
             store.transition(State.RUNNING, "provider_launch_ready", "test", {"thread_id": "TEST-001"})
             supervisor = Supervisor(store, RecoveredQuota())
@@ -173,10 +170,9 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, _plan, _progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-wrong-root", "goal", str(root / "wrong"))
-            with self.env(root / "missing", root / "missing", "normal"):
-                final = Supervisor(store, RecoveredQuota()).execute(start=True)
-            self.assertEqual(final["state"], State.BLOCKED.value)
+            store.initialize("run-wrong-root", "goal", str(root / "wrong"), verify_commands=["git diff --check"])
+            with self.assertRaises(Exception):
+                Supervisor(store, RecoveredQuota()).execute(start=True)
             self.assertFalse((root / ".fake-codex-state.json").exists())
         finally:
             temporary.cleanup()
@@ -196,7 +192,7 @@ class FaultMatrixTests(unittest.TestCase):
             merge = git_run(root, "merge", "other", check=False)
             self.assertNotEqual(merge.returncode, 0)
             store = NightwatchStore(root)
-            store.initialize("run-conflict", "goal", str(root))
+            store.initialize("run-conflict", "goal", str(root), verify_commands=["git diff --check"])
             with self.env(root / "missing", root / "missing", "normal"):
                 final = Supervisor(store, RecoveredQuota()).execute(start=True)
             self.assertEqual(final["state"], State.BLOCKED.value)
@@ -208,7 +204,7 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-quota-again", "goal", str(root))
+            store.initialize("run-quota-again", "goal", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             with self.env(plan, progress, "quota_again"), patch.dict(os.environ, {"FAKE_CODEX_RESET_SECONDS": "0"}):
                 final = Supervisor(store, RecoveredQuota()).execute(start=True)
             self.assertEqual(final["state"], State.DONE.value)
@@ -224,7 +220,7 @@ class FaultMatrixTests(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-manual", "goal", str(root))
+            store.initialize("run-manual", "goal", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             with self.env(plan, progress, "auth"):
                 first = Supervisor(store, RecoveredQuota()).execute(start=True)
             self.assertEqual(first["state"], State.FAILED.value)

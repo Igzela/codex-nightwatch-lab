@@ -1,33 +1,73 @@
 # nightwatch
 
-`nightwatch` supervises one non-interactive OpenAI Codex CLI thread inside one Git repository. It persists the exact thread ID, quota wait, milestones, verification evidence, and every automatic recovery decision under `.nightwatch/`.
+`nightwatch` is a Linux-first unattended supervisor for one exact OpenAI Codex
+CLI thread in one Git repository. It is intentionally a small trusted control
+plane, not an agent framework.
+
+## Trust boundary
+
+Authoritative state is outside the Codex workspace:
+
+```text
+~/.local/state/codex-nightwatch/<repo-name>-<path-and-git-hash>/
+├── state.json, plan.json, acceptance.json, verification-policy.json
+├── events.jsonl, supervisor.log, supervisor.lock
+├── runs/, reports/, checkpoint.md, metadata.json
+```
+
+The repository contains only the untrusted agent mailbox:
+
+```text
+.nightwatch-agent/{context.json,proposed-plan.json,progress.json,blocker.json}
+```
+
+Codex cannot change thread identity, quota leases, progress authority, verified
+status, reports, or verification policy. Legacy `repo/.nightwatch/` data is
+preserved but ignored; schema-1 state is never silently reinterpreted.
+
+## Use
+
+Pass real acceptance commands yourself. They are frozen before Codex starts;
+model-proposed shell commands are rejected and never executed. A lone `git diff
+--check` is deliberately insufficient for an arbitrary natural-language goal.
 
 ```bash
-nightwatch run "完成当前仓库规划中的所有剩余任务，并逐阶段验证，直到所有验收条件满足"
+cd /path/to/git-repo
+nightwatch run --service \
+  --verify 'pytest -q' \
+  --verify 'git diff --check' \
+  '完成当前仓库规划中的所有剩余任务，并逐阶段验证，直到所有验收条件满足'
+```
+
+The service is user-level systemd. It survives terminal closure, retries only
+unexpected internal exits, and does not loop for `BLOCKED`, `STOPPED`, or
+provider/auth `FAILED` outcomes.
+
+```bash
 nightwatch status
+nightwatch log
 nightwatch report
+nightwatch stop
+nightwatch recover --ack-ambiguous  # only after manual ambiguous-lease review
 ```
 
-Automatic recovery uses `codex exec resume <EXACT_THREAD_ID>`. Normal recovery never uses `resume --last`; no automatic privilege escalation or sandbox bypass is enabled. If quota cannot be freshly revalidated, state remains waiting or becomes blocked.
-
-For the unattended path—safe to close the terminal after the command returns—use:
+Quota authority is reported explicitly. Live App Server reads can authorize
+recovery; rollout JSONL is schedule-only. If live quota status is unavailable
+after a provider-declared reset, Nightwatch permits at most one guarded exact
+thread availability probe for that quota generation.
 
 ```bash
-nightwatch run --service "完成当前仓库规划中的所有剩余任务，并逐阶段验证，直到所有验收条件满足"
+nightwatch doctor
+nightwatch test app-server
+nightwatch test quota-soak
 ```
 
-It creates durable `NEW` state, installs a repo-bound user service, reloads the
-user systemd manager, and starts it. The service runs the same supervisor and
-continues waiting for and revalidating quota while you are away. It restarts only
-after an abnormal supervisor crash; a `BLOCKED`, `FAILED`, or `STOPPED` result is
-left stopped for inspection rather than retried forever. This requires a running
-user systemd manager (`systemctl --user`).
+Install/update is user-local and reversible:
 
-Alternatively, install the launcher with `nightwatch install`. To install (but
-not start) a repo-bound user service, run `nightwatch install --service --repo
-"$PWD"`, then enable it with `systemctl --user daemon-reload && systemctl --user
-enable --now nightwatch.service`. The service is user-level only and does not
-require root. `nightwatch uninstall` removes only files carrying Nightwatch's
-install marker.
+```bash
+nightwatch install
+nightwatch uninstall
+```
 
-See `../analysis/architecture-decision.md` and `../analysis/final-report.md` for the design and release evidence.
+Nightwatch backs up prior Nightwatch-marked launcher/unit files under its local
+state directory before replacing them and never overwrites unrelated files.

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import selectors
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .app_server import AppServerClient, AppServerProtocolError
 from .codex import extract_quota_windows, parse_iso
 from .models import QuotaSnapshot, QuotaWindow
 from .storage import redact
@@ -55,74 +54,10 @@ class AppServerQuotaProvider:
 
     def read(self) -> QuotaSnapshot:
         try:
-            process = subprocess.Popen(
-                [self.binary, "app-server", "--stdio"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except OSError as exc:
-            raise QuotaError(f"failed to start Codex App Server: {type(exc).__name__}") from exc
-        requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "nightwatch", "version": "0.1.0"}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}},
-        ]
-        try:
-            assert process.stdin is not None
-            for request in requests:
-                process.stdin.write(json.dumps(request) + "\n")
-                process.stdin.flush()
-            process.stdin.close()
-            responses: dict[int, dict[str, Any]] = {}
-            selector = selectors.DefaultSelector()
-            assert process.stdout is not None
-            selector.register(process.stdout, selectors.EVENT_READ)
-            deadline = time.monotonic() + self.timeout
-            buffer = ""
-            while time.monotonic() < deadline and 2 not in responses:
-                events = selector.select(max(0.05, deadline - time.monotonic()))
-                if not events:
-                    continue
-                chunk = process.stdout.readline()
-                if not chunk:
-                    break
-                buffer += chunk
-                for line in buffer.splitlines():
-                    try:
-                        message = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ident = message.get("id")
-                    if isinstance(ident, int):
-                        responses[ident] = message
-            response = responses.get(2)
-            if not response:
-                raise QuotaError("Codex App Server quota response timed out")
-            if response.get("error"):
-                error = response["error"]
-                raise QuotaError(str(redact(error.get("message", "App Server returned an error"))) if isinstance(error, dict) else "App Server returned an error")
-            return parse_quota_result(response.get("result"), "app_server")
-        finally:
-            try:
-                selector.close()
-            except (NameError, OSError):
-                pass
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            for stream in (process.stdin, process.stdout, process.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except OSError:
-                    pass
+            result = AppServerClient(self.binary, self.timeout).rate_limits()
+            return parse_quota_result(result, "live_app_server")
+        except AppServerProtocolError as exc:
+            raise QuotaError(str(exc)) from exc
 
 
 class RolloutQuotaProvider:
@@ -180,7 +115,8 @@ class FallbackQuotaProvider:
             return self.primary.read()
         except QuotaError as primary_error:
             try:
-                return self.fallback.read()
+                snapshot = self.fallback.read()
+                return QuotaSnapshot("rollout_schedule_only", snapshot.read_at, snapshot.primary, snapshot.secondary, snapshot.plan_type, snapshot.error)
             except QuotaError as fallback_error:
                 raise QuotaError("App Server and local rollout quota sources unavailable") from fallback_error
 
@@ -205,6 +141,8 @@ def make_quota_provider() -> AppServerQuotaProvider | FileQuotaProvider | Fallba
 
 
 def quota_recovered(snapshot: QuotaSnapshot, names: set[str]) -> bool:
+    if snapshot.source.startswith("rollout_"):
+        return False
     if snapshot.error:
         return False
     selected = [window for window in snapshot.windows() if window.name in names]

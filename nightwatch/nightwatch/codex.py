@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .models import ErrorKind, ProviderResult, QuotaWindow
+from .milestones import trusted_environment
 from .storage import NightwatchStore, redact
 
 
@@ -203,7 +204,8 @@ def classify_failure(
         for value in _walk_dicts(event)
         if isinstance(value.get("code"), str)
     ).lower()
-    is_weekly = any(token in lower for token in ("weekly", "7 day", "7-day"))
+    reached_types = [str(item.get("rateLimitReachedType", "")).lower() for event in events for item in _walk_dicts(event)]
+    is_weekly = any(value in {"weekly", "week", "7d", "7_day"} for value in reached_types) or any(token in lower for token in ("weekly", "7 day", "7-day"))
     quota_code = any(token in structured_codes for token in ("usage_limit", "usage-limit", "quota_exhausted", "rate_limit_reached"))
     quota_text = "usage limit" in lower or "you've hit your usage" in lower or "quota exhausted" in lower
     if quota_code or quota_text or any(window.exhausted for window in windows):
@@ -289,7 +291,7 @@ def run_codex(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-            env=dict(os.environ),
+        env=trusted_environment(),
         )
     except OSError as exc:
         return ProviderResult(None, None, thread_id, 0, 0, error_kind=ErrorKind.UNKNOWN, error_detail=f"Codex spawn failed: {type(exc).__name__}", run_log=str(run_log))

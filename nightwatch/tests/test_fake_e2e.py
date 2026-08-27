@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 import sys
 
+TEST_STATE_HOME = tempfile.mkdtemp(prefix="nightwatch-trusted-tests-")
+os.environ["NIGHTWATCH_STATE_HOME"] = TEST_STATE_HOME
+
 PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
 
@@ -30,7 +33,7 @@ class ScriptedQuota:
     def read(self):
         self.calls += 1
         return QuotaSnapshot(
-            "fake-provider", "now",
+            "live_app_server", "now",
             QuotaWindow("5h", 0, 300, int(time.time()) + 100),
             QuotaWindow("weekly", 0, 10080, int(time.time()) + 100),
         )
@@ -50,7 +53,7 @@ def fixture() -> tuple[tempfile.TemporaryDirectory, Path, Path, Path]:
     git_run(root, "add", "README.md")
     git_run(root, "commit", "-qm", "fixture")
     plan_file = root / "plan-source.json"
-    plan_file.write_text(json.dumps({"required_verification_commands": ["git diff --check"], "milestones": [{"id": "M1", "title": "implement fixture", "weight": 1, "required": True, "verification_commands": ["test -f fake-implemented.txt"]}]}))
+    plan_file.write_text(json.dumps({"milestones": [{"id": "M1", "title": "implement fixture", "weight": 1}]}))
     progress_file = root / "progress-source.json"
     progress_file.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
     return temporary, root, plan_file, progress_file
@@ -72,7 +75,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-normal", "implement fixture", str(root))
+            store.initialize("run-normal", "implement fixture", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             with self.env(plan, progress):
                 final = Supervisor(store, ScriptedQuota()).execute(start=True)
             self.assertEqual(final["state"], State.DONE.value)
@@ -91,7 +94,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-service", "implement fixture", str(root))
+            store.initialize("run-service", "implement fixture", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             with self.env(plan, progress):
                 final = Supervisor(store, ScriptedQuota()).execute(start=False)
             self.assertEqual(final["state"], State.DONE.value)
@@ -106,7 +109,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-quota", "implement fixture", str(root))
+            store.initialize("run-quota", "implement fixture", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             quota = ScriptedQuota()
             with self.env(plan, progress, "quota_then_success"), patch.dict(os.environ, {"FAKE_CODEX_RESET_SECONDS": "1"}):
                 final = Supervisor(store, quota).execute(start=True)
@@ -133,7 +136,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-auth", "goal", str(root))
+            store.initialize("run-auth", "goal", str(root), verify_commands=["git diff --check"])
             with self.env(plan, progress, "auth"):
                 final = Supervisor(store, ScriptedQuota()).execute(start=True)
             self.assertEqual(final["state"], State.FAILED.value)
@@ -145,7 +148,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-blocker", "goal", str(root))
+            store.initialize("run-blocker", "goal", str(root), verify_commands=["git diff --check"])
             with self.env(plan, progress, "blocker"):
                 final = Supervisor(store, ScriptedQuota()).execute(start=True)
             self.assertEqual(final["state"], State.BLOCKED.value)
@@ -156,10 +159,10 @@ class FakeCodexE2E(unittest.TestCase):
     def test_done_but_verification_failure_cannot_become_done(self):
         temporary, root, _plan, progress = fixture()
         bad_plan = root / "bad-plan.json"
-        bad_plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "bad check", "weight": 1, "required": True, "verification_commands": ["false"]}]}))
+        bad_plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "bad check", "weight": 1}]}))
         try:
             store = NightwatchStore(root)
-            store.initialize("run-bad-check", "goal", str(root))
+            store.initialize("run-bad-check", "goal", str(root), verify_commands=["false"])
             with self.env(bad_plan, progress, "done_but_fails"):
                 final = Supervisor(store, ScriptedQuota()).execute(start=True)
             self.assertEqual(final["state"], State.BLOCKED.value)
@@ -171,7 +174,7 @@ class FakeCodexE2E(unittest.TestCase):
         temporary, root, plan, progress = fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-weekly", "goal", str(root))
+            store.initialize("run-weekly", "goal", str(root), verify_commands=["git diff --check"])
             with self.env(plan, progress, "weekly"):
                 first = Supervisor(store, ScriptedQuota())
                 # Run only the provider turn so the state remains inspectable in WAIT_QUOTA.

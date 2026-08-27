@@ -12,6 +12,9 @@ from unittest.mock import patch
 
 import sys
 
+TEST_STATE_HOME = tempfile.mkdtemp(prefix="nightwatch-trusted-tests-")
+os.environ["NIGHTWATCH_STATE_HOME"] = TEST_STATE_HOME
+
 PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
 
@@ -36,7 +39,7 @@ def repo_fixture() -> tuple[tempfile.TemporaryDirectory, Path, Path, Path]:
     git_run(root, "add", "README.md")
     git_run(root, "commit", "-qm", "fixture")
     plan = root / "plan.json"
-    plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "fixture", "weight": 1, "required": True, "verification_commands": ["test -f fake-implemented.txt"]}], "required_verification_commands": ["git diff --check"]}))
+    plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "fixture", "weight": 1}]}))
     progress = root / "progress.json"
     progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
     return temporary, root, plan, progress
@@ -60,7 +63,7 @@ class RecoveryTests(unittest.TestCase):
         temporary, root, plan, progress = repo_fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-crash", "goal", str(root))
+            store.initialize("run-crash", "goal", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             with self.env(plan, progress, "crash", FAKE_CODEX_RESUME_SCENARIO="normal"):
                 final = Supervisor(store, object()).execute(start=True)
             self.assertEqual(final["state"], State.DONE.value)
@@ -76,11 +79,11 @@ class RecoveryTests(unittest.TestCase):
         temporary, root, plan, progress = repo_fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-claim", "goal", str(root))
+            store.initialize("run-claim", "goal", str(root), verify_commands=["git diff --check"])
             store.transition(State.PREFLIGHT, "preflight_started", "test")
             store.transition(State.RUNNING, "provider_launch_ready", "test")
             store.transition(State.WAIT_QUOTA, "quota_exhausted", "test", {"thread_id": "TEST-001", "generation": 2, "next_resume_at": "2030-01-01T00:00:00Z"})
-            store.mutate("resume_claimed", "simulated supervisor crash after claim", lambda state: {**state, "resume_claim": {"generation": 2, "claim_id": "x", "claimed_at": "2026-01-01T00:00:00Z", "pid": 999999}})
+            store.mutate("resume_claimed", "simulated supervisor crash after claim", lambda state: {**state, "resume_claim": {"generation": 2, "claim_id": "x", "claimed_at": "2026-01-01T00:00:00Z", "pid": 999999, "phase": "spawn_prepared"}})
             with self.env(plan, progress, "normal"):
                 final = Supervisor(store, object()).execute(start=False)
             self.assertEqual(final["state"], State.BLOCKED.value)
@@ -93,13 +96,13 @@ class RecoveryTests(unittest.TestCase):
         temporary, root, plan, progress = repo_fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-claim-running", "goal", str(root))
+            store.initialize("run-claim-running", "goal", str(root), verify_commands=["git diff --check"])
             store.transition(State.PREFLIGHT, "preflight_started", "test")
             store.transition(State.RUNNING, "provider_launch_ready", "test", {"thread_id": "TEST-001"})
             store.mutate("resume_claimed", "simulated crash after exact resume provider exit", lambda state: {
                 **state,
                 "generation": 2,
-                "resume_claim": {"generation": 2, "claim_id": "x", "claimed_at": "2026-01-01T00:00:00Z", "pid": 999999},
+                "resume_claim": {"generation": 2, "claim_id": "x", "claimed_at": "2026-01-01T00:00:00Z", "pid": 999999, "phase": "spawn_prepared"},
             })
             with self.env(plan, progress, "normal"):
                 final = Supervisor(store, object()).execute(start=False)
@@ -113,7 +116,7 @@ class RecoveryTests(unittest.TestCase):
         temporary, root, plan, progress = repo_fixture()
         try:
             store = NightwatchStore(root)
-            store.initialize("run-git", "goal", str(root))
+            store.initialize("run-git", "goal", str(root), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
             original = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
             store.mutate("test_setup", "test", lambda state: {**state, "last_verified_commit": original, "thread_id": "TEST-001", "state": "RUNNING"})
             (root / "other.txt").write_text("external\n")
@@ -140,9 +143,9 @@ class RecoveryTests(unittest.TestCase):
                 "FAKE_CODEX_PLAN_FILE": str(plan),
                 "FAKE_CODEX_PROGRESS_FILE": str(progress),
             })
-            command = [sys.executable, str(PRODUCT / "bin" / "nightwatch"), "run", "goal", "--repo", str(root), "--no-inhibit"]
+            command = [sys.executable, str(PRODUCT / "bin" / "nightwatch"), "run", "goal", "--verify", "test -f fake-implemented.txt", "--repo", str(root), "--no-inhibit"]
             supervisor_process = subprocess.Popen(command, cwd=root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            state_path = root / ".nightwatch" / "state.json"
+            state_path = NightwatchStore(root).state_path
             deadline = time.time() + 10
             state = {}
             while time.time() < deadline:
@@ -151,11 +154,11 @@ class RecoveryTests(unittest.TestCase):
                         state = json.loads(state_path.read_text())
                     except json.JSONDecodeError:
                         pass
-                    if state.get("thread_id") and state.get("active_pid"):
+                    if state.get("thread_id") and state.get("active_process"):
                         break
                 time.sleep(0.05)
             self.assertEqual(state.get("thread_id"), "TEST-001")
-            child = state.get("active_pid")
+            child = state.get("active_process", {}).get("pid")
             os.kill(supervisor_process.pid, signal.SIGKILL)
             supervisor_process.wait(timeout=5)
             supervisor_process.communicate(timeout=2)

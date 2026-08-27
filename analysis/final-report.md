@@ -1,145 +1,57 @@
-# Nightwatch final report
+# Nightwatch hardening release report
 
 Status: **USABLE_PENDING_REAL_QUOTA_SOAK**
 
-## 1. Final architecture
+## Result
 
-Nightwatch is a small Python 3.11+ standard-library Linux CLI. One Git
-repository owns one `.nightwatch/` state directory and one exact Codex thread.
-The supervisor launches `codex exec --json` with workspace-write sandboxing
-and a prompt on stdin, captures `thread.started.thread_id`, and resumes only
-with `codex exec --json resume <EXACT_THREAD_ID> -`. It may run in the
-foreground or as a repo-bound user-level systemd service.
+Nightwatch v2 is Linux-first, Codex-only, exact-thread, quota-aware,
+crash-resilient, fail-closed, and has a trusted control plane outside the
+Codex workspace. The previous release's architecture blockers are closed:
+workspace authority, model-to-shell escalation, incomplete App Server protocol,
+rollout-as-live-quota semantics, transaction-only locking, PID reuse, ambiguous
+claims, and systemd exit-loop semantics.
 
-State transitions, atomic JSON snapshots, append-only JSONL evidence, file
-locking, bounded retry budgets, Git recovery checks, milestone verification,
-quota generation leases, and final DONE guards are all local and durable.
-`systemd-inhibit` and an optional user-level systemd unit are integrations, not
-correctness prerequisites. For unattended use, `nightwatch run --service
-"goal"` durably initializes the goal before it starts the user service.
+## Architecture
 
-## 2. Reference projects audited
+- Trusted state: `~/.local/state/codex-nightwatch/<safe-name>-<sha256>/`,
+  0700 root and 0600 files. Identity binds real repository path and origin.
+- Untrusted mailbox: `repo/.nightwatch-agent/`; bounded no-symlink JSON input.
+- Frozen acceptance: user `--verify` commands are hash-bound before Codex runs.
+  Only those commands may execute; model verification commands are rejected.
+- Completion: `DONE` requires trusted policy, verified milestones, final checks,
+  Git safety and final report. Weak/diff-only acceptance is
+  `AWAITING_ACCEPTANCE`, not DONE.
+- Quota: live App Server revalidation is authority. Rollout JSONL is
+  schedule-only; a reset without live authority permits one guarded probe per
+  exact-thread generation.
+- Recovery: lifetime lock, Linux PID identity, durable claim phase and explicit
+  `recover --ack-ambiguous` for irreducible uncertainty.
 
-Cloned and source-audited: `continuation-layer`, `unsnooze`, `codex-auto`,
-`tmux-codex-auto-continue`, `codex-limit`, and `agent-resume`. The checkouts
-are in `refs/`; none was modified and no source code was copied. Detailed
-comparisons are in `source-audit.md`, `feature-matrix.md`, and
-`design-review.md`.
+## Validation
 
-## 3. Adopted and rejected designs
+- 55 automated tests pass.
+- Real Codex 0.150.1 App Server rate-limit handshake/read passes.
+- Real user-systemd normal completion and post-thread-capture SIGKILL restart
+  fixtures pass, with `TEST-001` exact resume evidence.
+- A fresh schema-2 real Codex calculator fixture captured an exact thread
+  externally, rejected an initial failed frozen check, then resumed that same
+  thread and reached DONE only after final checks passed.
 
-Adopted: structured JSONL identity/rate limits, App Server RPC shape,
-rollout structured fallback, exact-ID argv resume, watchdog polling, atomic
-state, single-flight leases, bounded backoff, PID reconciliation, and Git
-reality checks.
+## Known limits
 
-Rejected: TUI/screen scraping as an authority, PTY/tmux as a correctness
-dependency, `resume --last`, latest-session guessing, model-owned progress,
-unlocked writes, infinite retry, auto approval, sandbox bypass, and a broad
-multi-provider framework. No reference code was reused; license details and
-the reason are recorded in `attribution.md`.
+- `REAL_QUOTA_SOAK` remains pending a natural quota cycle; it was not forced.
+- Explicit user verification commands are trusted local capabilities; users
+  should choose commands that actually express their acceptance criteria.
+- Logout persistence depends on host user-manager linger configuration.
 
-## 4. Product layout
-
-```text
-nightwatch/
-├── nightwatch/{cli,codex,git,milestones,models,quota,storage,supervisor}.py
-├── tests/{test_unit,test_fake_e2e,test_fault_matrix,test_recovery}.py
-├── bin/nightwatch
-├── systemd/nightwatch.service
-├── pyproject.toml
-└── README.md
-```
-
-Runtime state is `.nightwatch/state.json`, `goal.md`, `plan.json`,
-`checkpoint.md`, `events.jsonl`, `supervisor.log`, `runs/`, and `reports/`.
-
-## 5. Tests
-
-The final automated suite contains **42 tests**, all passing with
-`ResourceWarning` promoted to errors. It includes pure unit tests, fake-Codex
-E2E, the full fault matrix, quota leases, exact-thread recovery, Codex child
-crash recovery, Nightwatch `SIGKILL` restart recovery, and user-service
-handoff/fail-closed tests.
-
-## 6. Real validation
-
-- Real Codex JSONL thread capture: **PASS**.
-- Real Codex calculator smoke and exact-thread manual resume: **PASS**.
-- Real Codex child `SIGKILL` recovery: **PASS**.
-- Nightwatch supervisor crash recovery: **PASS** in isolated automated fixture.
-- Real user-systemd Fake-Codex handoff: **PASS**. `nightwatch run --service`
-  persisted `NEW` state, launched the repo-bound unit with `systemctl --user`,
-  and the unit completed an exact `TEST-001` goal through final verification.
-- DONE guard against failed verification: **PASS**.
-- Secret redaction and no dangerous auto-approval/bypass flags: **PASS**.
-- Doctor: **PASS** for Linux/Codex/auth; quota source was structured
-  `rollout_jsonl` fallback because the App Server was unreachable here.
-
-## 7. Quota source
-
-The source order is:
-
-1. Codex App Server `account/rateLimits/read`.
-2. Recent local Codex rollout JSONL `rate_limits`.
-3. Structured Codex error payload/relative reset information for scheduling.
-
-The fallback is freshness-bounded. If quota recovery cannot be confirmed, no
-resume is sent and the run remains `WAIT_QUOTA` or becomes `BLOCKED`.
-
-Reports include each validated 5h and weekly window's used percentage, duration,
-and reset epoch when a snapshot was available during that run.
-
-## 8. Real quota soak
-
-`REAL_QUOTA_SOAK = PENDING_REAL_QUOTA_SOAK`. It was intentionally not forced:
-the test requires a natural 5h/weekly provider limit cycle. This is the only
-release-gate item not immediately completed.
-
-## 9. Known limitations
-
-- The Codex App Server protocol is experimental and may change.
-- Rollout fallback is local evidence, not a substitute for a live provider
-  revalidation; stale records are rejected.
-- A provider resume that fails after a quota lease is deliberately `BLOCKED`
-  instead of retried in the same generation, preserving the exactly-once
-  recovery invariant.
-- Sleep inhibition depends on a functioning user/systemd bus; the supervisor
-  remains usable without it.
-- A required milestone must provide explicit verification commands. A model's
-  “done” text never satisfies the DONE guard.
-
-## 10. Install, use, uninstall
-
-From the product directory after tests:
+## Use
 
 ```bash
-python3 bin/nightwatch install
-cd /path/to/git-repo
-nightwatch run --service "继续当前仓库规划，完成所有未完成任务并逐阶段验证。"
+nightwatch run --service --verify 'pytest -q' --verify 'git diff --check' 'goal'
 nightwatch status
 nightwatch report
+nightwatch test app-server
 ```
 
-The service persists through terminal closure and restarts only after abnormal
-supervisor termination. It deliberately does not restart a `BLOCKED`, `FAILED`,
-or `STOPPED` goal. Equivalent manual setup, without starting it automatically:
-
-```bash
-nightwatch install --service --repo /path/to/git-repo
-systemctl --user enable --now nightwatch.service
-```
-
-Rollback is:
-
-```bash
-nightwatch uninstall
-```
-
-Uninstall removes only files containing Nightwatch's install marker and
-preserves unrelated same-name files.
-
-## 11. Final Git commit
-
-The final handoff reports the SHA of the commit containing this report. (The
-SHA cannot be embedded self-referentially without changing the commit hash.)
+Detailed design and security evidence are in `architecture-decision.md`,
+`security-review.md`, and `verification-log.md`.

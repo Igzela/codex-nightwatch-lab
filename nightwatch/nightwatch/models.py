@@ -13,6 +13,7 @@ class State(StrEnum):
     RETRY_BACKOFF = "RETRY_BACKOFF"
     RECOVERING = "RECOVERING"
     VERIFYING = "VERIFYING"
+    AWAITING_ACCEPTANCE = "AWAITING_ACCEPTANCE"
     BLOCKED = "BLOCKED"
     STOPPED = "STOPPED"
     DONE = "DONE"
@@ -104,15 +105,16 @@ class ProviderResult:
     run_log: str | None = None
 
 
-TERMINAL_STATES = {State.DONE, State.FAILED, State.BLOCKED, State.STOPPED}
+TERMINAL_STATES = {State.DONE, State.FAILED, State.BLOCKED, State.STOPPED, State.AWAITING_ACCEPTANCE}
 
 
-def empty_state(run_id: str, goal: str, repo: str, now: str) -> dict[str, Any]:
+def empty_state(run_id: str, goal: str, repo: str, repo_id: str, now: str) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "goal": goal,
         "repo": repo,
+        "repo_id": repo_id,
         "thread_id": None,
         "state": State.NEW.value,
         "generation": 1,
@@ -126,9 +128,8 @@ def empty_state(run_id: str, goal: str, repo: str, now: str) -> dict[str, Any]:
         "last_error": None,
         "error_kind": None,
         "blocker": None,
-        "active_pid": None,
-        "active_started_at": None,
-        "active_action": None,
+        "active_process": None,
+        "supervisor_owner": None,
         "resume_claim": None,
         "retry_attempt": 0,
         "crash_attempt": 0,
@@ -142,19 +143,20 @@ def empty_state(run_id: str, goal: str, repo: str, now: str) -> dict[str, Any]:
         "verification_attempts": 0,
         "last_verification": None,
         "inhibit_requested": False,
+        "acceptance_ready": False,
     }
 
 
 def validate_state(state: dict[str, Any]) -> None:
     required = {
-        "schema_version", "run_id", "goal", "repo", "thread_id", "state",
+        "schema_version", "run_id", "goal", "repo", "repo_id", "thread_id", "state",
         "generation", "created_at", "updated_at", "next_resume_at", "quota_source",
         "last_verified_commit", "last_error", "last_event",
     }
     missing = sorted(required - set(state))
     if missing:
         raise ValueError(f"state missing fields: {', '.join(missing)}")
-    if state.get("schema_version") != 1:
+    if state.get("schema_version") != 2:
         raise ValueError(f"unsupported state schema: {state.get('schema_version')!r}")
     if state.get("state") not in {item.value for item in State}:
         raise ValueError(f"unknown state: {state.get('state')!r}")
@@ -166,6 +168,10 @@ def validate_state(state: dict[str, Any]) -> None:
         claim = state["resume_claim"]
         if not isinstance(claim, dict) or not isinstance(claim.get("generation"), int):
             raise ValueError("invalid resume_claim")
+    active = state.get("active_process")
+    if active is not None:
+        if not isinstance(active, dict) or not isinstance(active.get("pid"), int) or not isinstance(active.get("starttime"), str):
+            raise ValueError("invalid active_process")
 
 
 def validate_plan(plan: dict[str, Any]) -> None:
@@ -175,6 +181,8 @@ def validate_plan(plan: dict[str, Any]) -> None:
         raise ValueError("plan must contain at least one milestone")
     seen: set[str] = set()
     total = 0.0
+    if plan.get("schema_version") != 2 or plan.get("authority") != "nightwatch":
+        raise ValueError("plan is not a trusted schema 2 Nightwatch plan")
     allowed = {"pending", "working", "implemented", "verified", "blocked"}
     for item in plan["milestones"]:
         if not isinstance(item, dict):
@@ -190,11 +198,11 @@ def validate_plan(plan: dict[str, Any]) -> None:
             raise ValueError(f"milestone {ident!r} has invalid weight")
         if item.get("status", "pending") not in allowed:
             raise ValueError(f"milestone {ident!r} has invalid status")
-        commands = item.get("verification_commands", [])
-        if not isinstance(commands, list) or not all(isinstance(command, str) and command.strip() for command in commands):
-            raise ValueError(f"milestone {ident!r} has invalid verification_commands")
-        if item.get("required", True) and not commands:
-            raise ValueError(f"required milestone {ident!r} needs a verification command")
+        profile = item.get("verification_profile")
+        if profile not in {"default", "none"}:
+            raise ValueError(f"milestone {ident!r} has invalid verification_profile")
+        if "verification_commands" in item:
+            raise ValueError("model-controlled verification_commands are forbidden")
         evidence = item.get("evidence", [])
         if not isinstance(evidence, list):
             raise ValueError(f"milestone {ident!r} has invalid evidence")

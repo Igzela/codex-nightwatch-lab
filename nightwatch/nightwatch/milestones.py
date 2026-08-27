@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,118 +13,149 @@ from .models import plan_progress, validate_plan
 from .storage import NightwatchStore, StateIntegrityError, redact
 
 
+MAX_MAILBOX_BYTES = 1_000_000
+MAX_MILESTONES = 100
+MAX_TITLE = 500
+MAX_DEPTH = 12
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_plan(raw: dict[str, Any]) -> dict[str, Any]:
+def _json_depth(value: Any, depth: int = 0) -> int:
+    if depth > MAX_DEPTH:
+        raise ValueError("mailbox JSON is too deeply nested")
+    if isinstance(value, dict):
+        return max([depth, *(_json_depth(item, depth + 1) for item in value.values())])
+    if isinstance(value, list):
+        return max([depth, *(_json_depth(item, depth + 1) for item in value)])
+    return depth
+
+
+def read_mailbox_json(store: NightwatchStore, name: str) -> Any | None:
+    path = store.mailbox_directory / name
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("mailbox entry cannot be inspected") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size > MAX_MAILBOX_BYTES:
+        raise ValueError("mailbox entry is not a safe regular file")
+    try:
+        # lstat alone is not enough: the workspace writer could replace the
+        # entry between inspection and open.  Linux O_NOFOLLOW keeps the
+        # mailbox boundary intact across that race.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_MAILBOX_BYTES:
+                raise ValueError("mailbox entry changed while being opened")
+            value = json.load(handle)
+        _json_depth(value)
+        return value
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("mailbox JSON is invalid") from exc
+
+
+def _proposal_to_plan(store: NightwatchStore, proposed: Any) -> dict[str, Any]:
+    if not isinstance(proposed, dict) or set(proposed) - {"goal_hash", "milestones"}:
+        raise ValueError("proposal has unsupported fields")
+    acceptance = store.load_acceptance()
+    if proposed.get("goal_hash") != acceptance.get("goal_hash"):
+        raise ValueError("proposal is not bound to this goal")
+    rows = proposed.get("milestones")
+    if not isinstance(rows, list) or not rows or len(rows) > MAX_MILESTONES:
+        raise ValueError("proposal milestone count is invalid")
+    policy = store.load_policy()
+    profile = "default" if policy["final_commands"] else "none"
     milestones = []
-    for item in raw.get("milestones", []):
-        if not isinstance(item, dict):
-            continue
-        commands = item.get("verification_commands", item.get("verification", []))
-        if isinstance(commands, str):
-            commands = [commands]
-        milestones.append({
-            "id": item.get("id"),
-            "title": item.get("title", item.get("name", "")),
-            "weight": item.get("weight", 1),
-            "required": bool(item.get("required", True)),
-            # Codex's claim is informational; only Nightwatch's verification can set verified.
-            "status": "pending",
-            "verification_commands": commands if isinstance(commands, list) else [],
-            "evidence": [],
-        })
-    required = raw.get("required_verification_commands", raw.get("verification_commands", ["git diff --check"]))
-    if isinstance(required, str):
-        required = [required]
-    return {
-        "schema_version": 1,
-        "authority": "nightwatch",
-        "required_verification_commands": required if isinstance(required, list) else ["git diff --check"],
-        "milestones": milestones,
-    }
+    seen: set[str] = set()
+    for item in rows:
+        if not isinstance(item, dict) or set(item) - {"id", "title", "weight"}:
+            raise ValueError("proposal contains untrusted authority fields")
+        ident, title, weight = item.get("id"), item.get("title"), item.get("weight", 1)
+        if not isinstance(ident, str) or not ident or len(ident) > 80 or ident in seen:
+            raise ValueError("proposal milestone id is invalid")
+        if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE:
+            raise ValueError("proposal milestone title is invalid")
+        if not isinstance(weight, (int, float)) or not 0 < float(weight) <= 10_000:
+            raise ValueError("proposal milestone weight is invalid")
+        milestones.append({"id": ident, "title": title.strip(), "weight": weight, "required": True, "status": "pending", "verification_profile": profile, "evidence": []})
+        seen.add(ident)
+    return {"schema_version": 2, "authority": "nightwatch", "policy_hash": policy["policy_hash"], "milestones": milestones}
 
 
 def adopt_proposed_plan(store: NightwatchStore) -> bool:
-    proposed_path = store.directory / "proposed-plan.json"
-    if not proposed_path.exists():
-        return False
     try:
-        proposed = json.loads(proposed_path.read_text(encoding="utf-8"))
-        plan = _normalize_plan(proposed)
+        proposed = read_mailbox_json(store, "proposed-plan.json")
+        if proposed is None:
+            return False
+        plan = _proposal_to_plan(store, proposed)
         validate_plan(plan)
-    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
-        store.append_event("plan_rejected", "Codex proposed plan is invalid", {"error": type(exc).__name__})
+    except (ValueError, StateIntegrityError, TypeError) as exc:
+        store.append_event("plan_rejected", "untrusted mailbox plan rejected", {"error": type(exc).__name__})
         return False
     current = store.load_plan()
-    if current.get("authority") == "nightwatch" and current.get("milestones") != plan.get("milestones"):
-        # The first proposal is adopted once. Later edits need to be explicit and
-        # cannot silently erase already verified evidence.
-        store.append_event("plan_change_ignored", "ignoring later plan replacement after adoption")
+    if current.get("authority") == "nightwatch" and current["milestones"] != [{"id": "M1", "title": "Complete the goal", "weight": 100, "required": True, "status": "pending", "verification_profile": "default" if store.load_policy()["final_commands"] else "none", "evidence": []}]:
+        store.append_event("plan_change_ignored", "later untrusted plan replacement ignored")
         return False
     store.save_plan(plan)
-    store.mutate("plan_adopted", "validated structured milestone plan adopted", lambda state: {**state, "plan_ready": True})
+    store.mutate("plan_adopted", "validated untrusted milestone structure adopted", lambda state: {**state, "plan_ready": True})
     return True
 
 
 def ingest_progress(store: NightwatchStore) -> bool:
-    if not store.load_state().get("plan_ready"):
-        return False
-    path = store.directory / "progress.json"
-    if not path.exists():
-        return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        updates = raw.get("milestones", raw) if isinstance(raw, dict) else raw
-        if not isinstance(updates, list):
-            raise ValueError("progress milestones must be an array")
-    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
-        store.append_event("progress_rejected", "progress file is invalid", {"error": type(exc).__name__})
+        raw = read_mailbox_json(store, "progress.json")
+    except ValueError as exc:
+        store.append_event("progress_rejected", "untrusted mailbox progress rejected", {"error": type(exc).__name__})
+        return False
+    if raw is None:
+        return False
+    updates = raw.get("milestones") if isinstance(raw, dict) and set(raw) == {"milestones"} else None
+    if not isinstance(updates, list) or len(updates) > MAX_MILESTONES:
+        store.append_event("progress_rejected", "untrusted mailbox progress shape rejected")
         return False
     plan = store.load_plan()
     by_id = {item["id"]: item for item in plan["milestones"]}
     changed = False
     for update in updates:
-        if not isinstance(update, dict) or update.get("id") not in by_id:
+        if not isinstance(update, dict) or set(update) - {"id", "status", "reason"} or update.get("id") not in by_id:
             continue
-        item = by_id[update["id"]]
         requested = update.get("status")
-        if requested in {"working", "implemented", "blocked"} and item.get("status") != "verified":
-            if item.get("status") != requested:
+        item = by_id[update["id"]]
+        if requested in {"working", "implemented", "blocked"} and item["status"] != "verified":
+            if item["status"] != requested:
                 item["status"] = requested
                 changed = True
-            if requested == "blocked" and update.get("reason"):
-                item.setdefault("evidence", []).append({"at": _now(), "kind": "blocker", "detail": redact(str(update["reason"]))})
+            if requested == "blocked" and isinstance(update.get("reason"), str):
+                item.setdefault("evidence", []).append({"at": _now(), "kind": "untrusted_blocker", "detail": redact(update["reason"][:MAX_TITLE])})
         elif requested == "verified":
-            # Explicitly record the model claim, but keep the authority invariant.
-            store.append_event("model_reported_verified", "model cannot mark a milestone verified", {"id": update["id"]})
-            if item.get("status") != "verified":
+            store.append_event("model_reported_verified", "model cannot verify a milestone", {"id": update["id"]})
+            if item["status"] != "verified":
                 item["status"] = "implemented"
                 changed = True
     if changed:
         store.save_plan(plan)
-        store.append_event("progress_ingested", "mechanical progress update ingested")
+        store.append_event("progress_ingested", "untrusted implementation progress ingested")
     return changed
 
 
-def _run_command(root: Path, command: str, timeout: float = 120.0) -> dict[str, Any]:
+def trusted_environment() -> dict[str, str]:
+    allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "CODEX_HOME"}
+    return {key: value for key, value in os.environ.items() if key in allowed or key.startswith("LC_") or key.startswith("FAKE_CODEX_")}
+
+
+def _run_trusted_command(root: Path, command: str, timeout: float = 120.0) -> dict[str, Any]:
     started = _now()
     if command.strip() == "git diff --check":
         ok, output = diff_check(root)
         return {"command": command, "ok": ok, "output": redact(output), "started_at": started, "finished_at": _now()}
     try:
-        result = subprocess.run(
-            ["/bin/sh", "-lc", command],
-            cwd=str(root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=dict(os.environ),
-        )
+        result = subprocess.run(["/bin/sh", "-lc", command], cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=trusted_environment())
         return {"command": command, "ok": result.returncode == 0, "returncode": result.returncode, "output": redact(result.stdout[-4000:]), "started_at": started, "finished_at": _now()}
     except subprocess.TimeoutExpired:
         return {"command": command, "ok": False, "output": "verification timed out", "started_at": started, "finished_at": _now()}
@@ -133,43 +165,25 @@ def _run_command(root: Path, command: str, timeout: float = 120.0) -> dict[str, 
 
 def verify_milestones(store: NightwatchStore, git: GitSnapshot | None = None) -> dict[str, Any]:
     plan = store.load_plan()
+    commands = store.load_policy()["final_commands"]
     results: list[dict[str, Any]] = []
     changed = False
     for item in plan["milestones"]:
-        if item.get("status") not in {"working", "implemented"}:
+        if item["status"] not in {"working", "implemented"} or item["verification_profile"] != "default" or not commands:
             continue
-        commands = list(item.get("verification_commands", []))
-        if not commands:
-            results.append({"id": item["id"], "ok": False, "output": "no verification command defined"})
-            continue
-        checks = [_run_command(store.repo, command) for command in commands]
+        checks = [_run_trusted_command(store.repo, command) for command in commands]
         results.extend({"id": item["id"], **check} for check in checks)
         if all(check["ok"] for check in checks):
             item["status"] = "verified"
-            item.setdefault("evidence", []).append({"at": _now(), "kind": "commands", "checks": checks})
+            item.setdefault("evidence", []).append({"at": _now(), "kind": "trusted_policy_commands", "policy_hash": plan["policy_hash"], "checks": checks})
             changed = True
-            store.append_event("milestone_verified", "verification commands passed", {"id": item["id"], "checks": checks})
+            store.append_event("milestone_verified", "trusted policy checks passed", {"id": item["id"]})
     if changed:
         store.save_plan(plan)
-    required = [command for command in plan.get("required_verification_commands", []) if isinstance(command, str) and command.strip()]
-    final_checks = [_run_command(store.repo, command) for command in required]
-    result = {
-        "milestones": results,
-        "final_checks": final_checks,
-        "all_milestones_verified": all(item.get("status") == "verified" for item in plan["milestones"] if item.get("required", True)),
-        "all_final_checks_passed": bool(final_checks) and all(check["ok"] for check in final_checks),
-        "progress": plan_progress(plan),
-        "git": (git or snapshot(store.repo)).to_dict(),
-    }
-    return result
+    final_checks = [_run_trusted_command(store.repo, command) for command in commands]
+    return {"milestones": results, "final_checks": final_checks, "all_milestones_verified": all(item["status"] == "verified" for item in plan["milestones"] if item["required"]), "all_final_checks_passed": bool(final_checks) and all(check["ok"] for check in final_checks), "progress": plan_progress(plan), "git": (git or snapshot(store.repo)).to_dict()}
 
 
 def current_milestone(store: NightwatchStore) -> dict[str, Any] | None:
     plan = store.load_plan()
-    for item in plan["milestones"]:
-        if item.get("status") in {"working", "implemented"}:
-            return item
-    for item in plan["milestones"]:
-        if item.get("status") == "pending":
-            return item
-    return None
+    return next((item for item in plan["milestones"] if item["status"] in {"working", "implemented", "pending"}), None)

@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 import sys
 
+TEST_STATE_HOME = tempfile.mkdtemp(prefix="nightwatch-trusted-tests-")
+os.environ["NIGHTWATCH_STATE_HOME"] = TEST_STATE_HOME
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nightwatch import cli  # noqa: E402
@@ -36,9 +39,10 @@ class UnitTests(unittest.TestCase):
         unit = cli._service_text(Path("/repo"))
         self.assertIn("WorkingDirectory=/repo", unit)
         self.assertIn('resume --repo "/repo"', unit)
-        self.assertIn("Restart=on-abnormal", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("RestartPreventExitStatus=10 11 12", unit)
         self.assertNotIn("--last", unit)
-        self.assertNotIn("Restart=on-failure", unit)
+        self.assertNotIn("Restart=on-abnormal", unit)
         self.assertEqual(cli._systemd_quote("/repo with space/100%"), '"/repo with space/100%%"')
         self.assertIn("WorkingDirectory=/repo with space/100%%", cli._service_text(Path("/repo with space/100%")))
 
@@ -132,9 +136,9 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(kind, expected)
 
     def test_plan_progress_is_mechanical(self):
-        plan = {"milestones": [
-            {"id": "M1", "title": "one", "weight": 2, "required": True, "status": "verified", "verification_commands": ["true"], "evidence": []},
-            {"id": "M2", "title": "two", "weight": 3, "required": True, "status": "implemented", "verification_commands": ["true"], "evidence": []},
+        plan = {"schema_version": 2, "authority": "nightwatch", "policy_hash": "test", "milestones": [
+            {"id": "M1", "title": "one", "weight": 2, "required": True, "status": "verified", "verification_profile": "default", "evidence": []},
+            {"id": "M2", "title": "two", "weight": 3, "required": True, "status": "implemented", "verification_profile": "default", "evidence": []},
         ]}
         progress = plan_progress(plan)
         self.assertEqual(progress["implemented_count"], 2)
@@ -143,7 +147,7 @@ class UnitTests(unittest.TestCase):
 
     def test_required_milestone_needs_verification(self):
         with self.assertRaises(ValueError):
-            validate_plan({"milestones": [{"id": "M1", "title": "x", "weight": 1, "required": True, "status": "pending", "verification_commands": [], "evidence": []}]})
+            validate_plan({"schema_version": 2, "authority": "nightwatch", "policy_hash": "test", "milestones": [{"id": "M1", "title": "x", "weight": 1, "required": True, "status": "pending", "verification_profile": "bad", "evidence": []}]})
 
     def test_command_uses_exact_thread_and_never_last(self):
         with patch.dict(os.environ, {"NIGHTWATCH_CODEX_BIN": "/fake/codex"}):

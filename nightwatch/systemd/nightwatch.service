@@ -5,7 +5,8 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/nightwatch resume
-Restart=on-abnormal
+Restart=on-failure
+RestartPreventExitStatus=10 11 12
 RestartSec=15s
 NoNewPrivileges=true
 PrivateTmp=true
