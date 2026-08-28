@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 64 Passing](https://img.shields.io/badge/Tests-64%20Passing-success.svg)](#validation)
+[![Tests: 74 Passing](https://img.shields.io/badge/Tests-74%20Passing-success.svg)](#validation)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -124,15 +124,17 @@ nightwatch run --service \
 Already running an interactive Codex session in your terminal? Passively monitor it without interfering:
 
 ```bash
-# Snapshot current telemetry
+# Snapshot current telemetry (fails closed if multiple sessions exist unless --thread is given)
 nightwatch watch --once
 
-# Continuous live telemetry
-nightwatch watch
+# Continuous live telemetry (specify --thread if multiple sessions exist)
+nightwatch watch [--thread <ID>]
 
-# Automatic takeover when quota exhausts or terminal closes
-nightwatch watch --auto-takeover --verify "pytest -q"
+# Automatic takeover: waits for the interactive process to exit, then takes over exact thread
+nightwatch watch --auto-takeover --verify "pytest -q" [--thread <ID>]
 ```
+
+> **Auto-Takeover Semantics**: When quota exhausts (`used_percent >= 100%`), Nightwatch marks status as `TAKEOVER_PENDING` and continues passive observation. It **strictly waits for the original interactive process to exit** before starting the trusted supervisor, ensuring no concurrent process collision or corrupted workspace states.
 
 ```text
 ============================================================
@@ -163,7 +165,7 @@ nightwatch resume
 | Command | Description |
 | :--- | :--- |
 | `nightwatch run "<goal>" [--verify <cmd>] [--service]` | Initialize and run a new supervised goal |
-| `nightwatch watch [--auto-takeover] [--once] [--json]` | Passively monitor active Codex sessions in current repo |
+| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | Passively monitor active Codex sessions in current repo |
 | `nightwatch adopt --thread <id> [--verify <cmd>]` | Adopt an existing thread into Nightwatch |
 | `nightwatch resume` | Resume the current repo's exact-thread goal |
 | `nightwatch status [--json]` | Show durable task state, quota status & milestone progress |

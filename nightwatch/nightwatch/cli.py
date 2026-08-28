@@ -33,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
 
     watch = sub.add_parser("watch", help="passively monitor an active Codex session in this repo")
     watch.add_argument("--repo", default=None)
+    watch.add_argument("--thread", default=None, help="exact thread ID to select and watch")
     watch.add_argument("--json", action="store_true", help="output live snapshot as JSON")
     watch.add_argument("--once", action="store_true", help="inspect snapshot once and exit")
     watch.add_argument("--auto-takeover", action="store_true", help="automatically take over and supervise thread when quota runs out or session exits")
@@ -493,11 +494,25 @@ def _adopt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_ambiguous_sessions(sessions: list[dict[str, Any]], root: Path) -> None:
+    print("=" * 60)
+    print("AMBIGUOUS_ACTIVE_SESSIONS")
+    print(f"Multiple active Codex sessions found for {root}:")
+    for s in sessions:
+        title = str(s.get("title") or "")[:40]
+        title_str = f" | Title: {title}" if title else ""
+        print(f"  - PID {s.get('pid')} | Thread: {s.get('thread_id')} | Model: {s.get('model') or '(unknown)'} | Branch: {s.get('branch') or '(unknown)'}{title_str}")
+    print("Please specify --thread <EXACT_THREAD_ID> to select one session.")
+    print("=" * 60)
+
+
 def _print_watch_snapshot(snap: dict[str, Any], root: Path) -> None:
     print("=" * 60)
     print(f"REPO         {root}")
     print(f"THREAD ID    {snap.get('thread_id') or '(none)'}")
     print(f"PROCESS      PID {snap.get('pid') or '(none)'} ({'ALIVE' if snap.get('pid_alive') else 'NOT RUNNING / EXITED'})")
+    if snap.get("takeover_pending"):
+        print(f"TAKEOVER     TAKEOVER_PENDING (waiting for interactive process to exit)")
     print(f"MODEL        {snap.get('model') or '(unknown)'} [branch: {snap.get('branch') or '(unknown)'}]")
     if snap.get("title"):
         print(f"GOAL/TITLE   {str(snap['title'])[:80]}")
@@ -525,26 +540,39 @@ def _print_watch_snapshot(snap: dict[str, Any], root: Path) -> None:
 def _watch(args: argparse.Namespace) -> int:
     root = _root(args.repo)
     store = NightwatchStore(root)
-    watcher = PassiveWatcher(store)
+    watcher = PassiveWatcher(store, explicit_thread=args.thread)
 
     if args.once:
         snapshot = watcher.inspect_live_snapshot()
         if args.json:
             print(json.dumps(snapshot, indent=2, ensure_ascii=False))
-            return 0
+            return 0 if snapshot.get("status") == "OK" else 1
+        if snapshot.get("status") == "AMBIGUOUS_ACTIVE_SESSIONS":
+            _print_ambiguous_sessions(snapshot.get("sessions", []), root)
+            return 1
         if not snapshot.get("active"):
             print(f"Nightwatch watch: no active Codex session found for {root}")
             if snapshot.get("pid"):
-                print(f"PID {snapshot['pid']} running but no rollout file located")
+                print(f"PID {snapshot['pid']} running but no proven rollout file located")
             return 1
         _print_watch_snapshot(snapshot, root)
         return 0
+
+    init_snapshot = watcher.inspect_live_snapshot()
+    if init_snapshot.get("status") == "AMBIGUOUS_ACTIVE_SESSIONS":
+        if args.json:
+            print(json.dumps(init_snapshot, ensure_ascii=False))
+        else:
+            _print_ambiguous_sessions(init_snapshot.get("sessions", []), root)
+        return 1
 
     print(f"Nightwatch watch: passively monitoring {root} (Ctrl+C to stop)...")
     try:
         def on_update(snap: dict[str, Any]) -> None:
             if args.json:
                 print(json.dumps(snap, ensure_ascii=False))
+            elif snap.get("status") == "AMBIGUOUS_ACTIVE_SESSIONS":
+                _print_ambiguous_sessions(snap.get("sessions", []), root)
             else:
                 _print_watch_snapshot(snap, root)
 

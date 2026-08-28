@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 64 Passing](https://img.shields.io/badge/Tests-64%20Passing-success.svg)](#测试验证)
+[![Tests: 74 Passing](https://img.shields.io/badge/Tests-74%20Passing-success.svg)](#测试验证)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -124,15 +124,17 @@ nightwatch run --service \
 如果你正在终端中与 Codex 交互，无需退出，直接另起窗口监听：
 
 ```bash
-# 单次快照当前遥测信息
+# 单次快照当前遥测信息（若同仓库存在多会话且未指定 --thread 则安全 fail-closed）
 nightwatch watch --once
 
-# 实时动态监控
-nightwatch watch
+# 实时动态监控（多会话时可指定 --thread）
+nightwatch watch [--thread <ID>]
 
-# 开启夜间自动接管：一旦配额用尽或交互退出，Nightwatch 自动接管续跑
-nightwatch watch --auto-takeover --verify "pytest -q"
+# 开启夜间自动接管：等待前台交互进程退出后，自动无缝接管 exact thread 续跑
+nightwatch watch --auto-takeover --verify "pytest -q" [--thread <ID>]
 ```
+
+> **自动接管语义（Auto-Takeover Semantics）**：当配额耗尽（`used_percent >= 100%`）时，Nightwatch 标记状态为 `TAKEOVER_PENDING` 并保持纯被动监听，**严格等待原交互式 Codex 进程退出后**才启动受信任 supervisor，彻底防止多进程并发冲突与 Git 工作区竞争。
 
 ```text
 ============================================================
@@ -163,7 +165,7 @@ nightwatch resume
 | 命令 | 说明 |
 | :--- | :--- |
 | `nightwatch run "<goal>" [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
-| `nightwatch watch [--auto-takeover] [--once] [--json]` | 无侵入监听当前仓库中活跃的 Codex 会话 |
+| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听当前仓库中活跃的 Codex 会话 |
 | `nightwatch adopt --thread <id> [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
 | `nightwatch resume` | 恢复并继续当前仓库的精确 Thread 任务 |
 | `nightwatch status [--json]` | 查看当前持久化状态、配额恢复倒计时与里程碑进度 |

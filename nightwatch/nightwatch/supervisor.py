@@ -18,7 +18,7 @@ from .git import GitError, GitSnapshot, is_ancestor, repo_root, snapshot
 from .milestones import adopt_proposed_plan, current_milestone, ingest_progress, verify_milestones
 from .models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State, TERMINAL_STATES
 from .quota import QuotaError, make_quota_provider, quota_recovered
-from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, now_iso
+from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso
 from .testing import crash_hook
 
 
@@ -147,6 +147,107 @@ def find_active_threads_for_repo(repo: str | Path, codex_home: str | Path | None
             ]
     except Exception:
         return []
+
+
+def extract_rollout_meta(rollout_path: str | Path) -> dict[str, Any] | None:
+    path = Path(rollout_path)
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("type") == "session_meta":
+                        payload = data.get("payload", {})
+                        if isinstance(payload, dict):
+                            thread_id = payload.get("id") or payload.get("session_id")
+                            cwd = payload.get("cwd")
+                            if thread_id:
+                                return {
+                                    "thread_id": str(thread_id),
+                                    "cwd": str(Path(cwd).resolve()) if cwd else None,
+                                    "thread_source": payload.get("thread_source"),
+                                    "model_provider": payload.get("model_provider"),
+                                    "git": payload.get("git"),
+                                }
+                except Exception:
+                    continue
+    except OSError:
+        return None
+    return None
+
+
+def find_proven_codex_sessions(
+    repo: str | Path,
+    codex_home: str | Path | None = None,
+    explicit_thread: str | None = None,
+) -> list[dict[str, Any]]:
+    if not sys_platform_linux():
+        return []
+    target_repo = Path(repo).resolve()
+    candidate_processes = find_repo_codex_processes(target_repo, exclude_pid=os.getpid())
+    proven_sessions: list[dict[str, Any]] = []
+
+    sqlite_threads_by_id = {t["id"]: t for t in find_active_threads_for_repo(target_repo, codex_home)}
+
+    for proc in candidate_processes:
+        pid = proc["pid"]
+        ident_start = process_identity(pid)
+        if not ident_start:
+            continue
+
+        fd_dir = Path(f"/proc/{pid}/fd")
+        if not fd_dir.exists():
+            continue
+
+        proven_rollout: Path | None = None
+        proven_meta: dict[str, Any] | None = None
+
+        try:
+            fd_names = os.listdir(str(fd_dir))
+        except OSError:
+            continue
+
+        for name in fd_names:
+            try:
+                target_link = os.readlink(str(fd_dir / name))
+                if "rollout-" in target_link and target_link.endswith(".jsonl"):
+                    meta = extract_rollout_meta(target_link)
+                    if meta and meta.get("thread_id") and meta.get("cwd") == str(target_repo):
+                        proven_rollout = Path(target_link)
+                        proven_meta = meta
+                        break
+            except OSError:
+                continue
+
+        if not proven_rollout or not proven_meta:
+            continue
+
+        if not process_matches(ident_start):
+            continue
+
+        thread_id = proven_meta["thread_id"]
+        if explicit_thread and thread_id != explicit_thread:
+            continue
+
+        sqlite_meta = sqlite_threads_by_id.get(thread_id, {})
+
+        proven_sessions.append({
+            "pid": pid,
+            "pid_identity": ident_start,
+            "rollout_path": str(proven_rollout),
+            "thread_id": thread_id,
+            "thread_source": proven_meta.get("thread_source") or sqlite_meta.get("thread_source"),
+            "model": sqlite_meta.get("model"),
+            "branch": sqlite_meta.get("git_branch") or (proven_meta.get("git") or {}).get("branch"),
+            "title": sqlite_meta.get("title") or sqlite_meta.get("first_user_message"),
+            "sqlite_thread": sqlite_meta,
+        })
+
+    return proven_sessions
 
 
 def start_prompt(store: NightwatchStore, goal: str) -> str:
@@ -624,58 +725,79 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
 class PassiveWatcher:
     """Non-invasive observer and automatic takeover supervisor for active Codex sessions."""
 
-    def __init__(self, store: NightwatchStore, codex_home: str | Path | None = None):
+    def __init__(
+        self,
+        store: NightwatchStore,
+        codex_home: str | Path | None = None,
+        explicit_thread: str | None = None,
+    ):
         self.store = store
         self.codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+        self.explicit_thread = explicit_thread
         self._stop_requested = False
 
     def request_stop(self) -> None:
         self._stop_requested = True
 
-    def discover_active_session(self) -> dict[str, Any] | None:
-        processes = find_repo_codex_processes(self.store.repo, exclude_pid=os.getpid())
-        threads = find_active_threads_for_repo(self.store.repo, self.codex_home)
-        user_threads = [t for t in threads if t.get("thread_source") == "user"]
-        primary = user_threads[0] if user_threads else (threads[0] if threads else None)
-        active_pid = processes[0]["pid"] if processes else None
-        rollout_path = None
-        if active_pid:
-            fd_dir = Path(f"/proc/{active_pid}/fd")
-            if fd_dir.exists():
-                for entry in fd_dir.iterdir():
-                    try:
-                        target = os.readlink(str(entry))
-                        if "rollout-" in target and target.endswith(".jsonl"):
-                            if primary and primary["id"] in target:
-                                rollout_path = Path(target)
-                                break
-                            elif rollout_path is None:
-                                rollout_path = Path(target)
-                    except OSError:
-                        continue
-        if not rollout_path and primary and primary.get("rollout_path"):
-            cand = Path(primary["rollout_path"])
-            if cand.exists():
-                rollout_path = cand
-        if not primary and not rollout_path and not active_pid:
-            return None
+    def discover_active_session(self) -> dict[str, Any]:
+        proven = find_proven_codex_sessions(
+            self.store.repo,
+            self.codex_home,
+            explicit_thread=self.explicit_thread,
+        )
+        if not proven:
+            candidate_procs = find_repo_codex_processes(self.store.repo, exclude_pid=os.getpid())
+            return {
+                "status": "NO_SESSION",
+                "active": False,
+                "pid": candidate_procs[0]["pid"] if candidate_procs else None,
+                "processes": candidate_procs,
+                "thread_id": self.explicit_thread,
+                "rollout_path": None,
+            }
+
+        if len(proven) > 1:
+            return {
+                "status": "AMBIGUOUS_ACTIVE_SESSIONS",
+                "active": False,
+                "sessions": proven,
+                "error": "multiple active Codex sessions found for repository; specify --thread <ID> to select one",
+            }
+
+        session = proven[0]
         return {
-            "pid": active_pid,
-            "processes": processes,
-            "thread": primary,
-            "thread_id": primary["id"] if primary else None,
-            "rollout_path": str(rollout_path) if rollout_path else None,
+            "status": "OK",
+            "active": True,
+            "pid": session["pid"],
+            "pid_identity": session["pid_identity"],
+            "pid_alive": True,
+            "thread_id": session["thread_id"],
+            "rollout_path": session["rollout_path"],
+            "model": session.get("model"),
+            "branch": session.get("branch"),
+            "title": session.get("title"),
+            "session": session,
         }
 
     def inspect_live_snapshot(self) -> dict[str, Any]:
         info = self.discover_active_session()
-        if not info or not info.get("rollout_path"):
+        status = info.get("status")
+        if status == "AMBIGUOUS_ACTIVE_SESSIONS":
             return {
-                "active": bool(info and info.get("processes")),
-                "pid": info.get("pid") if info else None,
-                "processes": info.get("processes", []) if info else [],
-                "thread_id": info.get("thread_id") if info else None,
+                "status": "AMBIGUOUS_ACTIVE_SESSIONS",
+                "active": False,
+                "sessions": info.get("sessions", []),
+                "error": info.get("error"),
             }
+        if status != "OK" or not info.get("rollout_path"):
+            return {
+                "status": status or "NO_SESSION",
+                "active": False,
+                "pid": info.get("pid"),
+                "processes": info.get("processes", []),
+                "thread_id": info.get("thread_id"),
+            }
+
         path = Path(info["rollout_path"])
         rate_limits = None
         tokens = None
@@ -702,15 +824,20 @@ class PassiveWatcher:
                         last_turn_type = t
                     except Exception:
                         pass
-        primary_thread = info.get("thread") or {}
+
+        pid_ident = info.get("pid_identity")
+        alive = process_matches(pid_ident) if pid_ident else pid_alive(info.get("pid"))
+
         return {
+            "status": "OK",
             "active": True,
             "pid": info.get("pid"),
-            "pid_alive": pid_alive(info.get("pid")) if info.get("pid") else False,
+            "pid_identity": pid_ident,
+            "pid_alive": alive,
             "thread_id": info.get("thread_id"),
-            "model": primary_thread.get("model"),
-            "branch": primary_thread.get("git_branch"),
-            "title": primary_thread.get("title") or primary_thread.get("first_user_message"),
+            "model": info.get("model"),
+            "branch": info.get("branch"),
+            "title": info.get("title"),
             "rate_limits": rate_limits,
             "tokens": tokens,
             "subagents": subagents,
@@ -726,58 +853,112 @@ class PassiveWatcher:
         goal: str | None = None,
         verify_commands: list[str] | None = None,
     ) -> dict[str, Any]:
-        info = self.discover_active_session()
-        if not info or not info.get("rollout_path"):
-            snap = {"active": False, "pid": info.get("pid") if info else None}
+        init_snap = self.inspect_live_snapshot()
+
+        if init_snap.get("status") == "AMBIGUOUS_ACTIVE_SESSIONS":
             if on_update:
-                on_update(snap)
-            return snap
+                on_update(init_snap)
+            if auto_takeover:
+                raise SystemExit("nightwatch: auto-takeover refused: multiple active sessions found for repository; specify --thread <ID>")
+            return init_snap
+
+        if not init_snap.get("active") or not init_snap.get("rollout_path"):
+            if on_update:
+                on_update(init_snap)
+            return init_snap
+
+        frozen_thread_id = str(init_snap["thread_id"])
+        frozen_pid_identity = init_snap.get("pid_identity")
+        frozen_rollout_path = Path(init_snap["rollout_path"])
+        frozen_title = init_snap.get("title")
 
         last_status_str = ""
+        takeover_pending = False
+
         while not self._stop_requested:
-            snap = self.inspect_live_snapshot()
-            status_str = f"{snap.get('pid')}:{snap.get('pid_alive')}:{snap.get('rate_limits')}:{snap.get('tokens')}"
+            pid_alive_now = process_matches(frozen_pid_identity) if frozen_pid_identity else pid_alive(init_snap.get("pid"))
+
+            rate_limits = None
+            tokens = None
+            subagents = []
+            last_turn_type = None
+            if frozen_rollout_path.exists():
+                with frozen_rollout_path.open("r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            t = data.get("type")
+                            payload = data.get("payload", {})
+                            if isinstance(payload, dict):
+                                if "rate_limits" in payload:
+                                    rate_limits = payload["rate_limits"]
+                                if "info" in payload and "total_token_usage" in payload["info"]:
+                                    tokens = payload["info"]["total_token_usage"]
+                            if "<subagents>" in line:
+                                for sub in re.findall(r"-\s*([0-9a-fA-F-]{36}):\s*(\w+)", line):
+                                    if sub not in subagents:
+                                        subagents.append(sub)
+                            last_turn_type = t
+                        except Exception:
+                            pass
+
+            limits = rate_limits or {}
+            primary_exhausted = (limits.get("primary", {}).get("used_percent") or 0) >= 100
+            secondary_exhausted = (limits.get("secondary", {}).get("used_percent") or 0) >= 100
+            quota_hit = primary_exhausted or secondary_exhausted
+
+            if quota_hit and pid_alive_now:
+                takeover_pending = True
+
+            snap = {
+                "status": "TAKEOVER_PENDING" if (takeover_pending and pid_alive_now) else "OK",
+                "active": pid_alive_now,
+                "pid": init_snap.get("pid"),
+                "pid_identity": frozen_pid_identity,
+                "pid_alive": pid_alive_now,
+                "thread_id": frozen_thread_id,
+                "model": init_snap.get("model"),
+                "branch": init_snap.get("branch"),
+                "title": frozen_title,
+                "rate_limits": rate_limits,
+                "tokens": tokens,
+                "subagents": subagents,
+                "last_turn_type": last_turn_type,
+                "rollout_path": str(frozen_rollout_path),
+                "takeover_pending": takeover_pending and pid_alive_now,
+            }
+
+            status_str = f"{snap.get('status')}:{pid_alive_now}:{rate_limits}:{tokens}"
             if status_str != last_status_str:
                 last_status_str = status_str
                 if on_update:
                     on_update(snap)
 
-            limits = snap.get("rate_limits") or {}
-            primary_exhausted = (limits.get("primary", {}).get("used_percent") or 0) >= 100
-            secondary_exhausted = (limits.get("secondary", {}).get("used_percent") or 0) >= 100
-            quota_hit = primary_exhausted or secondary_exhausted
-
-            if quota_hit and auto_takeover:
-                thread_id = snap.get("thread_id")
-                if not thread_id:
-                    break
-                if not self.store.exists():
-                    self.store.initialize(
-                        make_run_id(str(self.store.repo)),
-                        goal or snap.get("title") or "Auto-takeover after quota limit",
-                        str(self.store.repo),
-                        verify_commands=verify_commands or [],
-                        thread_id=thread_id,
-                    )
-                supervisor = Supervisor(self.store)
-                return supervisor.execute(start=False)
-
-            if not snap.get("pid_alive"):
+            if not pid_alive_now:
                 if auto_takeover:
-                    thread_id = snap.get("thread_id")
-                    if not self.store.exists() and thread_id:
+                    competing = find_repo_codex_processes(self.store.repo, exclude_pid=os.getpid())
+                    if frozen_pid_identity and isinstance(frozen_pid_identity.get("pid"), int):
+                        competing = [p for p in competing if p["pid"] != frozen_pid_identity["pid"]]
+                    if competing:
+                        pids = ", ".join(str(p["pid"]) for p in competing)
+                        raise SystemExit(
+                            f"nightwatch: auto-takeover aborted: another competing Codex process (PID {pids}) is active in repository"
+                        )
+
+                    if not self.store.exists():
                         self.store.initialize(
                             make_run_id(str(self.store.repo)),
-                            goal or snap.get("title") or "Supervised session continuation",
+                            goal or frozen_title or "Supervised session continuation",
                             str(self.store.repo),
                             verify_commands=verify_commands or [],
-                            thread_id=thread_id,
+                            thread_id=frozen_thread_id,
                         )
-                    if self.store.exists():
-                        supervisor = Supervisor(self.store)
-                        return supervisor.execute(start=False)
+                    supervisor = Supervisor(self.store)
+                    return supervisor.execute(start=False)
                 break
 
             time.sleep(poll_interval)
 
-        return self.inspect_live_snapshot()
+        return snap
