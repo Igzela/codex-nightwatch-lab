@@ -162,6 +162,49 @@ class TuiTests(unittest.TestCase):
             self.assertIn("agent-reported 50.0%", status)
             self.assertIn("doing 1", status)
 
+    def test_canonical_milestone_mailbox_progress_is_visible_but_untrusted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("canonical-progress", "finish the goal", str(root), verify_commands=["git status --short"])
+            store.mailbox_directory.mkdir(parents=True, exist_ok=True)
+            (store.mailbox_directory / "progress.json").write_text(
+                json.dumps({
+                    "milestones": [
+                        {"id": "M1", "status": "implemented"},
+                        {"id": "M2", "status": "working", "title": "Keep the operator informed"},
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            report = agent_work_report(store)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["percent"], 50.0)
+            self.assertEqual(report["implemented"], ["M1"])
+            self.assertEqual(report["working"], ["M2: Keep the operator informed"])
+            rendered = render_dashboard(RunCatalog(Path(temporary) / "state").discover(), width=120)
+            self.assertIn("agent 50.0%", rendered)
+            self.assertIn("M2: Keep the operator informed", rendered)
+            self.assertIn("UNTRUSTED", rendered)
+
+    def test_adopted_run_and_current_branch_are_explicit_in_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("adopted-run", "continue the conversation", str(root), thread_id="THREAD-ADOPT")
+            run = RunCatalog(Path(temporary) / "state").discover()[0]
+            rendered = render_dashboard([run], width=120)
+            branch = subprocess.run(["git", "branch", "--show-current"], cwd=root, check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+            self.assertIn(f"Branch     {branch}", rendered)
+            self.assertIn("Mode       ADOPTED · adopted, no writer started", rendered)
+            self.assertIn("ADOPTED · exact thread bound · waiting for /resume", rendered)
+            status = status_run(run)
+            self.assertIn("Mode        ADOPTED · adopted, not supervised yet", status)
+
     def test_explain_and_recap_are_grounded_in_trusted_state(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repo"
@@ -603,6 +646,7 @@ class TuiControllerTests(unittest.TestCase):
         self.assertIn("PID 12", ui.overlay.body)
         ui.handle_key("enter")
         self.assertEqual(ui.overlay.kind, "confirm")
+        self.assertIn("LIVE + PROVEN", ui.overlay.body)
         ui.handle_key("enter")
         self.assertEqual(len(adopted), 1)
         self.assertEqual(adopted[0].thread_id, "T-LIVE")

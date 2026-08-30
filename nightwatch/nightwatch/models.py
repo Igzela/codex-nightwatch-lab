@@ -143,6 +143,7 @@ def empty_state(
         "thread_id": None,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "control_mode": "SUPERVISED",
         "state": State.NEW.value,
         "generation": 1,
         "created_at": now,
@@ -195,6 +196,8 @@ def validate_state(state: dict[str, Any]) -> None:
         validate_model_name(state["model"])
     if state.get("reasoning_effort") is not None:
         validate_reasoning_effort(state["reasoning_effort"])
+    if state.get("control_mode", "SUPERVISED") not in {"SUPERVISED", "ADOPTED"}:
+        raise ValueError("state.control_mode must be SUPERVISED or ADOPTED")
     if state.get("resume_claim") is not None:
         claim = state["resume_claim"]
         if not isinstance(claim, dict) or not isinstance(claim.get("generation"), int):

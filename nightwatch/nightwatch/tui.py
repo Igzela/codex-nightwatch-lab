@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .git import GitError, repo_root
+from .git import GitError, repo_root, snapshot
 from .models import TERMINAL_STATES, State, plan_progress
 from .operations import (
     ActionResult,
@@ -615,8 +615,11 @@ class TuiController:
             f"Nightwatch doctor: {report['status']}",
             f"Codex: {report.get('codex_version') or '(missing)'}",
             f"Auth: {report['auth']['status']}",
+            f"Codex compatibility: {(report.get('compatibility') or {}).get('status', 'unavailable').upper()} · help-only probes",
             f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})",
         ]
+        for name, check in ((report.get("compatibility") or {}).get("checks") or {}).items():
+            lines.append(f"  {name}: {'PASS' if check.get('ok') else 'FAIL'}")
         if report["quota"].get("primary"):
             lines.append(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
         if report["quota"].get("secondary"):
@@ -687,13 +690,13 @@ class TuiController:
                 unbound.append(session)
                 continue
             title = str(session.get("title") or "")[:60]
-            proof = "live" if session.get("live") else "recent"
+            proof = "LIVE + PROVEN" if session.get("live") and session.get("proof") == "pid_rollout" else "RECENT HISTORY"
             pid = f"PID {session['pid']}" if session.get("pid") else proof
             items.append(
                 OverlayItem(
                     str(session["thread_id"]),
                     title or proof,
-                    pid,
+                    f"{proof} · {pid}" if session.get("pid") else pid,
                     session,
                 )
             )
@@ -741,6 +744,7 @@ class TuiController:
                 f"Thread       {pending.get('thread')}",
                 f"Workspace    {pending.get('repo')}",
                 f"Goal         {goal}",
+                f"Evidence    {_adoption_evidence(pending.get('session'))}",
                 "Model        preserve Codex/default",
                 "Reasoning    preserve Codex/default",
                 f"Verification {verify_text}",
@@ -887,6 +891,13 @@ class RunRecord:
         return self.store.repo
 
     @property
+    def branch(self) -> str:
+        try:
+            return snapshot(self.repo).branch or "(unknown)"
+        except GitError:
+            return "(unavailable)"
+
+    @property
     def thread_id(self) -> str | None:
         value = self.state.get("thread_id")
         return value if isinstance(value, str) else None
@@ -995,9 +1006,25 @@ def _agent_summary(state: dict[str, Any]) -> str:
     if state.get("state") == State.WAIT_QUOTA.value and not state.get("thread_id"):
         suffix = f" · PID {owner.get('pid')}" if owner_alive else ""
         return f"WAITING_QUOTA (first launch deferred){suffix}"
+    if state.get("state") == State.NEW.value and state.get("control_mode", "SUPERVISED") == "ADOPTED":
+        suffix = f" · PID {owner.get('pid')}" if owner_alive else ""
+        return f"ADOPTED · exact thread bound · waiting for /resume{suffix}"
     if owner_alive:
         return f"SUPERVISOR {state.get('state')} · PID {owner.get('pid')}"
     return str(state.get("state") or "IDLE")
+
+
+def _adoption_evidence(session: dict[str, Any] | None) -> str:
+    """Describe discovery proof without turning model/session narrative into trust."""
+    if not session:
+        return "MANUAL EXACT ID · discovery did not prove this thread"
+    proof = session.get("proof")
+    pid = session.get("pid")
+    if session.get("live") and proof == "pid_rollout":
+        return f"LIVE + PROVEN · PID {pid} · repository-matched rollout"
+    if session.get("live"):
+        return f"LIVE + UNPROVEN · PID {pid or '(unknown)'} · process cwd only; thread was not proven"
+    return "RECENT HISTORY · rollout/history record only; no live process"
 
 
 def agent_work_report(store: NightwatchStore) -> dict[str, Any]:
@@ -1023,6 +1050,27 @@ def agent_work_report(store: NightwatchStore) -> dict[str, Any]:
     implemented = _lines("implemented")
     working = _lines("working")
     blocked = _lines("blocked")
+    milestones = raw.get("milestones")
+    if isinstance(milestones, list):
+        # This is the canonical shape written by the supervisor prompt. It is
+        # still only an untrusted display signal; trusted progress is separate.
+        for item in milestones[:8]:
+            if not isinstance(item, dict):
+                continue
+            ident = item.get("id")
+            status = item.get("status")
+            if not isinstance(ident, str) or not ident.strip():
+                continue
+            label = ident.strip()
+            title = item.get("title")
+            if isinstance(title, str) and title.strip():
+                label += f": {' '.join(title.split())[:180]}"
+            if status == "implemented":
+                implemented.append(label)
+            elif status == "working":
+                working.append(label)
+            elif status == "blocked":
+                blocked.append(label)
     total = len(implemented) + len(working) + len(blocked)
     percent = round(100 * len(implemented) / total, 1) if total else None
     return {
@@ -1096,7 +1144,9 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
             "─" * min(width, 120),
             f"Goal       {str(state.get('goal') or '')[: max(10, width - 12)]}",
             f"Repository {run.repo}",
+            f"Branch     {getattr(run, 'branch', '(unknown)')}",
             f"Thread     {thread_label} · generation {state.get('generation')}",
+            f"Mode       {state.get('control_mode', 'SUPERVISED')} · {'adopted, no writer started' if state.get('control_mode') == 'ADOPTED' and state.get('state') == State.NEW.value else 'Nightwatch supervision'}",
             f"Agent      {_agent_summary(state)}",
             f"Current    {(current or {}).get('id', 'complete')} · {(current or {}).get('title', 'all trusted milestones verified')}",
             f"Last       {state.get('last_event') or '(none)'}",
@@ -1117,8 +1167,10 @@ def status_run(run: RunRecord) -> str:
         f"STATUS · {state['state']}",
         f"Agent       {_agent_summary(state)}",
         f"Repository  {run.repo}",
+        f"Branch      {getattr(run, 'branch', '(unknown)')}",
         f"Run         {state.get('run_id')}",
         f"Thread      {thread_label}",
+        f"Mode        {state.get('control_mode', 'SUPERVISED')} · {'adopted, not supervised yet' if state.get('control_mode') == 'ADOPTED' and state.get('state') == State.NEW.value else 'Nightwatch supervision'}",
         f"Generation  {state.get('generation')} · recoveries {state.get('recoveries', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Quota       {_quota_line(state)} · authority {state.get('quota_source') or '(none)'}",
@@ -1167,7 +1219,10 @@ def recap_run(run: RunRecord) -> str:
         "NIGHTWATCH RECAP — trusted evidence",
         f"Result       {state['state']}",
         f"Goal         {state.get('goal')}",
+        f"Repository  {run.repo}",
+        f"Branch      {getattr(run, 'branch', '(unknown)')}",
         f"Thread       {run.thread_id or '(not captured)'}",
+        f"Mode        {state.get('control_mode', 'SUPERVISED')}",
         f"Model        {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Runtime      {state.get('created_at')} → {state.get('updated_at')}",
         f"Recoveries   {state.get('recoveries', 0)}",

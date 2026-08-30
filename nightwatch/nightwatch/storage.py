@@ -189,6 +189,8 @@ class NightwatchStore:
             model=model,
             reasoning_effort=reasoning_effort,
         )
+        if thread_id:
+            state["control_mode"] = "ADOPTED"
         state["acceptance_ready"] = sufficient_verification_policy(commands)
         if thread_id:
             state["thread_id"] = thread_id

@@ -19,6 +19,7 @@ from .operations import (
     atomic_write as _atomic_write,
     backup_marked_install as _backup_marked_install,
     doctor_snapshot,
+    codex_compatibility_snapshot,
     install_paths as _install_paths,
     install_user_files as _install_user_files,
     list_models as _model_catalog,
@@ -332,8 +333,13 @@ def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         return {"state": "NO_RUN", "error": str(exc), "terminal": True}
     progress = plan_progress(plan)
     agent = _agent_runtime(state)
+    try:
+        git_context = snapshot(state["repo"]).to_dict()
+    except (GitError, KeyError):
+        git_context = {"branch": "(unavailable)"}
     return {
         "state": state,
+        "git": git_context,
         "agent": agent,
         "plan": plan,
         "progress": progress,
@@ -352,11 +358,17 @@ def _render_status(value: dict[str, Any]) -> None:
         print(f"Nightwatch: no trusted run ({value.get('error')})")
         return
     state = value["state"]
+    git_context = value.get("git") or {}
     plan = value["plan"]
     progress = value["progress"]
     agent = value["agent"]
     print("Nightwatch")
     print(f"STATE          {state['state']}")
+    print(f"REPOSITORY     {state.get('repo') or '(unknown)'}")
+    print(f"BRANCH         {git_context.get('branch') or '(unknown)'}")
+    mode = state.get("control_mode", "SUPERVISED")
+    mode_detail = "adopted exact thread; writer not started" if mode == "ADOPTED" and state["state"] == State.NEW.value else "Nightwatch supervision"
+    print(f"MODE           {mode} ({mode_detail})")
     agent_detail = f" pid={agent['pid']} action={agent.get('action') or '(unknown)'}" if agent.get("pid") else ""
     print(f"AGENT          {agent['status']}{agent_detail}")
     thread_display = state.get("thread_id") or ("(not captured — first launch deferred)" if state["state"] == State.WAIT_QUOTA.value else "(not captured)")
@@ -464,6 +476,10 @@ def _doctor(args: argparse.Namespace) -> int:
         print(f"Nightwatch doctor: {report['status']}")
         print(f"Codex: {report.get('codex_version') or '(missing)'}")
         print(f"Auth: {report['auth']['status']}")
+        compatibility = report.get("compatibility") or {}
+        print(f"Codex compatibility: {str(compatibility.get('status', 'unavailable')).upper()} (non-destructive probes)")
+        for name, check in (compatibility.get("checks") or {}).items():
+            print(f"  {name}: {'PASS' if check.get('ok') else 'FAIL'}")
         print(f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})")
         if report["quota"].get("primary"):
             print(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
@@ -545,6 +561,14 @@ def _ui(args: argparse.Namespace) -> int:
 
 
 def _test(args: argparse.Namespace) -> int:
+    if args.test_name == "compatibility":
+        report = codex_compatibility_snapshot()
+        print(f"CODEX_COMPATIBILITY = {'PASS' if report['required_ok'] else 'FAIL'}")
+        for name, check in report["checks"].items():
+            suffix = f" ({check['detail']})" if check.get("detail") else ""
+            print(f"{name} = {'PASS' if check['ok'] else 'FAIL'}{suffix}")
+        print("No provider turn was started and no quota was consumed.")
+        return 0 if report["required_ok"] else 20
     if args.test_name == "app-server":
         try:
             quota = AppServerQuotaProvider().read()
@@ -558,7 +582,7 @@ def _test(args: argparse.Namespace) -> int:
             print(f"REAL_APP_SERVER_RATE_LIMITS = FAIL ({type(exc).__name__})")
             return 20
     if args.test_name != "quota-soak":
-        print("Available non-destructive tests: nightwatch test quota-soak | nightwatch test app-server")
+        print("Available non-destructive tests: nightwatch test compatibility | nightwatch test quota-soak | nightwatch test app-server")
         return 0
     print("REAL_QUOTA_SOAK = PENDING_REAL_QUOTA_SOAK")
     print("No quota is intentionally consumed. A natural provider limit cycle can be recorded later.")

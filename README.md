@@ -8,8 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#validation)
-[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+[![Tests: 147 Passing](https://img.shields.io/badge/Tests-147%20Passing-success.svg)](#validation)
+[![Codex: capability-probed](https://img.shields.io/badge/OpenAI%20Codex-capability--probed-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
 
@@ -88,6 +88,12 @@ nightwatch doctor
 Nightwatch doctor: ok
 Codex: codex-cli 0.150.1
 Auth: ok
+Codex compatibility: OK (non-destructive probes)
+  exec_json: PASS
+  exec_resume_exact_thread: PASS
+  queue_exact_thread: PASS
+  model_catalog: PASS
+  app_server_stdio: PASS
 Quota authority: LIVE_APP_SERVER (live_app_server)
 5h: 7.0% used, reset=1787866896
 weekly: 1.0% used, reset=1788453696
@@ -126,7 +132,7 @@ Source: trusted state + sequence-validated events
 Input › natural language starts a goal (or steers an active run); / opens command palette
 ```
 
-Typing `/` opens the described command palette. Important views include `/status`, `/plan`, `/timeline`, `/explain`, `/thread`, `/quota`, `/logs`, `/recap`, and `/report`. Mutating commands such as `/run`, `/adopt`, `/steer`, `/resume`, and `/stop` show a confirmation preview first. `/adopt` lists active sessions whose PID, rollout, repository and exact thread can be proven; manual thread entry remains the explicit fallback.
+Typing `/` opens the described command palette. Important views include `/status`, `/plan`, `/timeline`, `/explain`, `/thread`, `/quota`, `/logs`, `/recap`, and `/report`. Mutating commands such as `/run`, `/adopt`, `/steer`, `/resume`, and `/stop` show a confirmation preview first. `/adopt` labels each candidate as LIVE + PROVEN or RECENT HISTORY; a live process whose exact thread cannot be proven is shown separately, and manual thread entry is explicitly marked unproven. After adoption, the dashboard says `ADOPTED` until `/resume` starts supervision.
 
 `/multi` watches every trusted run under the control-plane state root. Concurrent writing agents may use different repositories or isolated Git worktrees. If the selected repository already has a run, the `/run` wizard creates the confirmed worktree under `.worktrees/<repo>/<label>` and a repo-specific systemd user unit. Nightwatch never permits two supervised writers in one working directory.
 
@@ -252,7 +258,8 @@ The TUI is an adapter over the same durable interfaces. Every operation remains 
 | `nightwatch log [--tail N]` | Show human-readable supervisor audit log |
 | `nightwatch report` | Output/generate the structured acceptance report |
 | `nightwatch stop` | Gracefully halt automatic supervision (state preserved) |
-| `nightwatch doctor` | Check Linux, Codex CLI, auth, quota authority & systemd |
+| `nightwatch doctor` | Check Linux, Codex CLI compatibility, auth, quota authority & systemd |
+| `nightwatch test compatibility` | Run help-only Codex capability probes; never starts a provider turn or consumes quota |
 | `nightwatch test app-server` | Test live JSON-RPC connection to Codex App Server |
 
 ---
@@ -296,11 +303,11 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 109 tests
+Ran 147 tests
 OK
 ```
 
-- ✅ Real Codex 0.150.1 App Server rate-limit RPC handshake validation
+- ✅ Codex App Server rate-limit RPC handshake and capability compatibility validation
 - ✅ Real process collision and race-condition prevention
 - ✅ Real Linux PID identity & state integrity under SIGKILL crash restarts
 - ✅ Symlink escape and mailbox injection attack prevention

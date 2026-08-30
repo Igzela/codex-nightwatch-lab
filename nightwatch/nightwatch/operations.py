@@ -423,8 +423,58 @@ def list_models() -> list[dict[str, Any]]:
     return catalog
 
 
+def codex_compatibility_snapshot(binary: str | None = None) -> dict[str, Any]:
+    """Probe the CLI surfaces Nightwatch relies on without starting a turn.
+
+    Every probe is a help request, so compatibility diagnostics never spend
+    quota or mutate a repository. The
+    launch and exact-thread resume surfaces are required; queue, model catalog,
+    and App Server help are useful optional capabilities.
+    """
+    executable = binary or os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+    probes = (
+        ("exec_json", ["exec", "--help"], ("--json",), True),
+        ("exec_resume_exact_thread", ["exec", "resume", "--help"], ("resume", "--json"), True),
+        ("queue_exact_thread", ["queue", "--help"], ("--thread",), False),
+        ("model_catalog", ["debug", "models", "--help"], ("models",), False),
+        ("app_server_stdio", ["app-server", "--help"], ("--stdio",), False),
+    )
+    checks: dict[str, dict[str, Any]] = {}
+    for name, argv, markers, required in probes:
+        try:
+            result = subprocess.run(
+                [executable, *argv],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            output = "\n".join(
+                value for value in (getattr(result, "stdout", ""), getattr(result, "stderr", "")) if isinstance(value, str)
+            )
+            missing = [marker for marker in markers if marker not in output]
+            ok = result.returncode == 0 and not missing
+            detail = None if ok else (f"missing {', '.join(missing)}" if missing else f"exit {result.returncode}")
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "timed out"
+        except OSError as exc:
+            ok, detail = False, type(exc).__name__
+        checks[name] = {"ok": ok, "required": required, "argv": argv, "detail": detail}
+    required_ok = all(item["ok"] for item in checks.values() if item["required"])
+    optional_ok = all(item["ok"] for item in checks.values() if not item["required"])
+    return {
+        "status": "ok" if required_ok and optional_ok else "degraded" if required_ok else "unavailable",
+        "required_ok": required_ok,
+        "checks": checks,
+        "non_destructive": True,
+    }
+
+
 def doctor_snapshot(repo: Path | None = None) -> dict[str, Any]:
     binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+    compatibility = codex_compatibility_snapshot(binary)
     inhibitor = shutil.which("systemd-inhibit")
     inhibit_ok = False
     if inhibitor:
@@ -448,6 +498,7 @@ def doctor_snapshot(repo: Path | None = None) -> dict[str, Any]:
         "systemd_inhibit": inhibit_ok,
         "auth": {"status": "unknown"},
         "quota": {"status": "unknown"},
+        "compatibility": compatibility,
     }
     try:
         result = subprocess.run(
@@ -493,5 +544,5 @@ def doctor_snapshot(repo: Path | None = None) -> dict[str, Any]:
             )
         except (SystemExit, StateIntegrityError, GitError) as exc:
             report["git"] = {"status": "unavailable", "error": str(exc)}
-    report["status"] = "ok" if report["codex_binary"] and report["auth"]["status"] == "ok" else "fail"
+    report["status"] = "ok" if report["codex_binary"] and report["auth"]["status"] == "ok" and compatibility["required_ok"] else "fail"
     return report

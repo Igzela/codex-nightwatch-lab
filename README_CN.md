@@ -8,8 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#测试验证)
-[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+[![Tests: 147 Passing](https://img.shields.io/badge/Tests-147%20Passing-success.svg)](#测试验证)
+[![Codex: capability-probed](https://img.shields.io/badge/OpenAI%20Codex-capability--probed-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
 
@@ -88,6 +88,12 @@ nightwatch doctor
 Nightwatch doctor: ok
 Codex: codex-cli 0.150.1
 Auth: ok
+Codex compatibility: OK (non-destructive probes)
+  exec_json: PASS
+  exec_resume_exact_thread: PASS
+  queue_exact_thread: PASS
+  model_catalog: PASS
+  app_server_stdio: PASS
 Quota authority: LIVE_APP_SERVER (live_app_server)
 5h: 7.0% used, reset=1787866896
 weekly: 1.0% used, reset=1788453696
@@ -126,7 +132,7 @@ Source: trusted state + sequence-validated events
 Input › natural language starts a goal (or steers an active run); / opens command palette
 ```
 
-输入 `/` 会展开带说明的命令面板。主要观察入口包括 `/status`、`/plan`、`/timeline`、`/explain`、`/thread`、`/quota`、`/logs`、`/recap` 和 `/report`；`/run`、`/adopt`、`/steer`、`/resume`、`/stop` 等状态变更操作都会先显示确认预览。`/adopt` 会列出能够同时证明 PID、rollout、仓库和 exact thread 的活跃会话，手工输入 Thread ID 仅作为显式后备路径。
+输入 `/` 会展开带说明的命令面板。主要观察入口包括 `/status`、`/plan`、`/timeline`、`/explain`、`/thread`、`/quota`、`/logs`、`/recap` 和 `/report`；`/run`、`/adopt`、`/steer`、`/resume`、`/stop` 等状态变更操作都会先显示确认预览。`/adopt` 会明确标记 `LIVE + PROVEN` 或 `RECENT HISTORY`；无法证明 exact thread 的活跃进程会单独显示，手工输入 Thread ID 也会明确标记为未证明。收养完成后，Dashboard 会显示 `ADOPTED`，直到 `/resume` 真正启动受控监督。
 
 `/multi` 会统一展示受信任状态根目录中的全部运行。多个写入 Agent 可以并行工作在不同仓库或相互隔离的 Git worktree 中。如果目标仓库已经存在一个运行，`/run` 向导会在确认后创建 `.worktrees/<repo>/<label>`，并为它生成独立的 systemd user unit。Nightwatch 不允许两个受控写入 Agent 共用同一个工作目录。
 
@@ -252,7 +258,8 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 | `nightwatch log [--tail N]` | 查看人类可读的审计与执行日志 |
 | `nightwatch report` | 输出/生成结构化验收报告 |
 | `nightwatch stop` | 安全停止自动执行（保留现场与 Thread 状态） |
-| `nightwatch doctor` | 检查 Linux、Codex CLI、认证状态、配额权威源与系统服务 |
+| `nightwatch doctor` | 检查 Linux、Codex CLI、兼容性、认证状态、配额权威源与系统服务 |
+| `nightwatch test compatibility` | 仅通过 help 探测 Codex 能力；不会启动模型任务或消耗配额 |
 | `nightwatch test app-server` | 实时测试与 Codex App Server 的 JSON-RPC 协议连接 |
 
 ---
@@ -296,11 +303,11 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 109 tests
+Ran 147 tests
 OK
 ```
 
-- ✅ 真实 Codex 0.150.1 App Server 实时配额 JSON-RPC 通信验证
+- ✅ Codex App Server 实时配额 JSON-RPC 握手与兼容性能力验证
 - ✅ 真实多进程并发冲突与竞争防御实测
 - ✅ SIGKILL 异常崩溃后 Linux PID 身份重校验与精确 Thread 恢复
 - ✅ 符号链接穿透与 Mailbox 命令注入反制

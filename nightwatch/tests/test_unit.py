@@ -29,6 +29,7 @@ from nightwatch.codex import (  # noqa: E402
 )
 from nightwatch.models import ErrorKind, QuotaSnapshot, QuotaWindow, State, plan_progress, validate_plan  # noqa: E402
 from nightwatch.quota import RolloutQuotaProvider  # noqa: E402
+from nightwatch.operations import codex_compatibility_snapshot  # noqa: E402
 from nightwatch.storage import NightwatchStore, StateIntegrityError, redact  # noqa: E402
 from nightwatch.supervisor import Supervisor  # noqa: E402
 
@@ -132,6 +133,39 @@ class UnitTests(unittest.TestCase):
         )
         self.assertNotIn("SECRET", json.dumps(catalog))
 
+    def test_compatibility_probe_is_help_only_and_reports_optional_degradation(self):
+        calls = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(argv)
+            output = {
+                ("/fake/codex", "exec", "--help"): "Usage: codex exec\n--json\n",
+                ("/fake/codex", "exec", "resume", "--help"): "resume previous session\n--json\n",
+                ("/fake/codex", "queue", "--help"): "queue --thread\n",
+                ("/fake/codex", "debug", "models", "--help"): "models\n",
+                ("/fake/codex", "app-server", "--help"): "app-server --stdio\n",
+            }.get(tuple(argv), "")
+            return type("Completed", (), {"returncode": 0, "stdout": output, "stderr": ""})()
+
+        with patch("nightwatch.operations.subprocess.run", side_effect=fake_run):
+            report = codex_compatibility_snapshot("/fake/codex")
+        self.assertEqual(report["status"], "ok")
+        self.assertTrue(report["required_ok"])
+        self.assertTrue(report["non_destructive"])
+        self.assertTrue(all("--help" in call for call in calls))
+
+        with patch("nightwatch.operations.subprocess.run", side_effect=lambda *_args, **_kwargs: type("Completed", (), {"returncode": 0, "stdout": "--json resume", "stderr": ""})()):
+            degraded = codex_compatibility_snapshot("/fake/codex")
+        self.assertEqual(degraded["status"], "degraded")
+        self.assertTrue(degraded["required_ok"])
+        self.assertFalse(degraded["checks"]["queue_exact_thread"]["ok"])
+
+    def test_compatibility_probe_fails_required_launch_surface_closed(self):
+        with patch("nightwatch.operations.subprocess.run", side_effect=FileNotFoundError):
+            report = codex_compatibility_snapshot("/missing/codex")
+        self.assertEqual(report["status"], "unavailable")
+        self.assertFalse(report["required_ok"])
+
     def test_terminal_status_watch_reports_agent_model_and_progress_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -151,6 +185,9 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(cli._status(args), 0)
             rendered = output.getvalue()
             self.assertIn("AGENT          STOPPED", rendered)
+            self.assertIn(f"REPOSITORY     {root}", rendered)
+            self.assertIn("BRANCH         ", rendered)
+            self.assertIn("MODE           SUPERVISED", rendered)
             self.assertIn("MODEL          gpt-test", rendered)
             self.assertIn("REASONING      high", rendered)
             self.assertIn("PROGRESS       [", rendered)
