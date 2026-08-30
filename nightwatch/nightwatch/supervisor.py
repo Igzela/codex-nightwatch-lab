@@ -685,6 +685,7 @@ class Supervisor:
 
 def build_report(store: NightwatchStore, state: dict[str, Any], verification: dict[str, Any] | None = None) -> str:
     plan = store.load_plan()
+    events = store.load_events()
     verification = verification or state.get("last_verification") or {}
     progress = verification.get("progress", {})
     quota = state.get("quota") or {}
@@ -702,8 +703,13 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         state["goal"],
         "",
         f"- RESULT: {state['state']}",
+        f"- RUN_ID: {state.get('run_id')}",
         f"- RUNTIME: {state['created_at']} → {state['updated_at']}",
+        f"- REPOSITORY: {state.get('repo')}",
         f"- THREAD_ID: {state.get('thread_id') or '(none)' }",
+        f"- GENERATION: {state.get('generation')}",
+        f"- MODEL: {state.get('model') or '(Codex default)'}",
+        f"- REASONING: {state.get('reasoning_effort') or '(Codex default)'}",
         f"- QUOTA SOURCE: {state.get('quota_source') or '(none)'}",
         f"- RECOVERIES: {state.get('recoveries', 0)}",
         f"- FINAL HEAD: {state.get('last_verified_commit') or state.get('last_git_head') or '(unknown)'}",
@@ -714,6 +720,7 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         "## MILESTONES",
         f"- implemented: {progress.get('implemented_count', 0)} / {progress.get('total_count', len(plan['milestones']))}",
         f"- verified: {progress.get('verified_count', 0)} / {progress.get('total_count', len(plan['milestones']))}",
+        *[f"- [{item.get('status')}] {item.get('id')}: {item.get('title')} (weight={item.get('weight')})" for item in plan["milestones"]],
         "",
         "## VERIFICATION",
         *[f"- {check.get('command')}: {'PASS' if check.get('ok') else 'FAIL'}" for check in verification.get("final_checks", [])],
@@ -723,6 +730,13 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         "",
         "## COMMITS",
         f"- last verified commit: {state.get('last_verified_commit') or '(none)'}",
+        "",
+        "## TRUSTED TIMELINE",
+        *[f"- #{item.get('seq')} {item.get('ts')} {item.get('state')} {item.get('event')}: {item.get('reason')}" for item in events[-100:]],
+        "",
+        "## TRUST SEMANTICS",
+        "- State, thread identity, milestones, quota snapshots, and checks above come from the Nightwatch trusted control plane.",
+        "- Model-authored narrative and model-authored verification authority are intentionally excluded.",
         "",
     ])
 

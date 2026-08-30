@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 81 Passing](https://img.shields.io/badge/Tests-81%20Passing-success.svg)](#测试验证)
+[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#测试验证)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -97,6 +97,40 @@ systemd-inhibit: available
 ---
 
 ## 📖 核心使用模式
+
+### 交互式 TUI（推荐）
+
+在终端里不带子命令运行 Nightwatch：
+
+```bash
+cd /path/to/my-project
+nightwatch
+```
+
+未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
+
+```text
+Nightwatch 0.3.0 · MULTI-THREAD CONTROL
+Runs 2 · ↑/↓ select · / commands · Esc quit
+
+▶ RUNNING             payments-retry         01a050ac-1149…
+    ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
+  WAIT_QUOTA          inventory-import       01a050bd-82ae…
+    ███████░░░░░░░░░░░ 38%  gpt-5.6-luna · medium
+
+Thread     01a050ac-1149… · generation 2
+Agent      RUNNING · PID 18234 · resume
+Next       continue current milestone
+Source: trusted state + sequence-validated events
+
+Input › natural language starts a goal (or steers an active run); / opens command palette
+```
+
+输入 `/` 会展开带说明的命令面板。主要观察入口包括 `/status`、`/plan`、`/timeline`、`/explain`、`/thread`、`/quota`、`/logs`、`/recap` 和 `/report`；`/run`、`/adopt`、`/steer`、`/resume`、`/stop` 等状态变更操作都会先显示确认预览。`/adopt` 会列出能够同时证明 PID、rollout、仓库和 exact thread 的活跃会话，手工输入 Thread ID 仅作为显式后备路径。
+
+`/multi` 会统一展示受信任状态根目录中的全部运行。多个写入 Agent 可以并行工作在不同仓库或相互隔离的 Git worktree 中。如果目标仓库已经存在一个运行，`/run` 向导会在确认后创建 `.worktrees/<repo>/<label>`，并为它生成独立的 systemd user unit。Nightwatch 不允许两个受控写入 Agent 共用同一个工作目录。
+
+到达 `DONE`、`BLOCKED`、`FAILED`、`STOPPED` 或 `AWAITING_ACCEPTANCE` 时，TUI 会响铃并明确显示真实终态。`/recap` 提供基于证据的短总结；`/report` 持久化包含模型、Thread、generation、里程碑、验证、配额和可信时间线的完整报告。模型叙述不会混入可信事实。
 
 ### 选择 Codex 模型和推理挡位
 
@@ -200,12 +234,15 @@ nightwatch resume                 # 继续同一个 exact Thread
 
 如果需要正常聊天交互，继续直接使用 Codex，并在另一个终端运行 `nightwatch watch`。`watch --auto-takeover` 会在原交互进程退出后，把同一 Thread 交给无人值守 Supervisor。
 
+TUI 只是现有持久化接口之上的显示与操作适配层。所有能力仍保留对应 CLI，便于脚本化与故障恢复；界面不会维护第二份隐藏状态。
+
 ---
 
 ## 🛠️ CLI 常用指令表
 
 | 命令 | 说明 |
 | :--- | :--- |
+| `nightwatch` / `nightwatch ui` | 打开多线程交互式 Dashboard 和 `/` 命令面板 |
 | `nightwatch models [--json]` | 显示本机 Codex 实时模型目录及支持的推理挡位 |
 | `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
 | `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听活跃交互会话；模型参数用于自动接管 |
@@ -259,7 +296,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 81 tests
+Ran 92 tests
 OK
 ```
 

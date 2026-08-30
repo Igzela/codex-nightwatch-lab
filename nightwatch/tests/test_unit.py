@@ -193,7 +193,7 @@ class UnitTests(unittest.TestCase):
             state = NightwatchStore(root).load_state()
             self.assertEqual(state["state"], State.NEW.value)
             self.assertIsNone(state["thread_id"])
-            start.assert_called_once()
+            start.assert_called_once_with(cli._service_name(root))
             execute.assert_not_called()
 
     def test_run_service_bus_failure_keeps_goal_new_and_does_not_start_codex(self):

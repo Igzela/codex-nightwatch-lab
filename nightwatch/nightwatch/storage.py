@@ -315,6 +315,17 @@ class NightwatchStore:
             self._append_event_unlocked(state, event, reason, metadata)
             self._log_unlocked(f"{state['state']}: {reason}")
 
+    def load_events(self) -> list[dict[str, Any]]:
+        """Return the sequence-validated trusted lifecycle timeline."""
+        events = self._event_items()
+        previous = 0
+        for item in events:
+            seq = item.get("seq") if isinstance(item, dict) else None
+            if not isinstance(seq, int) or seq != previous + 1:
+                raise StateIntegrityError("trusted event log sequence is corrupt")
+            previous = seq
+        return events
+
     def log(self, message: str) -> None:
         with self.locked():
             self._log_unlocked(message)

@@ -16,7 +16,7 @@ from . import __version__
 from .git import GitError, repo_root, snapshot
 from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
 from .quota import AppServerQuotaProvider, QuotaError, make_quota_provider
-from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact
+from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact, repo_identity
 from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive, process_matches
 
 
@@ -51,7 +51,7 @@ def _add_model_options(parser: argparse.ArgumentParser, *, takeover: bool = Fals
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nightwatch", description="Fail-closed unattended supervisor for one OpenAI Codex thread")
+    parser = argparse.ArgumentParser(prog="nightwatch", description="Fail-closed multi-thread control plane for OpenAI Codex")
     parser.add_argument("--version", action="version", version=f"nightwatch {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -99,6 +99,9 @@ def _parser() -> argparse.ArgumentParser:
 
     models = sub.add_parser("models", help="show the installed Codex model catalog and reasoning levels")
     models.add_argument("--json", action="store_true")
+
+    ui = sub.add_parser("ui", help="open the interactive multi-thread terminal control plane")
+    ui.add_argument("--repo", default=None)
 
     install = sub.add_parser("install", help="install a user-local launcher")
     install.add_argument("--service", action="store_true", help="also install a marked user-level systemd unit")
@@ -188,7 +191,7 @@ def _run(args: argparse.Namespace) -> int:
     if args.service:
         _install_user_files(root)
         try:
-            _start_user_service()
+            _start_user_service(_service_name(root))
         except RuntimeError as exc:
             print(
                 "nightwatch: goal was saved as NEW but the user service was not started; "
@@ -571,16 +574,19 @@ def _models(args: argparse.Namespace) -> int:
     return 0
 
 
-def _install_paths() -> tuple[Path, Path]:
+def _service_name(service_root: Path) -> str:
+    return f"nightwatch-{repo_identity(service_root)}.service"
+
+
+def _install_paths(service_root: Path | None = None) -> tuple[Path, Path]:
     return (
         Path.home() / ".local" / "bin" / "nightwatch",
-        Path.home() / ".config" / "systemd" / "user" / "nightwatch.service",
+        Path.home() / ".config" / "systemd" / "user" / (_service_name(service_root) if service_root else "nightwatch.service"),
     )
 
 
 def _service_text(service_root: Path) -> str:
-    source_root = Path(__file__).resolve().parents[1]
-    template = (source_root / "systemd" / "nightwatch.service").read_text(encoding="utf-8")
+    template = Path(__file__).with_name("nightwatch.service").read_text(encoding="utf-8")
     # systemd parses ExecStart itself (not through a shell), so quote the repo
     # there as one argument. WorkingDirectory is a unit path setting: quotes
     # are literal for that setting, therefore it must remain an absolute raw
@@ -599,7 +605,7 @@ def _systemd_quote(value: str) -> str:
 
 
 def _validate_install_targets(service_root: Path | None = None) -> None:
-    launcher, service = _install_paths()
+    launcher, service = _install_paths(service_root)
     if launcher.exists() or launcher.is_symlink():
         try:
             existing = launcher.read_text(encoding="utf-8")
@@ -643,7 +649,7 @@ def _backup_marked_install(path: Path) -> None:
 def _install_user_files(service_root: Path | None = None) -> tuple[Path, Path | None]:
     _validate_install_targets(service_root)
     source_root = Path(__file__).resolve().parents[1]
-    launcher, service = _install_paths()
+    launcher, service = _install_paths(service_root)
     launcher_text = f"#!/bin/sh\n# nightwatch-install: {source_root}\nexec python3 {source_root / 'bin' / 'nightwatch'} \"$@\"\n"
     _backup_marked_install(launcher)
     _atomic_write(launcher, launcher_text, 0o755)
@@ -654,13 +660,13 @@ def _install_user_files(service_root: Path | None = None) -> tuple[Path, Path | 
     return launcher, None
 
 
-def _start_user_service() -> None:
+def _start_user_service(service_name: str = "nightwatch.service") -> None:
     binary = shutil.which("systemctl")
     if not binary:
         raise RuntimeError("systemctl is not installed")
     for command in (
         [binary, "--user", "daemon-reload"],
-        [binary, "--user", "enable", "--now", "nightwatch.service"],
+        [binary, "--user", "enable", "--now", service_name],
     ):
         try:
             result = subprocess.run(
@@ -683,23 +689,56 @@ def _install(args: argparse.Namespace) -> int:
     print(f"Installed {launcher}")
     if service is not None:
         print(f"Installed {service}")
-        print("Enable it with: systemctl --user daemon-reload && systemctl --user enable --now nightwatch.service")
+        print(f"Enable it with: systemctl --user daemon-reload && systemctl --user enable --now {service.name}")
     return 0
 
 
 def _uninstall(_args: argparse.Namespace) -> int:
     removed = []
-    for path in _install_paths():
+    launcher, legacy_service = _install_paths()
+    service_directory = legacy_service.parent
+    dynamic_services = sorted(service_directory.glob("nightwatch-*.service")) if service_directory.exists() else []
+    for path in (launcher, legacy_service, *dynamic_services):
         if not path.exists():
+            continue
+        if path.is_symlink():
+            print(f"Preserved untrusted symlink: {path}", file=sys.stderr)
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if "nightwatch-install" not in text:
             print(f"Preserved unrelated file: {path}", file=sys.stderr)
             continue
+        if path.suffix == ".service":
+            binary = shutil.which("systemctl")
+            if binary:
+                try:
+                    subprocess.run(
+                        [binary, "--user", "disable", "--now", path.name],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
         path.unlink()
         removed.append(str(path))
     print("Uninstalled: " + (", ".join(removed) if removed else "nothing"))
     return 0
+
+
+def _launch_tui(repo: str | None = None) -> int:
+    from .tui import run_tui
+
+    return run_tui(repo)
+
+
+def _ui(args: argparse.Namespace) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("nightwatch: interactive UI requires a terminal", file=sys.stderr)
+        return 2
+    return _launch_tui(args.repo)
 
 
 def _test(args: argparse.Namespace) -> int:
@@ -840,7 +879,13 @@ def _watch(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    effective = list(sys.argv[1:] if argv is None else argv)
+    if not effective:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return _launch_tui()
+        _parser().print_help()
+        return 2
+    args = _parser().parse_args(effective)
     try:
         return {
             "run": _run,
@@ -852,6 +897,7 @@ def main(argv: list[str] | None = None) -> int:
             "stop": _stop,
             "doctor": _doctor,
             "models": _models,
+            "ui": _ui,
             "install": _install,
             "uninstall": _uninstall,
             "test": _test,

@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 81 Passing](https://img.shields.io/badge/Tests-81%20Passing-success.svg)](#validation)
+[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#validation)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -97,6 +97,40 @@ systemd-inhibit: available
 ---
 
 ## 📖 Usage Modes
+
+### Interactive TUI (Recommended)
+
+Run Nightwatch without a subcommand inside a terminal:
+
+```bash
+cd /path/to/my-project
+nightwatch
+```
+
+Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed.
+
+```text
+Nightwatch 0.3.0 · MULTI-THREAD CONTROL
+Runs 2 · ↑/↓ select · / commands · Esc quit
+
+▶ RUNNING             payments-retry         01a050ac-1149…
+    ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
+  WAIT_QUOTA          inventory-import       01a050bd-82ae…
+    ███████░░░░░░░░░░░ 38%  gpt-5.6-luna · medium
+
+Thread     01a050ac-1149… · generation 2
+Agent      RUNNING · PID 18234 · resume
+Next       continue current milestone
+Source: trusted state + sequence-validated events
+
+Input › natural language starts a goal (or steers an active run); / opens command palette
+```
+
+Typing `/` opens the described command palette. Important views include `/status`, `/plan`, `/timeline`, `/explain`, `/thread`, `/quota`, `/logs`, `/recap`, and `/report`. Mutating commands such as `/run`, `/adopt`, `/steer`, `/resume`, and `/stop` show a confirmation preview first. `/adopt` lists active sessions whose PID, rollout, repository and exact thread can be proven; manual thread entry remains the explicit fallback.
+
+`/multi` watches every trusted run under the control-plane state root. Concurrent writing agents may use different repositories or isolated Git worktrees. If the selected repository already has a run, the `/run` wizard creates the confirmed worktree under `.worktrees/<repo>/<label>` and a repo-specific systemd user unit. Nightwatch never permits two supervised writers in one working directory.
+
+At `DONE`, `BLOCKED`, `FAILED`, `STOPPED`, or `AWAITING_ACCEPTANCE`, the TUI rings the terminal bell and shows the exact terminal state. `/recap` gives a short evidence-grounded summary; `/report` writes the durable report with model, thread, generations, milestones, checks, quota and trusted timeline. Model narrative is explicitly excluded from trusted facts.
 
 ### Choose a Codex Model and Reasoning Level
 
@@ -200,12 +234,15 @@ The live status distinguishes the supervisor from the Codex child (`AGENT RUNNIN
 
 For a normal interactive Codex chat, keep using Codex directly and run `nightwatch watch` in another terminal. `watch --auto-takeover` can hand that exact thread to unattended supervision after the interactive process exits.
 
+The TUI is an adapter over the same durable interfaces. Every operation remains available through explicit CLI commands for scripts and recovery; the UI does not maintain a second hidden state.
+
 ---
 
 ## 🛠️ CLI Reference
 
 | Command | Description |
 | :--- | :--- |
+| `nightwatch` / `nightwatch ui` | Open the interactive multi-thread dashboard and `/` command palette |
 | `nightwatch models [--json]` | Show the installed Codex model catalog and supported reasoning levels |
 | `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | Initialize and run a new supervised goal |
 | `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | Passively monitor active interactive Codex sessions; model options apply to takeover |
@@ -259,7 +296,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 81 tests
+Ran 92 tests
 OK
 ```
 
