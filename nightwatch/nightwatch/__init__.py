@@ -1,3 +1,3 @@
 """Nightwatch: a small, durable supervisor for one Codex thread per Git repo."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

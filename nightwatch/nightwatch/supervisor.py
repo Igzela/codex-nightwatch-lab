@@ -273,8 +273,13 @@ Work only on unfinished work. If a real blocker prevents progress, write `.night
 
 def resume_prompt(store: NightwatchStore, state: dict[str, Any]) -> str:
     commands = store.load_policy()["final_commands"]
+    goal_hash = store.load_acceptance()["goal_hash"]
     verification = "\n".join(f"- {command}" for command in commands) or "- No trusted automatic verification is configured."
     return f"""Resume the same exact Nightwatch task thread. Read `.nightwatch-agent/context.json`, `.nightwatch-agent/proposed-plan.json`, `.nightwatch-agent/progress.json` if present, Git status, Git diff, and recent commits. Trusted Nightwatch control-plane state is outside the workspace. The durable task state says generation={state['generation']} and thread_id={state.get('thread_id')}.
+
+If `.nightwatch-agent/proposed-plan.json` is absent, create it before continuing with this exact shape:
+{{"goal_hash":"{goal_hash}","milestones":[{{"id":"M1","title":"...","weight":1}}]}}
+Do not add verification commands or policy to the proposal: models may suggest task structure but cannot authorize host commands.
 
 Determine which milestones are actually verified from available repository evidence. Do not repeat completed work. Continue only unfinished work. Update `.nightwatch-agent/progress.json` only with implemented/working/blocked facts. Nightwatch, not the model, decides verified/DONE and only runs frozen user-authorized checks. The frozen user-authorized verification commands are:
 {verification}
@@ -303,7 +308,7 @@ class Supervisor:
     def execute(self, start: bool = False) -> dict[str, Any]:
         try:
             with self.store.supervisor_lease():
-                owner = {"pid": os.getpid(), "acquired_at": now_iso()}
+                owner = {**(process_identity(os.getpid()) or {"pid": os.getpid()}), "acquired_at": now_iso()}
                 self.store.mutate("supervisor_lease_acquired", "supervisor lifetime lease acquired", lambda item: {**item, "supervisor_owner": owner})
                 try:
                     return self._execute(start)
@@ -852,6 +857,8 @@ class PassiveWatcher:
         auto_takeover: bool = False,
         goal: str | None = None,
         verify_commands: list[str] | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         init_snap = self.inspect_live_snapshot()
 
@@ -954,6 +961,8 @@ class PassiveWatcher:
                             str(self.store.repo),
                             verify_commands=verify_commands or [],
                             thread_id=frozen_thread_id,
+                            model=model,
+                            reasoning_effort=reasoning_effort,
                         )
                     supervisor = Supervisor(self.store)
                     return supervisor.execute(start=False)

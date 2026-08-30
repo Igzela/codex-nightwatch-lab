@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +33,128 @@ from nightwatch.supervisor import Supervisor  # noqa: E402
 
 
 class UnitTests(unittest.TestCase):
+    def test_inhibit_reexec_preserves_existing_thread_binding(self):
+        args = cli._parser().parse_args(
+            [
+                "run",
+                "goal",
+                "--repo",
+                "/repo",
+                "--thread",
+                "THREAD-1",
+                "--model",
+                "gpt-5.6-terra",
+                "--reasoning-effort",
+                "high",
+                "--verify",
+                "test -f proof.txt",
+            ]
+        )
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.dict(os.environ, {"NIGHTWATCH_INHIBITED": "0"}), patch(
+            "nightwatch.cli.shutil.which", return_value="/usr/bin/systemd-inhibit"
+        ), patch("nightwatch.cli.subprocess.run", return_value=completed), patch(
+            "nightwatch.cli.os.execvpe", side_effect=RuntimeError("captured re-exec")
+        ) as execvpe:
+            with self.assertRaisesRegex(RuntimeError, "captured re-exec"):
+                cli._maybe_inhibit(args, Path("/repo"))
+
+        command = execvpe.call_args.args[1]
+        self.assertIn("--thread", command)
+        self.assertEqual(command[command.index("--thread") + 1], "THREAD-1")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-terra")
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
+
+    def test_model_and_reasoning_selection_are_persisted_and_forwarded(self):
+        parsed = cli._parser().parse_args(
+            ["run", "goal", "--model", "gpt-5.6-terra", "--reasoning-effort", "high"]
+        )
+        self.assertEqual(parsed.model, "gpt-5.6-terra")
+        self.assertEqual(parsed.reasoning_effort, "high")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = NightwatchStore(root)
+            store.initialize(
+                "model-run",
+                "goal",
+                str(root),
+                model=parsed.model,
+                reasoning_effort=parsed.reasoning_effort,
+            )
+            state = store.load_state()
+            self.assertEqual(state["model"], "gpt-5.6-terra")
+            self.assertEqual(state["reasoning_effort"], "high")
+
+        for thread_id in (None, "EXACT-1"):
+            args, _action = build_command(
+                "/repo",
+                thread_id,
+                "prompt",
+                model="gpt-5.6-terra",
+                reasoning_effort="high",
+            )
+            self.assertEqual(args[args.index("--model") + 1], "gpt-5.6-terra")
+            config = args[args.index("--config") + 1]
+            self.assertEqual(config, 'model_reasoning_effort="high"')
+
+    def test_model_selection_rejects_terminal_control_characters(self):
+        with self.assertRaises(SystemExit):
+            cli._parser().parse_args(["run", "goal", "--model", "bad\nmodel"])
+
+    def test_model_catalog_exposes_only_allowlisted_selection_fields(self):
+        payload = {
+            "models": [
+                {
+                    "slug": "gpt-test",
+                    "display_name": "GPT Test",
+                    "visibility": "list",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                    "model_messages": {"instructions_template": "SECRET INTERNAL INSTRUCTIONS"},
+                    "base_instructions": "SECRET BASE INSTRUCTIONS",
+                },
+                {"slug": "hidden-model", "visibility": "hide", "model_messages": {"instructions_template": "SECRET"}},
+            ]
+        }
+        completed = type("Completed", (), {"returncode": 0, "stdout": json.dumps(payload)})()
+        with patch("nightwatch.cli.subprocess.run", return_value=completed):
+            catalog = cli._model_catalog()
+        self.assertEqual(
+            catalog,
+            [{
+                "slug": "gpt-test",
+                "display_name": "GPT Test",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": ["low", "high"],
+            }],
+        )
+        self.assertNotIn("SECRET", json.dumps(catalog))
+
+    def test_terminal_status_watch_reports_agent_model_and_progress_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            store = NightwatchStore(root)
+            store.initialize(
+                "status-run",
+                "goal",
+                str(root),
+                model="gpt-test",
+                reasoning_effort="high",
+            )
+            store.transition(State.STOPPED, "test_stop", "terminal status test")
+            args = cli._parser().parse_args(["status", "--watch", "--interval", "0.2", "--repo", str(root)])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(cli._status(args), 0)
+            rendered = output.getvalue()
+            self.assertIn("AGENT          STOPPED", rendered)
+            self.assertIn("MODEL          gpt-test", rendered)
+            self.assertIn("REASONING      high", rendered)
+            self.assertIn("PROGRESS       [", rendered)
+            self.assertEqual(rendered.count("Nightwatch\n"), 1)
+
     def test_service_cli_and_unit_are_repo_bound_and_fail_closed(self):
         args = cli._parser().parse_args(["run", "--service", "goal", "--repo", "/repo"])
         self.assertTrue(args.service)

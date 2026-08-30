@@ -6,9 +6,9 @@
 *Zero external dependencies • Direct App Server JSON-RPC • Frozen verification gates • Native systemd integration*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#installation)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 74 Passing](https://img.shields.io/badge/Tests-74%20Passing-success.svg)](#validation)
+[![Tests: 81 Passing](https://img.shields.io/badge/Tests-81%20Passing-success.svg)](#validation)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -98,6 +98,27 @@ systemd-inhibit: available
 
 ## 📖 Usage Modes
 
+### Choose a Codex Model and Reasoning Level
+
+Nightwatch reads the catalog from the installed Codex CLI, so it follows the models and levels available on this machine instead of freezing a stale list:
+
+```bash
+nightwatch models
+nightwatch models --json
+```
+
+Select both values when creating or adopting a run. They are stored in trusted durable state and reused for every exact-thread continuation:
+
+```bash
+nightwatch run \
+  --model gpt-5.6-luna \
+  --reasoning-effort high \
+  --verify "pytest -q" \
+  "Implement the feature and pass the test suite"
+```
+
+If either option is omitted, Codex's configured default remains authoritative. The installed Codex CLI performs the final model/level compatibility check.
+
 ### Mode A: Unattended Overnight Run (Full Autonomous Supervisor)
 
 Launch a goal with explicit verification gates:
@@ -105,6 +126,8 @@ Launch a goal with explicit verification gates:
 ```bash
 cd /path/to/my-project
 nightwatch run \
+  --model gpt-5.6-luna \
+  --reasoning-effort high \
   --verify "pytest -q" \
   --verify "git diff --check" \
   "Implement payment webhook retry handler and pass all tests"
@@ -154,9 +177,28 @@ SUBAGENTS    Copernicus (01a0442b...), Kepler (01a0442b...)
 Bind an existing conversation directly into Nightwatch's trusted control plane:
 
 ```bash
-nightwatch adopt --thread 01a04416-c7aa-7271-9ede-7fe2d40cf950 --verify "pytest"
+nightwatch adopt --thread 01a04416-c7aa-7271-9ede-7fe2d40cf950 \
+  --model gpt-5.6-luna --reasoning-effort high --verify "pytest"
 nightwatch resume
 ```
+
+### Interaction and Live Progress
+
+`nightwatch run` is deliberately unattended: it starts `codex exec --json`, sends the goal over stdin, and supervises that one exact thread. It is not a chat UI. Interact with the control plane from another terminal:
+
+```bash
+nightwatch status                 # one durable snapshot
+nightwatch status --watch         # live agent state, progress, and milestones
+nightwatch status --json          # machine-readable snapshot
+nightwatch log --tail 100         # supervisor audit trail
+nightwatch report                 # acceptance report
+nightwatch stop                   # stop safely; preserve state and thread
+nightwatch resume                 # continue that exact thread
+```
+
+The live status distinguishes the supervisor from the Codex child (`AGENT RUNNING`, PID and start/resume action), shows the selected model and reasoning level, displays trusted implemented/verified milestone progress, and exits automatically at a terminal state. Workspace mailbox progress is untrusted input until Nightwatch validates and incorporates it into the durable plan.
+
+For a normal interactive Codex chat, keep using Codex directly and run `nightwatch watch` in another terminal. `watch --auto-takeover` can hand that exact thread to unattended supervision after the interactive process exits.
 
 ---
 
@@ -164,11 +206,12 @@ nightwatch resume
 
 | Command | Description |
 | :--- | :--- |
-| `nightwatch run "<goal>" [--verify <cmd>] [--service]` | Initialize and run a new supervised goal |
-| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | Passively monitor active Codex sessions in current repo |
-| `nightwatch adopt --thread <id> [--verify <cmd>]` | Adopt an existing thread into Nightwatch |
+| `nightwatch models [--json]` | Show the installed Codex model catalog and supported reasoning levels |
+| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | Initialize and run a new supervised goal |
+| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | Passively monitor active interactive Codex sessions; model options apply to takeover |
+| `nightwatch adopt --thread <id> [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>]` | Adopt an existing thread into Nightwatch |
 | `nightwatch resume` | Resume the current repo's exact-thread goal |
-| `nightwatch status [--json]` | Show durable task state, quota status & milestone progress |
+| `nightwatch status [--watch] [--interval <seconds>] [--json]` | Show or continuously watch agent state, quota and trusted milestone progress |
 | `nightwatch log [--tail N]` | Show human-readable supervisor audit log |
 | `nightwatch report` | Output/generate the structured acceptance report |
 | `nightwatch stop` | Gracefully halt automatic supervision (state preserved) |
@@ -216,7 +259,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 64 tests in 3.563s
+Ran 81 tests
 OK
 ```
 

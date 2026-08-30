@@ -2,7 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import re
 from typing import Any
+
+
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_REASONING_EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+
+
+def validate_model_name(value: str) -> str:
+    if not _MODEL_NAME.fullmatch(value):
+        raise ValueError("model must be a visible model slug (letters, digits, '.', '_', ':', '/', or '-')")
+    return value
+
+
+def validate_reasoning_effort(value: str) -> str:
+    if not _REASONING_EFFORT.fullmatch(value):
+        raise ValueError("reasoning effort must be a visible level name")
+    return value
 
 
 class State(StrEnum):
@@ -108,7 +125,15 @@ class ProviderResult:
 TERMINAL_STATES = {State.DONE, State.FAILED, State.BLOCKED, State.STOPPED, State.AWAITING_ACCEPTANCE}
 
 
-def empty_state(run_id: str, goal: str, repo: str, repo_id: str, now: str) -> dict[str, Any]:
+def empty_state(
+    run_id: str,
+    goal: str,
+    repo: str,
+    repo_id: str,
+    now: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "run_id": run_id,
@@ -116,6 +141,8 @@ def empty_state(run_id: str, goal: str, repo: str, repo_id: str, now: str) -> di
         "repo": repo,
         "repo_id": repo_id,
         "thread_id": None,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
         "state": State.NEW.value,
         "generation": 1,
         "created_at": now,
@@ -164,6 +191,10 @@ def validate_state(state: dict[str, Any]) -> None:
         raise ValueError("state.generation must be a positive integer")
     if state.get("thread_id") is not None and not isinstance(state["thread_id"], str):
         raise ValueError("state.thread_id must be a string or null")
+    if state.get("model") is not None:
+        validate_model_name(state["model"])
+    if state.get("reasoning_effort") is not None:
+        validate_reasoning_effort(state["reasoning_effort"])
     if state.get("resume_claim") is not None:
         claim = state["resume_claim"]
         if not isinstance(claim, dict) or not isinstance(claim.get("generation"), int):

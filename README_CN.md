@@ -6,9 +6,9 @@
 *零外部依赖 • 直连官方 App Server JSON-RPC • 预冻结验证门禁 • 宿主系统级原生集成*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#安装指南)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 74 Passing](https://img.shields.io/badge/Tests-74%20Passing-success.svg)](#测试验证)
+[![Tests: 81 Passing](https://img.shields.io/badge/Tests-81%20Passing-success.svg)](#测试验证)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -98,6 +98,27 @@ systemd-inhibit: available
 
 ## 📖 核心使用模式
 
+### 选择 Codex 模型和推理挡位
+
+Nightwatch 会读取当前已安装 Codex CLI 的实时模型目录，不把容易过期的模型和挡位列表写死：
+
+```bash
+nightwatch models
+nightwatch models --json
+```
+
+创建或收养任务时可以同时指定模型与挡位。它们会写入工作区外的受信任持久化状态，并用于后续每一次 exact-thread 续跑：
+
+```bash
+nightwatch run \
+  --model gpt-5.6-luna \
+  --reasoning-effort high \
+  --verify "pytest -q" \
+  "实现功能并通过完整测试"
+```
+
+不指定某一项时，继续使用 Codex 自身配置的默认值；模型与挡位是否兼容最终由本机 Codex CLI 校验。
+
 ### 模式一：夜间全自主无人值守模式
 
 在 Git 仓库中直接启动带真实验收门禁的守护任务：
@@ -105,6 +126,8 @@ systemd-inhibit: available
 ```bash
 cd /path/to/my-project
 nightwatch run \
+  --model gpt-5.6-luna \
+  --reasoning-effort high \
   --verify "pytest -q" \
   --verify "git diff --check" \
   "完成当前模块的重构并确保所有测试全部通过"
@@ -154,9 +177,28 @@ SUBAGENTS    Copernicus (01a0442b...), Kepler (01a0442b...)
 直接将现存的对话 Thread 注入 Nightwatch 控制面：
 
 ```bash
-nightwatch adopt --thread 01a04416-c7aa-7271-9ede-7fe2d40cf950 --verify "pytest"
+nightwatch adopt --thread 01a04416-c7aa-7271-9ede-7fe2d40cf950 \
+  --model gpt-5.6-luna --reasoning-effort high --verify "pytest"
 nightwatch resume
 ```
+
+### 如何交互与查看实时进度
+
+`nightwatch run` 是无人值守执行模式：它启动 `codex exec --json`，通过 stdin 发送目标，并只监督这个精确 Thread；它本身不是聊天界面。另开一个终端即可操作控制面：
+
+```bash
+nightwatch status                 # 单次持久化状态快照
+nightwatch status --watch         # 实时 Agent 状态、进度和里程碑
+nightwatch status --json          # 机器可读快照
+nightwatch log --tail 100         # Supervisor 审计日志
+nightwatch report                 # 验收报告
+nightwatch stop                   # 安全停止，保留状态和 Thread
+nightwatch resume                 # 继续同一个 exact Thread
+```
+
+实时状态会区分 Supervisor 与 Codex 子 Agent（`AGENT RUNNING`、PID、start/resume 动作），显示所选模型和推理挡位，并展示受信任的 implemented/verified 里程碑进度，到达终态后自动退出。工作区 mailbox 中由模型写入的进度只是非受信任输入，必须被 Nightwatch 校验并纳入持久化计划后才会显示为可信进度。
+
+如果需要正常聊天交互，继续直接使用 Codex，并在另一个终端运行 `nightwatch watch`。`watch --auto-takeover` 会在原交互进程退出后，把同一 Thread 交给无人值守 Supervisor。
 
 ---
 
@@ -164,11 +206,12 @@ nightwatch resume
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `nightwatch run "<goal>" [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
-| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听当前仓库中活跃的 Codex 会话 |
-| `nightwatch adopt --thread <id> [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
+| `nightwatch models [--json]` | 显示本机 Codex 实时模型目录及支持的推理挡位 |
+| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
+| `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听活跃交互会话；模型参数用于自动接管 |
+| `nightwatch adopt --thread <id> [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
 | `nightwatch resume` | 恢复并继续当前仓库的精确 Thread 任务 |
-| `nightwatch status [--json]` | 查看当前持久化状态、配额恢复倒计时与里程碑进度 |
+| `nightwatch status [--watch] [--interval <秒>] [--json]` | 单次或持续查看 Agent 状态、配额与可信里程碑进度 |
 | `nightwatch log [--tail N]` | 查看人类可读的审计与执行日志 |
 | `nightwatch report` | 输出/生成结构化验收报告 |
 | `nightwatch stop` | 安全停止自动执行（保留现场与 Thread 状态） |
@@ -216,7 +259,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 64 tests in 3.563s
+Ran 81 tests
 OK
 ```
 

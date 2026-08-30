@@ -38,6 +38,44 @@ def fixture() -> tuple[tempfile.TemporaryDirectory, Path]:
 
 
 class TrustedControlPlaneTests(unittest.TestCase):
+    def test_new_run_clears_stale_mailbox_outputs_but_preserves_unrelated_files(self):
+        temporary, root = fixture()
+        try:
+            mailbox = root / ".nightwatch-agent"
+            mailbox.mkdir()
+            for name in ("proposed-plan.json", "progress.json", "blocker.json"):
+                (mailbox / name).write_text('{"stale": true}\n')
+            (mailbox / "user-note.txt").write_text("preserve\n")
+
+            store = NightwatchStore(root)
+            store.initialize("fresh-run", "fresh goal", str(root), verify_commands=["pytest -q"])
+
+            for name in ("proposed-plan.json", "progress.json", "blocker.json"):
+                self.assertFalse((mailbox / name).exists())
+            self.assertEqual((mailbox / "user-note.txt").read_text(), "preserve\n")
+            context = json.loads((mailbox / "context.json").read_text())
+            self.assertEqual(context["goal_hash"], store.load_acceptance()["goal_hash"])
+        finally:
+            temporary.cleanup()
+
+    def test_new_run_unlinks_stale_mailbox_symlink_without_touching_target(self):
+        temporary, root = fixture()
+        outside_temporary = tempfile.TemporaryDirectory(prefix="nightwatch-stale-mailbox-target-")
+        try:
+            outside = Path(outside_temporary.name) / "outside.json"
+            outside.write_text('{"preserve": true}\n')
+            mailbox = root / ".nightwatch-agent"
+            mailbox.mkdir()
+            (mailbox / "progress.json").symlink_to(outside)
+
+            NightwatchStore(root).initialize("fresh-run", "fresh goal", str(root), verify_commands=["pytest -q"])
+
+            self.assertFalse((mailbox / "progress.json").exists())
+            self.assertEqual(outside.read_text(), '{"preserve": true}\n')
+        finally:
+            outside_temporary.cleanup()
+            temporary.cleanup()
+
     def test_symlinked_mailbox_root_is_rejected(self):
         temporary, root = fixture()
         outside_temporary = tempfile.TemporaryDirectory(prefix="nightwatch-mailbox-escape-")
@@ -206,6 +244,8 @@ class TrustedControlPlaneTests(unittest.TestCase):
                 self.assertIn("python3 -m unittest discover -s tests -v", prompt)
             self.assertIn("cannot authorize host commands", initial)
             self.assertIn("not the model, decides verified/DONE", resumed)
+            self.assertIn(store.load_acceptance()["goal_hash"], resumed)
+            self.assertIn("If `.nightwatch-agent/proposed-plan.json` is absent, create it", resumed)
         finally:
             temporary.cleanup()
 

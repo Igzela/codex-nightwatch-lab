@@ -104,6 +104,8 @@ def sufficient_verification_policy(commands: list[str]) -> bool:
 class NightwatchStore:
     """Trusted control plane. The repository mailbox is deliberately separate."""
 
+    MAILBOX_RUN_OUTPUTS = ("proposed-plan.json", "progress.json", "blocker.json")
+
     def __init__(self, repo: str | Path, state_home: str | Path | None = None):
         self.repo = Path(repo).resolve()
         self.repo_id = repo_identity(self.repo)
@@ -162,13 +164,31 @@ class NightwatchStore:
             finally:
                 handle.close()
 
-    def initialize(self, run_id: str, goal: str, repo: str, timestamp: str | None = None, verify_commands: list[str] | None = None, thread_id: str | None = None) -> dict[str, Any]:
+    def initialize(
+        self,
+        run_id: str,
+        goal: str,
+        repo: str,
+        timestamp: str | None = None,
+        verify_commands: list[str] | None = None,
+        thread_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
         policy_core = {"schema_version": 1, "source": "cli", "final_commands": commands}
         policy = {**policy_core, "policy_hash": policy_hash(policy_core)}
         acceptance = {"schema_version": 1, "goal_hash": hashlib.sha256(goal.encode("utf-8")).hexdigest(), "verification_policy_hash": policy["policy_hash"], "required_final_checks": commands, "plan_minimum": {"milestones": 1}, "baseline_repo": str(self.repo), "created_at": timestamp}
-        state = empty_state(run_id, goal, repo, self.repo_id, timestamp)
+        state = empty_state(
+            run_id,
+            goal,
+            repo,
+            self.repo_id,
+            timestamp,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
         state["acceptance_ready"] = sufficient_verification_policy(commands)
         if thread_id:
             state["thread_id"] = thread_id
@@ -184,6 +204,7 @@ class NightwatchStore:
             try:
                 self.runs_path.mkdir(mode=0o700)
                 self.reports_path.mkdir(mode=0o700)
+                self._clear_mailbox_run_outputs_at(mailbox_fd)
                 self._write_json_at(mailbox_fd, "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
             finally:
                 os.close(mailbox_fd)
@@ -364,6 +385,17 @@ class NightwatchStore:
         if not isinstance(name, str) or not name or Path(name).name != name:
             raise StateIntegrityError("invalid Nightwatch mailbox filename")
         return name
+
+    @classmethod
+    def _clear_mailbox_run_outputs_at(cls, directory_fd: int) -> None:
+        for name in cls.MAILBOX_RUN_OUTPUTS:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise StateIntegrityError(f"cannot clear stale Nightwatch mailbox output: {name}") from exc
+        os.fsync(directory_fd)
 
     def read_mailbox_file(self, name: str) -> bytes | None:
         name = self._mailbox_name(name)

@@ -5,17 +5,49 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .git import GitError, repo_root, snapshot
-from .models import State, plan_progress
+from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
 from .quota import AppServerQuotaProvider, QuotaError, make_quota_provider
 from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact
-from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive
+from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive, process_matches
+
+
+def _model_arg(value: str) -> str:
+    try:
+        return validate_model_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _reasoning_arg(value: str) -> str:
+    try:
+        return validate_reasoning_effort(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _interval_arg(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("interval must be a number") from exc
+    if not 0.2 <= interval <= 60:
+        raise argparse.ArgumentTypeError("interval must be between 0.2 and 60 seconds")
+    return interval
+
+
+def _add_model_options(parser: argparse.ArgumentParser, *, takeover: bool = False) -> None:
+    suffix = " for auto-takeover" if takeover else ""
+    parser.add_argument("--model", type=_model_arg, default=None, help=f"Codex model slug{suffix}; use `nightwatch models` to list")
+    parser.add_argument("--reasoning-effort", type=_reasoning_arg, default=None, help=f"Codex reasoning level{suffix}, such as low, medium, high, or xhigh")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,6 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
+    _add_model_options(run)
 
     watch = sub.add_parser("watch", help="passively monitor an active Codex session in this repo")
     watch.add_argument("--repo", default=None)
@@ -39,18 +72,22 @@ def _parser() -> argparse.ArgumentParser:
     watch.add_argument("--auto-takeover", action="store_true", help="automatically take over and supervise thread when quota runs out or session exits")
     watch.add_argument("--goal", default=None, help="goal description for auto-takeover")
     watch.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="verification commands for auto-takeover")
+    _add_model_options(watch, takeover=True)
 
     adopt = sub.add_parser("adopt", help="bind an existing exact thread into Nightwatch control plane")
     adopt.add_argument("--thread", required=True, help="exact thread ID to adopt")
     adopt.add_argument("goal", nargs="?", default="Supervise adopted conversation", help="goal description")
     adopt.add_argument("--repo", default=None)
     adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
+    _add_model_options(adopt)
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
         cmd.add_argument("--repo", default=None)
         if name == "status":
             cmd.add_argument("--json", action="store_true")
+            cmd.add_argument("--watch", action="store_true", help="refresh until the run reaches a terminal state")
+            cmd.add_argument("--interval", type=_interval_arg, default=2.0, metavar="SECONDS")
         if name == "log":
             cmd.add_argument("--tail", type=int, default=80)
         if name == "resume":
@@ -59,6 +96,9 @@ def _parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check Linux, Codex, auth, quota, and local state support")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--repo", default=None)
+
+    models = sub.add_parser("models", help="show the installed Codex model catalog and reasoning levels")
+    models.add_argument("--json", action="store_true")
 
     install = sub.add_parser("install", help="install a user-local launcher")
     install.add_argument("--service", action="store_true", help="also install a marked user-level systemd unit")
@@ -109,6 +149,12 @@ def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
     child_args = [sys.executable, "-m", "nightwatch.cli", args.command]
     if args.command == "run":
         child_args.append(args.goal)
+        if args.thread:
+            child_args.extend(["--thread", args.thread])
+        if args.model:
+            child_args.extend(["--model", args.model])
+        if args.reasoning_effort:
+            child_args.extend(["--reasoning-effort", args.reasoning_effort])
         for command in args.verify:
             child_args.extend(["--verify", command])
     child_args.extend(["--repo", str(root), "--no-inhibit"])
@@ -130,7 +176,15 @@ def _run(args: argparse.Namespace) -> int:
         _validate_install_targets(root)
     else:
         _maybe_inhibit(args, root)
-    state = store.initialize(make_run_id(str(root)), args.goal, str(root), verify_commands=args.verify, thread_id=getattr(args, "thread", None))
+    state = store.initialize(
+        make_run_id(str(root)),
+        args.goal,
+        str(root),
+        verify_commands=args.verify,
+        thread_id=getattr(args, "thread", None),
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+    )
     if args.service:
         _install_user_files(root)
         try:
@@ -196,34 +250,115 @@ def _install_signal_handlers(supervisor: Supervisor) -> None:
     signal.signal(signal.SIGTERM, handle)
 
 
-def _status(args: argparse.Namespace) -> int:
+def _last_provider_event(store: NightwatchStore, generation: int) -> dict[str, Any] | None:
+    path = store.runs_path / f"generation-{generation}.events.jsonl"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        offset = max(0, info.st_size - 65_536)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        chunk = os.read(descriptor, 65_536).decode("utf-8", errors="replace")
+    finally:
+        os.close(descriptor)
+    lines = chunk.splitlines()
+    if offset and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _agent_runtime(state: dict[str, Any]) -> dict[str, Any]:
+    active = state.get("active_process")
+    owner = state.get("supervisor_owner")
+    owner_alive = (
+        process_matches(owner)
+        if isinstance(owner, dict) and owner.get("starttime") and owner.get("executable")
+        else isinstance(owner, dict) and pid_alive(owner.get("pid"))
+    )
+    if isinstance(active, dict) and process_matches(active):
+        return {"status": "RUNNING", "pid": active["pid"], "action": active.get("action")}
+    if state["state"] == State.WAIT_QUOTA.value:
+        status = "WAITING_QUOTA"
+    elif state["state"] in {item.value for item in TERMINAL_STATES}:
+        status = state["state"]
+    elif owner_alive:
+        status = f"SUPERVISOR_{state['state']}"
+    else:
+        status = "IDLE"
+    return {
+        "status": status,
+        "pid": None,
+        "action": None,
+        "supervisor_pid": owner.get("pid") if owner_alive else None,
+    }
+
+
+def _status_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     try:
         store = _store(args.repo)
         state = store.load_state()
         plan = store.load_plan()
     except (SystemExit, StateIntegrityError) as exc:
-        if args.json:
-            print(json.dumps({"state": "NO_RUN", "error": str(exc)}, indent=2))
-            return 0
-        print(f"Nightwatch: no trusted run ({exc})")
-        return 0
+        return {"state": "NO_RUN", "error": str(exc), "terminal": True}
     progress = plan_progress(plan)
-    value = {"state": state, "plan": plan, "progress": progress}
-    if args.json:
-        print(json.dumps(value, indent=2, ensure_ascii=False))
-        return 0
+    agent = _agent_runtime(state)
+    return {
+        "state": state,
+        "agent": agent,
+        "plan": plan,
+        "progress": progress,
+        "last_provider_event": _last_provider_event(store, state["generation"]),
+        "terminal": state["state"] in {item.value for item in TERMINAL_STATES},
+    }
+
+
+def _progress_bar(percent: float, width: int = 24) -> str:
+    filled = min(width, max(0, round(percent / 100 * width)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _render_status(value: dict[str, Any]) -> None:
+    if value.get("state") == "NO_RUN":
+        print(f"Nightwatch: no trusted run ({value.get('error')})")
+        return
+    state = value["state"]
+    plan = value["plan"]
+    progress = value["progress"]
+    agent = value["agent"]
     print("Nightwatch")
     print(f"STATE          {state['state']}")
+    agent_detail = f" pid={agent['pid']} action={agent.get('action') or '(unknown)'}" if agent.get("pid") else ""
+    print(f"AGENT          {agent['status']}{agent_detail}")
     print(f"THREAD         {state.get('thread_id') or '(not captured)'}")
+    print(f"MODEL          {state.get('model') or '(Codex default)'}")
+    print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
     print(f"RUN_ID         {state['run_id']}")
     print(f"GENERATION     {state['generation']}")
     print(f"QUOTA SOURCE   {state.get('quota_source') or '(none)'}")
     quality = "LIVE_APP_SERVER" if state.get("quota_source") == "live_app_server" else "GUARDED_PROBE_ONLY" if state.get("quota_source") in {"rollout_schedule_only", "unavailable"} else "(unknown)"
     print(f"RECOVERY MODE  {quality}")
-    owner = state.get("supervisor_owner") or {}
-    print(f"SUPERVISOR     {owner.get('pid') if isinstance(owner, dict) else '(none)'}")
+    quota = state.get("quota") or {}
+    for key, fallback in (("primary", "5h"), ("secondary", "weekly")):
+        window = quota.get(key) if isinstance(quota, dict) else None
+        if isinstance(window, dict):
+            label = str(window.get("name") or fallback).upper()
+            print(f"QUOTA {label:<7} {window.get('used_percent', '(unknown)')}% used; reset={window.get('resets_at') or '(unknown)'}")
+    print(f"SUPERVISOR     {agent.get('supervisor_pid') or '(none)'}")
     print(f"RESET          {state.get('next_resume_at') or '(none)'}")
-    print(f"VERIFIED       {progress['verified_count']} / {progress['total_count']} milestones ({progress['verified_percent']}%)")
+    print(f"PROGRESS       {_progress_bar(progress['verified_percent'])} {progress['verified_percent']}% verified")
+    print(f"VERIFIED       {progress['verified_count']} / {progress['total_count']} milestones")
     print(f"IMPLEMENTED    {progress['implemented_count']} / {progress['total_count']} milestones ({progress['implemented_percent']}%)")
     blocked = sum(1 for item in plan["milestones"] if item.get("status") == "blocked")
     print(f"BLOCKED        {blocked}")
@@ -232,6 +367,38 @@ def _status(args: argparse.Namespace) -> int:
     current = next((item for item in plan["milestones"] if item.get("status") in {"working", "implemented", "pending"}), None)
     if current:
         print(f"CURRENT        {current['id']} — {current['title']}")
+    print("MILESTONES")
+    markers = {"pending": " ", "working": ">", "implemented": "+", "verified": "x", "blocked": "!"}
+    for item in plan["milestones"]:
+        status_value = item.get("status", "pending")
+        print(f"  [{markers.get(status_value, '?')}] {item['id']} {item['title']} ({status_value})")
+    event = value.get("last_provider_event") or {}
+    if event:
+        print(f"LAST EVENT     {event.get('type', '(unknown)')} ({event.get('action') or event.get('status') or 'provider'})")
+    print(f"UPDATED        {state.get('updated_at') or '(unknown)'}")
+
+
+def _status(args: argparse.Namespace) -> int:
+    first = True
+    try:
+        while True:
+            value = _status_snapshot(args)
+            if args.json:
+                if args.watch:
+                    print(json.dumps(value, ensure_ascii=False), flush=True)
+                else:
+                    print(json.dumps(value, indent=2, ensure_ascii=False))
+            else:
+                if args.watch and not first and sys.stdout.isatty():
+                    print("\033[2J\033[H", end="")
+                _render_status(value)
+            if not args.watch or value.get("terminal"):
+                return 0
+            first = False
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        if not args.json:
+            print("\nNightwatch status watch stopped.")
     return 0
 
 
@@ -328,6 +495,80 @@ def _doctor(args: argparse.Namespace) -> int:
             print(f"weekly: {report['quota']['secondary'].get('used_percent')}% used, reset={report['quota']['secondary'].get('resets_at')}")
         print(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
     return 0 if report["status"] == "ok" else 1
+
+
+def _model_catalog() -> list[dict[str, Any]]:
+    binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+    try:
+        result = subprocess.run(
+            [binary, "debug", "models"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("installed Codex model catalog is unavailable") from exc
+    if result.returncode != 0:
+        raise RuntimeError("installed Codex model catalog command failed")
+    try:
+        raw_models = json.loads(result.stdout).get("models")
+    except (AttributeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("installed Codex returned an invalid model catalog") from exc
+    if not isinstance(raw_models, list):
+        raise RuntimeError("installed Codex returned an invalid model catalog")
+    catalog: list[dict[str, Any]] = []
+    for item in raw_models:
+        if not isinstance(item, dict) or item.get("visibility") not in {None, "list"}:
+            continue
+        try:
+            slug = validate_model_name(item.get("slug"))
+        except (TypeError, ValueError):
+            continue
+        default = item.get("default_reasoning_level")
+        try:
+            default = validate_reasoning_effort(default) if default is not None else None
+        except (TypeError, ValueError):
+            default = None
+        levels: list[str] = []
+        for level in item.get("supported_reasoning_levels") or []:
+            candidate = level.get("effort") if isinstance(level, dict) else None
+            try:
+                candidate = validate_reasoning_effort(candidate)
+            except (TypeError, ValueError):
+                continue
+            if candidate not in levels:
+                levels.append(candidate)
+        display_name = item.get("display_name")
+        if not isinstance(display_name, str):
+            display_name = slug
+        display_name = " ".join(display_name.split())[:80] or slug
+        catalog.append(
+            {
+                "slug": slug,
+                "display_name": display_name,
+                "default_reasoning_level": default,
+                "supported_reasoning_levels": levels,
+            }
+        )
+    if not catalog:
+        raise RuntimeError("installed Codex model catalog contains no visible models")
+    return catalog
+
+
+def _models(args: argparse.Namespace) -> int:
+    catalog = _model_catalog()
+    if args.json:
+        print(json.dumps({"models": catalog}, indent=2, ensure_ascii=False))
+        return 0
+    print("Installed Codex models (live local catalog)")
+    for item in catalog:
+        levels = ",".join(item["supported_reasoning_levels"]) or "(not reported)"
+        default = item["default_reasoning_level"] or "(not reported)"
+        print(f"{item['slug']:<24} default={default:<8} levels={levels}")
+    return 0
 
 
 def _install_paths() -> tuple[Path, Path]:
@@ -488,7 +729,15 @@ def _adopt(args: argparse.Namespace) -> int:
     if store.exists():
         state = store.load_state()
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}, thread={state.get('thread_id')})")
-    state = store.initialize(make_run_id(str(root)), args.goal or "Adopted conversation", str(root), verify_commands=args.verify, thread_id=args.thread)
+    state = store.initialize(
+        make_run_id(str(root)),
+        args.goal or "Adopted conversation",
+        str(root),
+        verify_commands=args.verify,
+        thread_id=args.thread,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+    )
     print(f"Nightwatch: adopted thread {args.thread} for repo {root} (run_id={state['run_id']})")
     print("Run `nightwatch resume` to start unattended supervision.")
     return 0
@@ -582,6 +831,8 @@ def _watch(args: argparse.Namespace) -> int:
             auto_takeover=args.auto_takeover,
             goal=args.goal,
             verify_commands=args.verify,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
         )
     except KeyboardInterrupt:
         print("\nNightwatch watch stopped.")
@@ -600,6 +851,7 @@ def main(argv: list[str] | None = None) -> int:
             "report": _report,
             "stop": _stop,
             "doctor": _doctor,
+            "models": _models,
             "install": _install,
             "uninstall": _uninstall,
             "test": _test,

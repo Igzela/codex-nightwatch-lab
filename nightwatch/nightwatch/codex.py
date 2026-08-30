@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .models import ErrorKind, ProviderResult, QuotaWindow
+from .models import ErrorKind, ProviderResult, QuotaWindow, validate_model_name, validate_reasoning_effort
 from .milestones import trusted_environment
 from .storage import NightwatchStore, redact
 
@@ -231,10 +231,22 @@ def _safe_detail(text: str) -> str | None:
     return compact[:500] or None
 
 
-def build_command(repo: str | Path, thread_id: str | None, prompt: str) -> tuple[list[str], str]:
+def build_command(
+    repo: str | Path,
+    thread_id: str | None,
+    prompt: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> tuple[list[str], str]:
     binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
     # Prompt is sent over stdin, avoiding argv/process-list leakage.
     base = [binary, "exec"]
+    if model:
+        base.extend(["--model", validate_model_name(model)])
+    if reasoning_effort:
+        # JSON strings are valid TOML scalar values. Encoding the value keeps
+        # the repeatable Codex config override a single, non-injectable argv.
+        base.extend(["--config", f"model_reasoning_effort={json.dumps(validate_reasoning_effort(reasoning_effort))}"])
     if thread_id:
         # Resume accepts the persisted session identity and inherits the
         # session's execution policy. Never use the recency-based --last path.
@@ -277,7 +289,14 @@ def run_codex(
     stop_event: threading.Event | None = None,
     timeout: float | None = None,
 ) -> ProviderResult:
-    args, action = build_command(store.repo, thread_id, prompt)
+    state = store.load_state()
+    args, action = build_command(
+        store.repo,
+        thread_id,
+        prompt,
+        model=state.get("model"),
+        reasoning_effort=state.get("reasoning_effort"),
+    )
     run_log = store.runs_path / f"generation-{generation}.stderr.log"
     store.runs_path.mkdir(parents=True, exist_ok=True, mode=0o700)
     store.write_run_event(generation, {"type": "provider_command", "action": action, "argv": [item for item in args if item != prompt]})
