@@ -110,7 +110,7 @@ nightwatch
 未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
 
 ```text
-Nightwatch 0.3.0 · MULTI-THREAD CONTROL
+Nightwatch 0.3.1 · MULTI-THREAD CONTROL
 Runs 2 · ↑/↓ select · / commands · Esc quit
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
@@ -296,7 +296,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 92 tests
+Ran 109 tests
 OK
 ```
 

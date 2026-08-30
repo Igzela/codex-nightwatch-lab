@@ -15,6 +15,21 @@ from typing import Any
 from . import __version__
 from .git import GitError, repo_root, snapshot
 from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
+from .operations import (
+    atomic_write as _atomic_write,
+    backup_marked_install as _backup_marked_install,
+    doctor_snapshot,
+    install_paths as _install_paths,
+    install_user_files as _install_user_files,
+    list_models as _model_catalog,
+    resume_service,
+    service_name as _service_name,
+    service_text as _service_text,
+    start_user_service as _start_user_service,
+    stop_run,
+    systemd_quote as _systemd_quote,
+    validate_install_targets as _validate_install_targets,
+)
 from .quota import AppServerQuotaProvider, QuotaError, make_quota_provider
 from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact, repo_identity
 from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive, process_matches
@@ -441,50 +456,7 @@ def _stop(args: argparse.Namespace) -> int:
 
 
 def _doctor(args: argparse.Namespace) -> int:
-    binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
-    inhibitor = shutil.which("systemd-inhibit")
-    inhibit_ok = False
-    if inhibitor:
-        try:
-            probe = subprocess.run(
-                [inhibitor, "--what=sleep", "--mode=block", "--why=Nightwatch probe", "/bin/true"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5, check=False,
-            )
-            inhibit_ok = probe.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            inhibit_ok = False
-    report: dict[str, Any] = {
-        "platform": sys.platform,
-        "python": sys.version.split()[0],
-        "linux_first": sys.platform.startswith("linux"),
-        "codex_binary": shutil.which(binary) or (binary if Path(binary).is_file() else None),
-        "systemd_inhibit": inhibit_ok,
-        "auth": {"status": "unknown"},
-        "quota": {"status": "unknown"},
-    }
-    try:
-        result = subprocess.run([binary, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=8, check=False)
-        report["codex_version"] = result.stdout.strip() if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
-        report["codex_version"] = None
-    try:
-        result = subprocess.run([binary, "login", "status"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8, check=False)
-        report["auth"] = {"status": "ok" if result.returncode == 0 else "fail", "credentials_read": False}
-    except (OSError, subprocess.TimeoutExpired):
-        report["auth"] = {"status": "fail", "credentials_read": False}
-    try:
-        quota = make_quota_provider().read()
-        report["quota"] = {"status": "ok", "authority": "LIVE_APP_SERVER" if quota.source == "live_app_server" else "ROLLOUT_SCHEDULE_ONLY", "recovery_capability": "LIVE_REVALIDATION" if quota.source == "live_app_server" else "GUARDED_PROBE_ONLY", **quota.to_dict()}
-    except Exception as exc:
-        report["quota"] = {"status": "unavailable", "source": "none", "error": redact(str(exc)) or type(exc).__name__}
-    try:
-        root = _root(args.repo)
-        report["git"] = snapshot(root).to_dict()
-        report["nightwatch_state"] = (NightwatchStore(root).load_state().get("state") if NightwatchStore(root).exists() else "NO_RUN")
-    except (SystemExit, StateIntegrityError, GitError) as exc:
-        report["git"] = {"status": "unavailable", "error": str(exc)}
-    report["status"] = "ok" if report["codex_binary"] and report["auth"]["status"] == "ok" else "fail"
+    report = doctor_snapshot(_root(args.repo) if args.repo else None)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
@@ -500,67 +472,6 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if report["status"] == "ok" else 1
 
 
-def _model_catalog() -> list[dict[str, Any]]:
-    binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
-    try:
-        result = subprocess.run(
-            [binary, "debug", "models"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("installed Codex model catalog is unavailable") from exc
-    if result.returncode != 0:
-        raise RuntimeError("installed Codex model catalog command failed")
-    try:
-        raw_models = json.loads(result.stdout).get("models")
-    except (AttributeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("installed Codex returned an invalid model catalog") from exc
-    if not isinstance(raw_models, list):
-        raise RuntimeError("installed Codex returned an invalid model catalog")
-    catalog: list[dict[str, Any]] = []
-    for item in raw_models:
-        if not isinstance(item, dict) or item.get("visibility") not in {None, "list"}:
-            continue
-        try:
-            slug = validate_model_name(item.get("slug"))
-        except (TypeError, ValueError):
-            continue
-        default = item.get("default_reasoning_level")
-        try:
-            default = validate_reasoning_effort(default) if default is not None else None
-        except (TypeError, ValueError):
-            default = None
-        levels: list[str] = []
-        for level in item.get("supported_reasoning_levels") or []:
-            candidate = level.get("effort") if isinstance(level, dict) else None
-            try:
-                candidate = validate_reasoning_effort(candidate)
-            except (TypeError, ValueError):
-                continue
-            if candidate not in levels:
-                levels.append(candidate)
-        display_name = item.get("display_name")
-        if not isinstance(display_name, str):
-            display_name = slug
-        display_name = " ".join(display_name.split())[:80] or slug
-        catalog.append(
-            {
-                "slug": slug,
-                "display_name": display_name,
-                "default_reasoning_level": default,
-                "supported_reasoning_levels": levels,
-            }
-        )
-    if not catalog:
-        raise RuntimeError("installed Codex model catalog contains no visible models")
-    return catalog
-
-
 def _models(args: argparse.Namespace) -> int:
     catalog = _model_catalog()
     if args.json:
@@ -572,115 +483,6 @@ def _models(args: argparse.Namespace) -> int:
         default = item["default_reasoning_level"] or "(not reported)"
         print(f"{item['slug']:<24} default={default:<8} levels={levels}")
     return 0
-
-
-def _service_name(service_root: Path) -> str:
-    return f"nightwatch-{repo_identity(service_root)}.service"
-
-
-def _install_paths(service_root: Path | None = None) -> tuple[Path, Path]:
-    return (
-        Path.home() / ".local" / "bin" / "nightwatch",
-        Path.home() / ".config" / "systemd" / "user" / (_service_name(service_root) if service_root else "nightwatch.service"),
-    )
-
-
-def _service_text(service_root: Path) -> str:
-    template = Path(__file__).with_name("nightwatch.service").read_text(encoding="utf-8")
-    # systemd parses ExecStart itself (not through a shell), so quote the repo
-    # there as one argument. WorkingDirectory is a unit path setting: quotes
-    # are literal for that setting, therefore it must remain an absolute raw
-    # path.
-    unit_root = _systemd_quote(str(service_root))
-    directory_root = str(service_root).replace("%", "%%")
-    rendered = template.replace(
-        "ExecStart=%h/.local/bin/nightwatch resume",
-        f"WorkingDirectory={directory_root}\nExecStart=%h/.local/bin/nightwatch resume --repo {unit_root}",
-    )
-    return "# nightwatch-install\n" + rendered
-
-
-def _systemd_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
-
-
-def _validate_install_targets(service_root: Path | None = None) -> None:
-    launcher, service = _install_paths(service_root)
-    if launcher.exists() or launcher.is_symlink():
-        try:
-            existing = launcher.read_text(encoding="utf-8")
-        except OSError:
-            existing = ""
-        if "nightwatch-install:" not in existing:
-            raise SystemExit(f"nightwatch: refusing to overwrite existing {launcher}")
-    if service_root is None or not service.exists():
-        return
-    existing = service.read_text(encoding="utf-8", errors="replace")
-    if "# nightwatch-install" not in existing:
-        raise SystemExit(f"nightwatch: refusing to overwrite existing {service}")
-    existing_root = next((line.removeprefix("WorkingDirectory=").strip('"') for line in existing.splitlines() if line.startswith("WorkingDirectory=")), None)
-    if existing_root is not None and Path(existing_root.replace("%%", "%")).resolve() != service_root.resolve():
-        raise SystemExit(
-            f"nightwatch: existing user service is bound to {existing_root}; refusing to repoint it to {service_root}"
-        )
-
-
-def _atomic_write(path: Path, content: str, mode: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.chmod(temporary, mode)
-    os.replace(temporary, path)
-
-
-def _backup_marked_install(path: Path) -> None:
-    if not path.exists():
-        return
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if "nightwatch-install" not in text:
-        raise SystemExit(f"nightwatch: refusing to overwrite existing {path}")
-    backup_root = Path.home() / ".local" / "state" / "codex-nightwatch" / "install-backups" / now_iso().replace(":", "-").replace(".", "-")
-    backup_root.mkdir(parents=True, exist_ok=False, mode=0o700)
-    os.chmod(backup_root, 0o700)
-    backup = backup_root / path.name
-    _atomic_write(backup, text, 0o600)
-
-
-def _install_user_files(service_root: Path | None = None) -> tuple[Path, Path | None]:
-    _validate_install_targets(service_root)
-    source_root = Path(__file__).resolve().parents[1]
-    launcher, service = _install_paths(service_root)
-    launcher_text = f"#!/bin/sh\n# nightwatch-install: {source_root}\nexec python3 {source_root / 'bin' / 'nightwatch'} \"$@\"\n"
-    _backup_marked_install(launcher)
-    _atomic_write(launcher, launcher_text, 0o755)
-    if service_root is not None:
-        _backup_marked_install(service)
-        _atomic_write(service, _service_text(service_root), 0o600)
-        return launcher, service
-    return launcher, None
-
-
-def _start_user_service(service_name: str = "nightwatch.service") -> None:
-    binary = shutil.which("systemctl")
-    if not binary:
-        raise RuntimeError("systemctl is not installed")
-    for command in (
-        [binary, "--user", "daemon-reload"],
-        [binary, "--user", "enable", "--now", service_name],
-    ):
-        try:
-            result = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RuntimeError("systemctl --user is unavailable") from exc
-        if result.returncode != 0:
-            raise RuntimeError("systemctl --user could not contact or start the user service")
 
 
 def _install(args: argparse.Namespace) -> int:
@@ -864,7 +666,7 @@ def _watch(args: argparse.Namespace) -> int:
             else:
                 _print_watch_snapshot(snap, root)
 
-        watcher.watch(
+        result = watcher.watch(
             on_update=on_update,
             poll_interval=2.0,
             auto_takeover=args.auto_takeover,
@@ -873,6 +675,18 @@ def _watch(args: argparse.Namespace) -> int:
             model=args.model,
             reasoning_effort=args.reasoning_effort,
         )
+        if args.auto_takeover and isinstance(result, dict):
+            status = result.get("status")
+            if status == "TAKEOVER_HANDOFF_COMPLETE":
+                print(f"Nightwatch auto-takeover handoff complete: service={result.get('service')} thread_id={result.get('thread_id')}")
+                return 0
+            if status == "TAKEOVER_SERVICE_START_FAILED":
+                print(
+                    "nightwatch: goal was saved as NEW but the user service was not started; "
+                    f"run `nightwatch resume --repo {root}` after fixing systemd: {result.get('error')}",
+                    file=sys.stderr,
+                )
+                return 1
     except KeyboardInterrupt:
         print("\nNightwatch watch stopped.")
     return 0

@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
-import re
 import stat
-import subprocess
 import sys
 import textwrap
 import unicodedata
-from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,9 +14,22 @@ from typing import Any
 from . import __version__
 from .git import GitError, repo_root
 from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
+from .operations import (
+    ActionResult,
+    RunSpec,
+    create_worktree,
+    doctor_snapshot,
+    list_models,
+    queue_steer,
+    resume_service,
+    start_run,
+    stop_run,
+    validate_human_text,
+)
 from .storage import MAX_EVENT_BYTES, NightwatchStore, StateIntegrityError, control_plane_root
 from .supervisor import build_report, find_proven_codex_sessions, pid_alive, process_matches
 
+_validate_human_text = validate_human_text
 
 MAX_GOAL_CHARS = 4_000
 MAX_INSTRUCTION_CHARS = 4_000
@@ -94,62 +103,15 @@ def route_input(text: str, has_active_run: bool) -> Intent:
     return Intent("steer" if has_active_run else "run", value, True)
 
 
-def _validate_human_text(value: str, label: str, maximum: int) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{label} must be text")
-    clean = value.strip()
-    if not clean:
-        raise ValueError(f"{label} must not be empty")
-    if len(clean) > maximum:
-        raise ValueError(f"{label} exceeds {maximum} characters")
-    if any(ord(character) < 32 and character not in "\n\t" for character in clean):
-        raise ValueError(f"{label} contains terminal control characters")
-    return clean
-
-
 def terminal_safe(value: Any) -> str:
     """Neutralize terminal controls and invisible formatting from all display data."""
     text = str(value)
     return "".join(
         character
         if character in "\n\t" or unicodedata.category(character) not in {"Cc", "Cf"}
-        else "�"
+        else ""
         for character in text
     )
-
-
-@dataclass(frozen=True)
-class RunSpec:
-    repo: Path
-    goal: str
-    model: str | None = None
-    reasoning_effort: str | None = None
-    verify_commands: tuple[str, ...] = ()
-    thread_id: str | None = None
-    service: bool = True
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "repo", Path(self.repo).expanduser().resolve())
-        object.__setattr__(self, "goal", _validate_human_text(self.goal, "goal", MAX_GOAL_CHARS))
-        if self.model is not None:
-            validate_model_name(self.model)
-        if self.reasoning_effort is not None:
-            validate_reasoning_effort(self.reasoning_effort)
-        if len(self.verify_commands) > MAX_VERIFY_COMMANDS:
-            raise ValueError(f"at most {MAX_VERIFY_COMMANDS} verification commands are allowed")
-        commands = tuple(_validate_human_text(item, "verification command", MAX_INSTRUCTION_CHARS) for item in self.verify_commands)
-        object.__setattr__(self, "verify_commands", commands)
-        if self.thread_id is not None:
-            thread = _validate_human_text(self.thread_id, "thread ID", 256)
-            if "\n" in thread or "\t" in thread:
-                raise ValueError("thread ID must be a single line")
-            object.__setattr__(self, "thread_id", thread)
-
-
-@dataclass(frozen=True)
-class ActionResult:
-    ok: bool
-    message: str
 
 
 @dataclass
@@ -157,7 +119,13 @@ class RunRecord:
     store: NightwatchStore
     state: dict[str, Any]
     plan: dict[str, Any]
-    events: list[dict[str, Any]]
+    _events: list[dict[str, Any]] | None = None
+
+    @property
+    def events(self) -> list[dict[str, Any]]:
+        if self._events is None:
+            self._events = self.store.load_events()
+        return self._events
 
     @property
     def repo(self) -> Path:
@@ -219,8 +187,7 @@ class RunCatalog:
                     raise StateIntegrityError("metadata does not match its trusted directory")
                 state = store.load_state()
                 plan = store.load_plan()
-                events = store.load_events()
-                records.append(RunRecord(store, state, plan, events))
+                records.append(RunRecord(store, state, plan))
             except (OSError, ValueError, TypeError, StateIntegrityError) as exc:
                 self.errors.append(f"{child.name}: {type(exc).__name__}")
         return sorted(records, key=lambda item: (str(item.repo), item.state.get("created_at", "")))
@@ -271,10 +238,21 @@ def _agent_summary(state: dict[str, Any]) -> str:
     return str(state.get("state") or "IDLE")
 
 
-def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100) -> str:
+def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100, errors: list[str] | None = None) -> str:
     width = max(60, width)
     selected = min(max(0, selected), max(0, len(runs) - 1))
-    lines = [f"Nightwatch {__version__} · MULTI-THREAD CONTROL", f"Runs {len(runs)} · ↑/↓ select · / commands · Esc quit", "─" * min(width, 120)]
+    error_header = f" · {len(errors)} trusted run failed integrity validation" if errors else ""
+    lines = [
+        f"Nightwatch {__version__} · MULTI-THREAD CONTROL",
+        f"Runs {len(runs)}{error_header} · ↑/↓ select · / commands · Esc quit",
+        "─" * min(width, 120),
+    ]
+    if errors:
+        lines.append(f"⚠ TRUSTED STATE ERRORS: {len(errors)}")
+        for err in errors[:5]:
+            lines.append(f"  {err}")
+        lines.append("  Use explicit CLI/recovery inspection before touching that run.")
+        lines.append("─" * min(width, 120))
     if not runs:
         lines.extend(["No trusted runs discovered.", "Type a natural-language goal or /run to create one."])
     for index, run in enumerate(runs):
@@ -397,72 +375,6 @@ def _safe_tail(path: Path, maximum: int = 32_768) -> str:
         os.close(descriptor)
 
 
-def queue_steer(store: NightwatchStore, instruction: str) -> ActionResult:
-    text = _validate_human_text(instruction, "instruction", MAX_INSTRUCTION_CHARS)
-    state = store.load_state()
-    thread = state.get("thread_id")
-    if not isinstance(thread, str) or not thread:
-        return ActionResult(False, "No exact thread has been captured; steering was not sent.")
-    binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
-    try:
-        result = subprocess.run(
-            [binary, "queue", "--thread", thread, "--message", text],
-            cwd=store.repo,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ActionResult(False, "Codex queue transport was unavailable; no instruction was recorded as delivered.")
-    if result.returncode != 0:
-        return ActionResult(False, "Codex did not accept the queued instruction; inspect the exact thread state.")
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    store.append_event(
-        "user_instruction_queued",
-        "confirmed user instruction queued to exact thread",
-        {"instruction_sha256": digest, "instruction_chars": len(text)},
-    )
-    return ActionResult(True, f"Instruction queued to exact thread {thread}.")
-
-
-_WORKTREE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-
-
-def create_worktree(source_repo: str | Path, label: str) -> Path:
-    source = repo_root(source_repo)
-    if not _WORKTREE_LABEL.fullmatch(label):
-        raise ValueError("worktree label must contain only letters, digits, '.', '_', or '-'")
-    worktrees_root = source.parent / ".worktrees"
-    layout = worktrees_root / source.name
-    for candidate in (worktrees_root, layout):
-        if candidate.is_symlink():
-            raise ValueError(f"worktree layout must not contain symlinks: {candidate}")
-    target = layout / label
-    if target.exists() or target.is_symlink():
-        raise ValueError(f"worktree target already exists: {target}")
-    layout.mkdir(parents=True, exist_ok=True)
-    if layout.resolve() != layout:
-        raise ValueError("worktree layout resolved outside its confirmed path")
-    branch = f"nightwatch/{label}"
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "add", "-b", branch, str(target), "HEAD"],
-            cwd=source,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitError("git worktree add failed") from exc
-    if result.returncode != 0:
-        raise GitError("git worktree add failed; branch or target may already exist")
-    return target.resolve()
 
 
 def _selected(runs: list[RunRecord], index: int) -> RunRecord | None:
@@ -593,7 +505,7 @@ class _CursesApp:
 
     def _draw(self) -> None:
         height, width = self.screen.getmaxyx()
-        body = self.content if self.content is not None else render_dashboard(self.runs, self.selected, width)
+        body = self.content if self.content is not None else render_dashboard(self.runs, self.selected, width, errors=self.catalog.errors)
         lines = []
         for source_line in body.splitlines():
             safe_line = terminal_safe(source_line)
@@ -708,16 +620,25 @@ class _CursesApp:
                 path = run.store.write_report(build_report(run.store, run.store.load_state(), run.store.load_state().get("last_verification")))
                 self.message = f"Report written: {path}"
         elif intent.kind == "steer":
+            if run.terminal:
+                self.message = (
+                    "Instruction was NOT queued because this Nightwatch run is terminal.\n"
+                    "Use /resume or start a new supervised run before steering."
+                )
+                self.scroll = 0
+                return False
             instruction = intent.argument or self._prompt("Instruction for the selected exact thread")
             if instruction and self._confirm(f"Queue to exact thread {run.thread_id}?\n\n{instruction}"):
                 result = queue_steer(run.store, instruction)
                 self.message = result.message
         elif intent.kind == "stop":
             if self._confirm(f"Stop {run.state['run_id']} and preserve its exact thread/state?"):
-                self.message = self._capture_cli("stop", run.repo)
+                result = stop_run(run.repo)
+                self.message = result.message
         elif intent.kind == "resume":
             if self._confirm(f"Resume exact thread {run.thread_id or '(not captured)'} in its repo-specific user service?"):
-                self.message = self._resume_service(run.repo)
+                result = resume_service(run.repo)
+                self.message = result.message
         self.scroll = 0
         return False
 
@@ -853,50 +774,13 @@ class _CursesApp:
 
     @staticmethod
     def _start_spec(spec: RunSpec) -> str:
-        from . import cli
-
-        arguments = ["run", spec.goal, "--repo", str(spec.repo)]
-        if spec.service:
-            arguments.append("--service")
-        if spec.thread_id:
-            arguments.extend(["--thread", spec.thread_id])
-        if spec.model:
-            arguments.extend(["--model", spec.model])
-        if spec.reasoning_effort:
-            arguments.extend(["--reasoning-effort", spec.reasoning_effort])
-        for command in spec.verify_commands:
-            arguments.extend(["--verify", command])
-        output = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(output):
-            code = cli.main(arguments)
-        return output.getvalue().strip() or ("Run started." if code == 0 else f"Run failed with exit {code}.")
-
-    @staticmethod
-    def _capture_cli(command: str, repo: Path) -> str:
-        from . import cli
-
-        output = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(output):
-            code = cli.main([command, "--repo", str(repo)])
-        return output.getvalue().strip() or f"{command} exited {code}"
-
-    @staticmethod
-    def _resume_service(repo: Path) -> str:
-        from . import cli
-
-        try:
-            _launcher, service = cli._install_user_files(repo)
-            cli._start_user_service(cli._service_name(repo))
-            return f"Resume service started: {service.name if service else cli._service_name(repo)}"
-        except (RuntimeError, SystemExit, OSError) as exc:
-            return f"Resume service was not started: {exc}"
+        result = start_run(spec, run_in_service=spec.service)
+        return result.message
 
     @staticmethod
     def _models_view() -> str:
-        from . import cli
-
         try:
-            models = cli._model_catalog()
+            models = list_models()
         except RuntimeError as exc:
             return f"MODELS\n{exc}"
         return "MODELS · live installed Codex catalog\n" + "\n".join(
@@ -905,13 +789,19 @@ class _CursesApp:
 
     @staticmethod
     def _doctor_view(repo: Path) -> str:
-        from . import cli
-
-        output = io.StringIO()
-        args = cli._parser().parse_args(["doctor", "--repo", str(repo)])
-        with redirect_stdout(output), redirect_stderr(output):
-            cli._doctor(args)
-        return output.getvalue().strip()
+        report = doctor_snapshot(repo)
+        lines = [
+            f"Nightwatch doctor: {report['status']}",
+            f"Codex: {report.get('codex_version') or '(missing)'}",
+            f"Auth: {report['auth']['status']}",
+            f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})",
+        ]
+        if report["quota"].get("primary"):
+            lines.append(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
+        if report["quota"].get("secondary"):
+            lines.append(f"weekly: {report['quota']['secondary'].get('used_percent')}% used, reset={report['quota']['secondary'].get('resets_at')}")
+        lines.append(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
+        return "\n".join(lines)
 
 
 class _NullRun:

@@ -186,6 +186,91 @@ class FakeCodexE2E(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_e2e_multi_repo_concurrency_and_isolation(self):
+        """Multi-repo isolation: separate stores, distinct services, independent lifecycle."""
+        temp_a, root_a, plan_a, prog_a = fixture()
+        temp_b, root_b, plan_b, prog_b = fixture()
+        try:
+            from nightwatch.operations import service_name, stop_run
+
+            service_a = service_name(root_a)
+            service_b = service_name(root_b)
+            self.assertNotEqual(service_a, service_b)
+
+            store_a = NightwatchStore(root_a)
+            store_a.initialize("run-repo-a", "goal A", str(root_a), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
+            store_b = NightwatchStore(root_b)
+            store_b.initialize("run-repo-b", "goal B", str(root_b), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
+
+            # Stopping run A while in NEW transitions it to STOPPED without affecting run B
+            stop_res = stop_run(root_a)
+            self.assertIn("STOPPED", stop_res.message)
+            self.assertEqual(store_a.load_state()["state"], State.STOPPED.value)
+            self.assertEqual(store_b.load_state()["state"], State.NEW.value)
+
+            with self.env(plan_b, prog_b):
+                final_b = Supervisor(store_b, ScriptedQuota()).execute(start=True)
+            self.assertEqual(final_b["state"], State.DONE.value)
+            self.assertEqual(store_b.load_state()["state"], State.DONE.value)
+            self.assertEqual(store_a.load_state()["state"], State.STOPPED.value)
+        finally:
+            temp_a.cleanup()
+            temp_b.cleanup()
+
+    def test_e2e_same_repo_worktree_concurrency(self):
+        """Same-repo concurrency via isolated Git worktrees."""
+        temp_source, root_source, plan, prog = fixture()
+        try:
+            from nightwatch.operations import create_worktree, service_name
+
+            wt_a = create_worktree(root_source, "worker-a")
+            wt_b = create_worktree(root_source, "worker-b")
+
+            self.assertNotEqual(wt_a, wt_b)
+            self.assertNotEqual(wt_a, root_source)
+            self.assertNotEqual(wt_b, root_source)
+
+            service_main = service_name(root_source)
+            service_a = service_name(wt_a)
+            service_b = service_name(wt_b)
+
+            self.assertEqual(len({service_main, service_a, service_b}), 3)
+
+            store_a = NightwatchStore(wt_a)
+            store_a.initialize("run-wt-a", "worktree A goal", str(wt_a), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
+            store_b = NightwatchStore(wt_b)
+            store_b.initialize("run-wt-b", "worktree B goal", str(wt_b), verify_commands=["test -f fake-implemented.txt", "git diff --check"])
+
+            self.assertNotEqual(store_a.directory, store_b.directory)
+
+            plan_a = wt_a / "plan-source.json"
+            prog_a = wt_a / "progress-source.json"
+            plan_a.write_text(json.dumps({"milestones": [{"id": "M1", "title": "worktree A", "weight": 1}]}))
+            prog_a.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
+
+            with self.env(plan_a, prog_a):
+                final_a = Supervisor(store_a, ScriptedQuota()).execute(start=True)
+            self.assertEqual(final_a["state"], State.DONE.value)
+
+            self.assertEqual(store_b.load_state()["state"], State.NEW.value)
+        finally:
+            temp_source.cleanup()
+
+    def test_e2e_same_workspace_second_writer_fails_closed(self):
+        """Attempting to run a second supervisor on the exact same workspace fails closed."""
+        temp, root, plan, prog = fixture()
+        try:
+            store = NightwatchStore(root)
+            store.initialize("run-first", "first goal", str(root), verify_commands=["git diff --check"])
+
+            from nightwatch.storage import SupervisorAlreadyRunning
+            with store.supervisor_lease():
+                with self.assertRaises(SupervisorAlreadyRunning):
+                    with store.supervisor_lease():
+                        pass
+        finally:
+            temp.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

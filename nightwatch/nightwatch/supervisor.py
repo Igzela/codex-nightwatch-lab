@@ -978,8 +978,28 @@ class PassiveWatcher:
                             model=model,
                             reasoning_effort=reasoning_effort,
                         )
-                    supervisor = Supervisor(self.store)
-                    return supervisor.execute(start=False)
+                    from .operations import install_user_files, service_name, start_user_service
+
+                    try:
+                        install_user_files(self.store.repo)
+                        s_name = service_name(self.store.repo)
+                        start_user_service(s_name)
+                        return {
+                            "status": "TAKEOVER_HANDOFF_COMPLETE",
+                            "service": s_name,
+                            "thread_id": frozen_thread_id,
+                            "repo": str(self.store.repo),
+                            "run_id": self.store.load_state()["run_id"],
+                        }
+                    except (RuntimeError, SystemExit, OSError) as exc:
+                        return {
+                            "status": "TAKEOVER_SERVICE_START_FAILED",
+                            "error": str(exc),
+                            "service": service_name(self.store.repo),
+                            "thread_id": frozen_thread_id,
+                            "repo": str(self.store.repo),
+                            "run_id": self.store.load_state()["run_id"],
+                        }
                 break
 
             time.sleep(poll_interval)

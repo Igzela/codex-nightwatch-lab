@@ -110,7 +110,7 @@ nightwatch
 Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed.
 
 ```text
-Nightwatch 0.3.0 · MULTI-THREAD CONTROL
+Nightwatch 0.3.1 · MULTI-THREAD CONTROL
 Runs 2 · ↑/↓ select · / commands · Esc quit
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
@@ -296,7 +296,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 92 tests
+Ran 109 tests
 OK
 ```
 

@@ -153,8 +153,10 @@ class TuiTests(unittest.TestCase):
             git_repo(root)
             store = NightwatchStore(root, state_home=Path(temporary) / "state")
             store.initialize("steer-run", "goal", str(root), thread_id="THREAD-STEER")
+            store.transition(State.PREFLIGHT, "test_preflight", "preflight")
+            store.transition(State.RUNNING, "test_running", "active for steer test")
             completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-            with patch("nightwatch.tui.subprocess.run", return_value=completed) as run:
+            with patch("nightwatch.operations.subprocess.run", return_value=completed) as run:
                 result = queue_steer(store, "不要修改数据库 schema")
             self.assertTrue(result.ok)
             args = run.call_args.args[0]
@@ -166,6 +168,133 @@ class TuiTests(unittest.TestCase):
             self.assertNotIn("不要修改数据库", events)
             with self.assertRaises(ValueError):
                 queue_steer(store, "bad\x00instruction")
+
+    def test_terminal_run_rejects_steer(self):
+        for terminal_state in (State.DONE, State.FAILED, State.BLOCKED, State.STOPPED, State.AWAITING_ACCEPTANCE):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "repo"
+                root.mkdir()
+                git_repo(root)
+                store = NightwatchStore(root, state_home=Path(temporary) / "state")
+                store.initialize("term-run", "goal", str(root), thread_id="THREAD-TERM")
+                if terminal_state in (State.STOPPED, State.FAILED, State.BLOCKED):
+                    store.transition(terminal_state, "test_transition", "testing terminal steer rejection")
+                elif terminal_state == State.DONE:
+                    store.transition(State.PREFLIGHT, "test", "test")
+                    store.transition(State.RUNNING, "test", "test")
+                    store.transition(State.VERIFYING, "test", "test")
+                    store.transition(State.DONE, "test", "test")
+                elif terminal_state == State.AWAITING_ACCEPTANCE:
+                    store.transition(State.PREFLIGHT, "test", "test")
+                    store.transition(State.RUNNING, "test", "test")
+                    store.transition(State.VERIFYING, "test", "test")
+                    store.transition(State.AWAITING_ACCEPTANCE, "test", "test")
+                catalog = RunCatalog(Path(temporary) / "state")
+                run = catalog.discover()[0]
+                self.assertTrue(run.terminal)
+                self.assertFalse(run.active)
+                result = queue_steer(store, "test steering terminal run")
+                self.assertFalse(result.ok)
+                self.assertIn("Instruction was NOT queued because this Nightwatch run is terminal", result.message)
+                self.assertIn("Use /resume or start a new supervised run before steering", result.message)
+
+    def test_done_run_does_not_call_codex_queue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("done-run", "goal", str(root), thread_id="THREAD-DONE")
+            store.transition(State.PREFLIGHT, "test", "test")
+            store.transition(State.RUNNING, "test", "test")
+            store.transition(State.VERIFYING, "test", "test")
+            store.transition(State.DONE, "test_done", "goal completed")
+            with patch("nightwatch.operations.subprocess.run") as mock_run:
+                result = queue_steer(store, "new instructions after done")
+                mock_run.assert_not_called()
+            self.assertFalse(result.ok)
+
+    def test_active_running_run_can_steer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("active-run", "goal", str(root), thread_id="THREAD-ACT")
+            store.transition(State.PREFLIGHT, "test_preflight", "preflight")
+            store.transition(State.RUNNING, "test_running", "active worker")
+            completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            with patch("nightwatch.operations.subprocess.run", return_value=completed) as mock_run:
+                result = queue_steer(store, "keep going with task B")
+                mock_run.assert_called_once()
+            self.assertTrue(result.ok)
+            self.assertIn("Instruction queued to exact thread THREAD-ACT", result.message)
+
+    def test_direct_queue_steer_defense_in_depth(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("defense-run", "goal", str(root), thread_id="THREAD-DEF")
+            store.transition(State.BLOCKED, "test_blocked", "blocked by safety rule")
+            result = queue_steer(store, "bypass instruction")
+            self.assertFalse(result.ok)
+            self.assertIn("terminal", result.message)
+
+    def test_multi_summary_does_not_load_full_event_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("summary-run", "goal", str(root), thread_id="THREAD-SUM")
+            with patch.object(NightwatchStore, "load_events", wraps=store.load_events) as mock_load_events:
+                catalog = RunCatalog(Path(temporary) / "state")
+                runs = catalog.discover()
+                self.assertEqual(len(runs), 1)
+                mock_load_events.assert_not_called()
+
+    def test_timeline_lazy_loads_and_validates_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            git_repo(root)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("lazy-run", "goal", str(root), thread_id="THREAD-LAZY")
+            catalog = RunCatalog(Path(temporary) / "state")
+            run = catalog.discover()[0]
+            self.assertIsNone(run._events)
+            events = run.events
+            self.assertIsInstance(events, list)
+            self.assertGreater(len(events), 0)
+            self.assertEqual(events[0]["event"], "run_created")
+
+    def test_tui_does_not_depend_on_private_cli_helpers(self):
+        tui_source = (PRODUCT / "nightwatch" / "tui.py").read_text(encoding="utf-8")
+        self.assertNotIn("from . import cli", tui_source)
+        self.assertNotIn("import cli", tui_source)
+        self.assertNotIn("cli._", tui_source)
+        self.assertNotIn("cli.main", tui_source)
+
+    def test_catalog_integrity_error_visible_in_dashboard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            state_home = base / "state"
+            state_home.mkdir(parents=True, exist_ok=True)
+            corrupt_dir = state_home / "corrupted-run-dir"
+            corrupt_dir.mkdir()
+            (corrupt_dir / "metadata.json").write_text("invalid json syntax", encoding="utf-8")
+            catalog = RunCatalog(state_home)
+            runs = catalog.discover()
+            self.assertEqual(len(runs), 0)
+            self.assertEqual(len(catalog.errors), 1)
+            self.assertIn("corrupted-run-dir", catalog.errors[0])
+            rendered = render_dashboard(runs, errors=catalog.errors)
+            self.assertIn("⚠ TRUSTED STATE ERRORS: 1", rendered)
+            self.assertIn("corrupted-run-dir:", rendered)
+            self.assertIn("Use explicit CLI/recovery inspection before touching that run.", rendered)
+            self.assertIn("1 trusted run failed integrity validation", rendered)
 
     def test_worktree_creation_is_argv_only_and_uses_isolated_layout(self):
         with tempfile.TemporaryDirectory() as temporary:

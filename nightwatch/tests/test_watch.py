@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from nightwatch import operations
 from nightwatch.models import State
 from nightwatch.storage import NightwatchStore
 from nightwatch.supervisor import (
@@ -270,22 +271,152 @@ class WatchAndAdoptionTests(unittest.TestCase):
         def fake_matches(ident: dict) -> bool:
             return alive_seq.pop(0) if alive_seq else False
 
-        mock_supervisor_execute = MagicMock(return_value={"state": State.WAIT_QUOTA.value, "thread_id": "THREAD-A"})
-
         with patch.object(watcher, "discover_active_session", return_value=fake_session), \
              patch("nightwatch.supervisor.process_matches", side_effect=fake_matches), \
              patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
-             patch.object(Supervisor, "execute", mock_supervisor_execute), \
+             patch("nightwatch.operations.install_user_files", return_value=(Path("launcher"), Path("service"))), \
+             patch("nightwatch.operations.start_user_service") as mock_start_service, \
+             patch.object(Supervisor, "execute") as mock_exec, \
              patch("time.sleep", return_value=None):
 
             result = watcher.watch(auto_takeover=True)
             self.assertTrue(self.store.exists())
             state = self.store.load_state()
             self.assertEqual(state["thread_id"], "THREAD-A")
-            mock_supervisor_execute.assert_called_once_with(start=False)
-            self.assertEqual(result["state"], State.WAIT_QUOTA.value)
+            mock_exec.assert_not_called()
+            mock_start_service.assert_called_once()
+            self.assertEqual(result["status"], "TAKEOVER_HANDOFF_COMPLETE")
+            self.assertEqual(result["thread_id"], "THREAD-A")
 
-    def test_pid_reuse_does_not_count_as_original_session_alive(self) -> None:
+    def test_auto_takeover_does_not_execute_supervisor_inline(self) -> None:
+        rollout_a = self._create_rollout("THREAD-A", primary_pct=10.0)
+        watcher = PassiveWatcher(self.store)
+        fake_session = {
+            "status": "OK",
+            "active": True,
+            "pid": 1001,
+            "pid_identity": {"pid": 1001, "starttime": "1001", "executable": "/bin/codex"},
+            "thread_id": "THREAD-A",
+            "rollout_path": str(rollout_a),
+            "title": "Goal A",
+        }
+
+        with patch.object(watcher, "discover_active_session", return_value=fake_session), \
+             patch("nightwatch.supervisor.process_matches", return_value=False), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
+             patch("nightwatch.operations.install_user_files", return_value=(Path("launcher"), Path("service"))), \
+             patch("nightwatch.operations.start_user_service") as mock_start_service, \
+             patch.object(Supervisor, "execute") as mock_exec:
+
+            result = watcher.watch(auto_takeover=True)
+            mock_exec.assert_not_called()
+            mock_start_service.assert_called_once()
+            self.assertEqual(result["status"], "TAKEOVER_HANDOFF_COMPLETE")
+
+    def test_auto_takeover_starts_repo_specific_service(self) -> None:
+        rollout_a = self._create_rollout("THREAD-A", primary_pct=10.0)
+        watcher = PassiveWatcher(self.store)
+        fake_session = {
+            "status": "OK",
+            "active": True,
+            "pid": 1001,
+            "pid_identity": {"pid": 1001, "starttime": "1001", "executable": "/bin/codex"},
+            "thread_id": "THREAD-A",
+            "rollout_path": str(rollout_a),
+            "title": "Goal A",
+        }
+
+        with patch.object(watcher, "discover_active_session", return_value=fake_session), \
+             patch("nightwatch.supervisor.process_matches", return_value=False), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
+             patch("nightwatch.operations.install_user_files") as mock_install, \
+             patch("nightwatch.operations.start_user_service") as mock_start:
+
+            result = watcher.watch(auto_takeover=True)
+            mock_install.assert_called_once_with(self.store.repo)
+            self.assertTrue(result["service"].startswith("nightwatch-"))
+            self.assertTrue(result["service"].endswith(".service"))
+            mock_start.assert_called_once_with(result["service"])
+
+    def test_auto_takeover_uses_frozen_exact_thread(self) -> None:
+        rollout_a = self._create_rollout("THREAD-A", primary_pct=10.0)
+        watcher = PassiveWatcher(self.store)
+        fake_session = {
+            "status": "OK",
+            "active": True,
+            "pid": 1001,
+            "pid_identity": {"pid": 1001, "starttime": "1001", "executable": "/bin/codex"},
+            "thread_id": "THREAD-FROZEN",
+            "rollout_path": str(rollout_a),
+            "title": "Frozen Goal",
+        }
+
+        fake_sqlite_after = [{"id": "THREAD-NEWEST", "title": "Newest sqlite thread"}]
+
+        with patch.object(watcher, "discover_active_session", return_value=fake_session), \
+             patch("nightwatch.supervisor.process_matches", return_value=False), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
+             patch("nightwatch.supervisor.find_active_threads_for_repo", return_value=fake_sqlite_after), \
+             patch("nightwatch.operations.install_user_files"), \
+             patch("nightwatch.operations.start_user_service"):
+
+            result = watcher.watch(auto_takeover=True)
+            self.assertTrue(self.store.exists())
+            self.assertEqual(self.store.load_state()["thread_id"], "THREAD-FROZEN")
+            self.assertEqual(result["thread_id"], "THREAD-FROZEN")
+
+    def test_service_start_failure_leaves_safe_durable_state(self) -> None:
+        rollout_a = self._create_rollout("THREAD-A", primary_pct=10.0)
+        watcher = PassiveWatcher(self.store)
+        fake_session = {
+            "status": "OK",
+            "active": True,
+            "pid": 1001,
+            "pid_identity": {"pid": 1001, "starttime": "1001", "executable": "/bin/codex"},
+            "thread_id": "THREAD-A",
+            "rollout_path": str(rollout_a),
+            "title": "Goal A",
+        }
+
+        with patch.object(watcher, "discover_active_session", return_value=fake_session), \
+             patch("nightwatch.supervisor.process_matches", return_value=False), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
+             patch("nightwatch.operations.install_user_files"), \
+             patch("nightwatch.operations.start_user_service", side_effect=RuntimeError("systemctl --user unavailable")), \
+             patch.object(Supervisor, "execute") as mock_exec:
+
+            result = watcher.watch(auto_takeover=True)
+            mock_exec.assert_not_called()
+            self.assertEqual(result["status"], "TAKEOVER_SERVICE_START_FAILED")
+            self.assertIn("systemctl --user unavailable", result["error"])
+            self.assertTrue(self.store.exists())
+            state = self.store.load_state()
+            self.assertEqual(state["state"], State.NEW.value)
+            self.assertEqual(state["thread_id"], "THREAD-A")
+
+    def test_competing_codex_process_still_blocks_takeover(self) -> None:
+        rollout_a = self._create_rollout("THREAD-A", primary_pct=10.0)
+        watcher = PassiveWatcher(self.store)
+        fake_session = {
+            "status": "OK",
+            "active": True,
+            "pid": 1001,
+            "pid_identity": {"pid": 1001, "starttime": "1001", "executable": "/bin/codex"},
+            "thread_id": "THREAD-A",
+            "rollout_path": str(rollout_a),
+            "title": "Goal A",
+        }
+
+        with patch.object(watcher, "discover_active_session", return_value=fake_session), \
+             patch("nightwatch.supervisor.process_matches", return_value=False), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[{"pid": 9999}]):
+
+            with self.assertRaises(SystemExit) as exc:
+                watcher.watch(auto_takeover=True)
+            self.assertIn("competing Codex process", str(exc.exception))
+            self.assertFalse(self.store.exists())
+
+    def test_pid_reuse_protection_remains(self) -> None:
         fake_identity = {"pid": 1001, "starttime": "12345", "executable": "/bin/codex"}
         reused_stat = "1001 (codex) S 1 1001 1001 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 67890 0 0"
 
@@ -309,18 +440,19 @@ class WatchAndAdoptionTests(unittest.TestCase):
             "title": "Goal A",
         }
 
-        mock_supervisor_execute = MagicMock(return_value={"state": State.DONE.value, "thread_id": "THREAD-A"})
         fake_sqlite_after = [{"id": "THREAD-B", "title": "Newest thread"}]
 
         with patch.object(watcher, "discover_active_session", return_value=fake_session), \
              patch("nightwatch.supervisor.process_matches", return_value=False), \
              patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
              patch("nightwatch.supervisor.find_active_threads_for_repo", return_value=fake_sqlite_after), \
-             patch.object(Supervisor, "execute", mock_supervisor_execute):
+             patch("nightwatch.operations.install_user_files"), \
+             patch("nightwatch.operations.start_user_service"):
 
-            watcher.watch(auto_takeover=True)
+            result = watcher.watch(auto_takeover=True)
             self.assertTrue(self.store.exists())
             self.assertEqual(self.store.load_state()["thread_id"], "THREAD-A")
+            self.assertEqual(result["status"], "TAKEOVER_HANDOFF_COMPLETE")
 
 
 class FakeE2EWatchTests(unittest.TestCase):
@@ -430,16 +562,18 @@ class FakeE2EWatchTests(unittest.TestCase):
                 return timeline[0]["alive"]
             return False
 
-        mock_supervisor_execute = MagicMock(return_value={"state": State.WAIT_QUOTA.value, "thread_id": "THREAD-A"})
-
         with patch.object(watcher, "discover_active_session", return_value=fake_session), \
              patch("nightwatch.supervisor.process_matches", side_effect=is_alive), \
              patch("nightwatch.supervisor.find_repo_codex_processes", return_value=[]), \
-             patch.object(Supervisor, "execute", mock_supervisor_execute), \
+             patch("nightwatch.operations.install_user_files", return_value=(Path("launcher"), Path("service"))), \
+             patch("nightwatch.operations.start_user_service") as mock_start_service, \
+             patch.object(Supervisor, "execute") as mock_exec, \
              patch("time.sleep", side_effect=step_poll):
 
             result = watcher.watch(auto_takeover=True)
             self.assertTrue(self.store.exists())
             self.assertEqual(self.store.load_state()["thread_id"], "THREAD-A")
-            mock_supervisor_execute.assert_called_once_with(start=False)
-            self.assertEqual(result["state"], State.WAIT_QUOTA.value)
+            mock_exec.assert_not_called()
+            mock_start_service.assert_called_once()
+            self.assertEqual(result["status"], "TAKEOVER_HANDOFF_COMPLETE")
+            self.assertEqual(result["thread_id"], "THREAD-A")

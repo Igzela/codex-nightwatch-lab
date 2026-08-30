@@ -19,8 +19,8 @@ fi
 PYTHON_MAJOR=$(python3 -c "import sys; print(sys.version_info[0])")
 PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info[1])")
 
-if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 10 ]; }; then
-    echo -e "${RED}Error: Python 3.10+ is required. Found Python $PYTHON_MAJOR.$PYTHON_MINOR.${NC}" >&2
+if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]; }; then
+    echo -e "${RED}Error: Python 3.11+ is required. Found Python $PYTHON_MAJOR.$PYTHON_MINOR.${NC}" >&2
     exit 1
 fi
 

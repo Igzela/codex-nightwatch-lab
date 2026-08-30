@@ -183,7 +183,7 @@ class NightwatchStore:
         state = empty_state(
             run_id,
             goal,
-            repo,
+            str(Path(repo).resolve()),
             self.repo_id,
             timestamp,
             model=model,

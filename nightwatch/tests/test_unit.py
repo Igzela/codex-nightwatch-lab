@@ -16,7 +16,8 @@ import sys
 TEST_STATE_HOME = tempfile.mkdtemp(prefix="nightwatch-trusted-tests-")
 os.environ["NIGHTWATCH_STATE_HOME"] = TEST_STATE_HOME
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PRODUCT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PRODUCT))
 
 from nightwatch import cli  # noqa: E402
 from nightwatch.codex import (  # noqa: E402
@@ -360,6 +361,33 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(quota.source, "rollout_jsonl")
             self.assertEqual(quota.primary.used_percent, 59)
             self.assertEqual(quota.secondary.window_duration_mins, 10080)
+
+    def test_install_script_requires_python_311(self):
+        install_sh = PRODUCT.parent / "install.sh"
+        self.assertTrue(install_sh.exists())
+        content = install_sh.read_text(encoding="utf-8")
+        self.assertIn("PYTHON_MINOR", content)
+        self.assertIn("-lt 11", content)
+        self.assertIn("Python 3.11+ is required", content)
+        self.assertNotIn("3.10", content)
+
+        test_script = """
+        check_py() {
+            PYTHON_MAJOR=$1
+            PYTHON_MINOR=$2
+            if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 11 ]; }; then
+                return 1
+            fi
+            return 0
+        }
+        check_py 3 10 && exit 10
+        check_py 3 11 || exit 11
+        check_py 3 12 || exit 12
+        check_py 2 7 && exit 27
+        exit 0
+        """
+        res = subprocess.run(["bash", "-c", test_script], capture_output=True)
+        self.assertEqual(res.returncode, 0)
 
 
 if __name__ == "__main__":
