@@ -480,6 +480,9 @@ class Supervisor:
         try:
             quota = self.quota_provider.read()
             self.store.mutate("quota_sanity_ok", "quota provider returned a validated snapshot", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
+            if quota.source in {"live_app_server", "fake_file"} and quota.exhausted_windows():
+                self._enter_initial_quota_wait(quota)
+                return True
         except Exception as exc:
             # A first run can still start: quota may be healthy but its optional
             # read may be network-blocked. Automatic recovery remains fail closed.
@@ -531,13 +534,11 @@ class Supervisor:
     def _run_turn(self) -> dict[str, Any]:
         state = self.store.load_state()
         thread = state.get("thread_id")
-        if state["state"] == State.PREFLIGHT.value and not thread:
-            state = self.store.transition(State.RUNNING, "provider_launch_ready", "preflight passed")
-        if state["state"] in {State.RUNNING.value, State.PREFLIGHT.value} and not thread:
+        if state["state"] in {State.PREFLIGHT.value, State.RECOVERING.value}:
+            state = self.store.transition(State.RUNNING, "provider_launch_ready", "preflight passed" if state["state"] == State.PREFLIGHT.value else "quota recovered; ready for provider launch")
+        if not thread:
             action = "starting new exact-thread goal"
         else:
-            if not thread:
-                return self._fail_closed("resume path has no exact thread_id", ErrorKind.STATE)
             action = "resuming exact thread"
         prompt = start_prompt(self.store, state["goal"]) if not thread else resume_prompt(self.store, state)
         self.store.mutate("provider_launch_prepared", action, lambda item: {**item, "resume_claim": ({**item["resume_claim"], "phase": "spawn_prepared"} if item.get("resume_claim") else None), "last_error": None})
@@ -578,6 +579,30 @@ class Supervisor:
             return self.store.transition(target, "provider_failed", result.error_detail or result.error_kind.value, {"last_error": result.error_detail, "error_kind": result.error_kind.value, "resume_claim": None})
         return self._after_success()
 
+    def _enter_initial_quota_wait(self, quota: QuotaSnapshot) -> dict[str, Any]:
+        windows = quota.windows()
+        exhausted = quota.exhausted_windows()
+        reset = max((window.resets_at or 0 for window in exhausted), default=0)
+        if not reset:
+            reset = max((window.resets_at or 0 for window in windows), default=0)
+        weekly_only = any(w.name == "weekly" for w in exhausted) and not any(w.name == "5h" for w in exhausted)
+        if not reset:
+            reset = int(time.time()) + (7 * 86400 if weekly_only else 5 * 3600)
+        buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
+        next_at = reset + max(0, buffer_seconds)
+        error_kind = ErrorKind.QUOTA_WEEKLY.value if weekly_only else ErrorKind.QUOTA_5H.value
+        waiting = self.store.transition(State.WAIT_QUOTA, "quota_exhausted", "authoritative quota is exhausted; first launch deferred", {
+            "next_resume_at": datetime.fromtimestamp(next_at, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "quota_source": quota.source,
+            "quota": quota.to_dict(),
+            "quota_windows": [window.to_dict() for window in windows],
+            "resume_claim": None,
+            "last_error": "authoritative quota is exhausted; first launch deferred",
+            "error_kind": error_kind,
+        })
+        crash_hook("AFTER_QUOTA_DETECT")
+        return waiting
+
     def _enter_quota_wait(self, result: ProviderResult) -> dict[str, Any]:
         state = self.store.load_state()
         if state["recoveries"] >= MAX_QUOTA_RECOVERIES:
@@ -614,13 +639,15 @@ class Supervisor:
             return False
         _sleep_until(int(target.timestamp()), float(os.environ.get("NIGHTWATCH_WAIT_POLL_SECONDS", QUOTA_POLL_SECONDS)))
         governing = {window.get("name") for window in state.get("quota_windows", []) if isinstance(window, dict) and window.get("name")}
+        if not governing:
+            governing = {"5h", "weekly"}
         if self._stop_requested:
             self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested during quota wait")
             return False
         try:
             quota = self.quota_provider.read()
             self.store.mutate("quota_revalidated", "quota authority queried after reset", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
-            if quota.source == "live_app_server":
+            if quota.source in {"live_app_server", "fake_file"}:
                 if not quota_recovered(quota, governing):
                     later = max((window.resets_at or int(time.time()) + QUOTA_POLL_SECONDS for window in quota.windows() if window.name in governing), default=int(time.time()) + QUOTA_POLL_SECONDS)
                     buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
@@ -654,7 +681,7 @@ class Supervisor:
 
         def mutate(state: dict[str, Any]) -> dict[str, Any]:
             nonlocal claimed
-            if state["state"] != State.WAIT_QUOTA.value or state.get("thread_id") is None:
+            if state["state"] != State.WAIT_QUOTA.value:
                 return state
             existing = state.get("resume_claim")
             if existing and existing.get("generation") == state["generation"]:

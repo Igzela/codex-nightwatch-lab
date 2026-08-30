@@ -964,11 +964,14 @@ def _quota_line(state: dict[str, Any]) -> str:
 
 
 def _next_action(state: dict[str, Any]) -> str:
+    if state.get("state") == State.WAIT_QUOTA.value:
+        if not state.get("thread_id"):
+            return "revalidate quota at reset, then start first thread"
+        return "revalidate quota at reset, then resume exact thread"
     mapping = {
         State.NEW.value: "start supervisor preflight",
         State.PREFLIGHT.value: "validate repo, auth, and quota",
         State.RUNNING.value: "continue current milestone",
-        State.WAIT_QUOTA.value: "revalidate quota at reset, then resume exact thread",
         State.RETRY_BACKOFF.value: "retry after bounded backoff",
         State.RECOVERING.value: "prove recovery state, then resume exact thread",
         State.VERIFYING.value: "run frozen trusted verification",
@@ -986,10 +989,14 @@ def _agent_summary(state: dict[str, Any]) -> str:
     if isinstance(active, dict) and process_matches(active):
         return f"RUNNING · PID {active.get('pid')} · {active.get('action') or 'provider'}"
     owner = state.get("supervisor_owner")
+    owner_alive = False
     if isinstance(owner, dict):
         owner_alive = process_matches(owner) if owner.get("starttime") and owner.get("executable") else pid_alive(owner.get("pid"))
-        if owner_alive:
-            return f"SUPERVISOR {state.get('state')} · PID {owner.get('pid')}"
+    if state.get("state") == State.WAIT_QUOTA.value and not state.get("thread_id"):
+        suffix = f" · PID {owner.get('pid')}" if owner_alive else ""
+        return f"WAITING_QUOTA (first launch deferred){suffix}"
+    if owner_alive:
+        return f"SUPERVISOR {state.get('state')} · PID {owner.get('pid')}"
     return str(state.get("state") or "IDLE")
 
 
@@ -1073,7 +1080,7 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
         state = run.state
         progress = plan_progress(run.plan)
         marker = "▶" if index == selected else " "
-        thread = run.thread_id or "capturing…"
+        thread = run.thread_id or ("First launch deferred" if state.get("state") == State.WAIT_QUOTA.value else "capturing…")
         model = state.get("model") or "Codex default"
         effort = state.get("reasoning_effort") or "default"
         work = agent_work_report(run.store)
@@ -1084,11 +1091,12 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
         run = runs[selected]
         state = run.state
         current = next((item for item in run.plan["milestones"] if item.get("status") != "verified"), None)
+        thread_label = run.thread_id or ("First launch deferred — no Codex thread created yet" if state.get("state") == State.WAIT_QUOTA.value else "Creating/capturing exact thread")
         lines.extend([
             "─" * min(width, 120),
             f"Goal       {str(state.get('goal') or '')[: max(10, width - 12)]}",
             f"Repository {run.repo}",
-            f"Thread     {run.thread_id or 'Creating/capturing exact thread'} · generation {state.get('generation')}",
+            f"Thread     {thread_label} · generation {state.get('generation')}",
             f"Agent      {_agent_summary(state)}",
             f"Current    {(current or {}).get('id', 'complete')} · {(current or {}).get('title', 'all trusted milestones verified')}",
             f"Last       {state.get('last_event') or '(none)'}",
@@ -1104,12 +1112,13 @@ def status_run(run: RunRecord) -> str:
     progress = plan_progress(run.plan)
     current = next((item for item in run.plan["milestones"] if item.get("status") != "verified"), None)
     latest = run.events[-1] if run.events else {}
+    thread_label = run.thread_id or ("First launch deferred — no Codex thread created yet" if state.get("state") == State.WAIT_QUOTA.value else "Creating/capturing exact thread")
     lines = [
         f"STATUS · {state['state']}",
         f"Agent       {_agent_summary(state)}",
         f"Repository  {run.repo}",
         f"Run         {state.get('run_id')}",
-        f"Thread      {run.thread_id or 'Creating/capturing exact thread'}",
+        f"Thread      {thread_label}",
         f"Generation  {state.get('generation')} · recoveries {state.get('recoveries', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Quota       {_quota_line(state)} · authority {state.get('quota_source') or '(none)'}",

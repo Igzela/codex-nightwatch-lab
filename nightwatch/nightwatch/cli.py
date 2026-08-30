@@ -308,7 +308,7 @@ def _agent_runtime(state: dict[str, Any]) -> dict[str, Any]:
     if isinstance(active, dict) and process_matches(active):
         return {"status": "RUNNING", "pid": active["pid"], "action": active.get("action")}
     if state["state"] == State.WAIT_QUOTA.value:
-        status = "WAITING_QUOTA"
+        status = "WAITING_QUOTA (first launch deferred)" if not state.get("thread_id") else "WAITING_QUOTA"
     elif state["state"] in {item.value for item in TERMINAL_STATES}:
         status = state["state"]
     elif owner_alive:
@@ -359,7 +359,8 @@ def _render_status(value: dict[str, Any]) -> None:
     print(f"STATE          {state['state']}")
     agent_detail = f" pid={agent['pid']} action={agent.get('action') or '(unknown)'}" if agent.get("pid") else ""
     print(f"AGENT          {agent['status']}{agent_detail}")
-    print(f"THREAD         {state.get('thread_id') or '(not captured)'}")
+    thread_display = state.get("thread_id") or ("(not captured — first launch deferred)" if state["state"] == State.WAIT_QUOTA.value else "(not captured)")
+    print(f"THREAD         {thread_display}")
     print(f"MODEL          {state.get('model') or '(Codex default)'}")
     print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
     print(f"RUN_ID         {state['run_id']}")
