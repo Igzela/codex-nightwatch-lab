@@ -18,6 +18,7 @@ from nightwatch.supervisor import (
     find_active_threads_for_repo,
     find_proven_codex_sessions,
     find_repo_codex_processes,
+    list_adoptable_sessions,
     process_matches,
 )
 
@@ -159,6 +160,40 @@ class WatchAndAdoptionTests(unittest.TestCase):
             self.assertEqual(session_1001["rollout_path"], str(rollout_a))
             self.assertEqual(session_1002["thread_id"], "THREAD-B")
             self.assertEqual(session_1002["rollout_path"], str(rollout_b))
+
+    def test_list_adoptable_sessions_includes_cwd_live_process_and_hides_subagents(self) -> None:
+        rollout_user = self._create_rollout("THREAD-USER")
+        fake_procs = [
+            {"pid": 1001, "executable": "/bin/codex", "cwd": str(self.repo)},
+            {"pid": 2002, "executable": "/bin/codex", "cwd": str(self.repo)},
+        ]
+        fake_sqlite = [
+            {"id": "THREAD-USER", "title": "User", "thread_source": "user", "model": "gpt-test"},
+            {"id": "THREAD-SUB", "title": "Child", "thread_source": "subagent", "model": "gpt-test"},
+            {"id": "THREAD-OLD", "title": "Older", "thread_source": "user", "model": "gpt-test"},
+        ]
+
+        def fake_readlink(path_str: str) -> str:
+            if "1001" in path_str:
+                return str(rollout_user)
+            return ""
+
+        with patch("nightwatch.supervisor.sys_platform_linux", return_value=True), \
+             patch("nightwatch.supervisor.find_repo_codex_processes", return_value=fake_procs), \
+             patch("nightwatch.supervisor.process_identity", side_effect=lambda p: {"pid": p, "starttime": str(p), "executable": "/bin/codex"}), \
+             patch("nightwatch.supervisor.process_matches", return_value=True), \
+             patch("nightwatch.supervisor.find_active_threads_for_repo", return_value=fake_sqlite), \
+             patch("pathlib.Path.exists", return_value=True), \
+             patch("os.listdir", return_value=["3"]), \
+             patch("os.readlink", side_effect=fake_readlink):
+
+            items = list_adoptable_sessions(self.repo)
+            threads = [item.get("thread_id") for item in items]
+            self.assertIn("THREAD-USER", threads)
+            self.assertIn("THREAD-OLD", threads)
+            self.assertNotIn("THREAD-SUB", threads)
+            self.assertTrue(any(item.get("proof") == "pid_rollout" and item.get("thread_id") == "THREAD-USER" for item in items))
+            self.assertTrue(any(item.get("proof") == "pid_cwd" and item.get("pid") == 2002 for item in items))
 
     def test_multiple_live_sessions_fail_closed_without_explicit_thread(self) -> None:
         fake_proven = [

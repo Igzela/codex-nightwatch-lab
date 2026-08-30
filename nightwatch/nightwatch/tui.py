@@ -7,16 +7,18 @@ import stat
 import sys
 import textwrap
 import unicodedata
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .git import GitError, repo_root
-from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
+from .models import TERMINAL_STATES, State, plan_progress
 from .operations import (
     ActionResult,
     RunSpec,
+    adopt_run,
     create_worktree,
     doctor_snapshot,
     list_models,
@@ -26,15 +28,31 @@ from .operations import (
     stop_run,
     validate_human_text,
 )
+from .milestones import read_mailbox_json
+from .quota import make_quota_provider
 from .storage import MAX_EVENT_BYTES, NightwatchStore, StateIntegrityError, control_plane_root
-from .supervisor import build_report, find_active_threads_for_repo, find_proven_codex_sessions, pid_alive, process_matches
-
-_validate_human_text = validate_human_text
+from .supervisor import build_report, list_adoptable_sessions, pid_alive, process_matches
 
 MAX_GOAL_CHARS = 4_000
 MAX_INSTRUCTION_CHARS = 4_000
 MAX_VERIFY_COMMANDS = 20
 MAX_DISCOVERED_RUNS = 1_000
+MAX_ADOPT_GOAL_DISPLAY = 240
+
+
+def adopt_goal_text(title: str | None, thread_id: str | None = None, max_chars: int = MAX_GOAL_CHARS) -> str:
+    """Turn a Codex session title into a Nightwatch goal that always fits the validator."""
+    fallback = "Supervise adopted conversation"
+    if isinstance(thread_id, str) and thread_id.strip():
+        fallback = f"Supervise adopted conversation ({thread_id.strip()})"
+    raw = str(title or "").strip()
+    if not raw:
+        return fallback
+    first = next((line.strip() for line in raw.splitlines() if line.strip()), raw)
+    if len(first) <= max_chars:
+        return first
+    trimmed = first[: max(1, max_chars - 1)].rstrip()
+    return f"{trimmed}…"[:max_chars]
 
 
 @dataclass(frozen=True)
@@ -65,12 +83,49 @@ COMMANDS = (
     SlashCommand("/stop", "Stop the selected run while preserving durable state", "/stop", True),
     SlashCommand("/help", "Show commands, keys, and trust semantics", "/help"),
     SlashCommand("/quit", "Exit the TUI without stopping agents", "/quit"),
+    SlashCommand("/exit", "Exit the TUI without stopping agents", "/exit"),
 )
+
+COMMAND_ALIASES = {"new": "run", "exit": "quit"}
+VIEW_COMMANDS = {"status", "plan", "logs", "timeline", "explain", "thread", "quota", "recap"}
+HELP_TEXT = """COMMANDS AND KEYS
+Type / to open the command menu. Filter by typing; ↑/↓ select; Enter runs the highlighted command.
+Without / , text is a new goal or a steer to the selected active run. Mutating actions confirm first.
+
+Esc closes the command menu, then a picker/confirm card, then a view, then clears the input.
+Empty dashboard Esc does not quit. Leave with /quit, /exit, or Ctrl+C.
+
+↑/↓ with an empty input selects a run. PgUp/PgDn scroll the current view.
+Absolute paths such as /home/... are not commands.
+
+/run [goal]     confirm a supervised goal (verify commands optional on the confirm card)
+/adopt [thread] pick a live or recent Codex session; binds the exact thread without starting a writer
+/steer [text]   queue an instruction to the selected exact thread
+/resume         start unattended supervision after the interactive Codex process exits
+/stop           stop supervision and keep durable state
+/status /plan /logs /timeline /explain /thread /quota /recap /models /doctor /help /multi
+"""
+
+
+def is_slash_composer(text: str) -> bool:
+    if not text.startswith("/"):
+        return False
+    first = text.split(maxsplit=1)[0]
+    return "/" not in first[1:]
 
 
 def slash_commands(prefix: str = "") -> list[SlashCommand]:
     clean = prefix.strip().lower().removeprefix("/")
-    return [item for item in COMMANDS if item.name.removeprefix("/").startswith(clean)]
+    if not clean:
+        return list(COMMANDS)
+    prefix_hits = [item for item in COMMANDS if item.name.removeprefix("/").startswith(clean)]
+    if prefix_hits:
+        return prefix_hits
+    return [
+        item
+        for item in COMMANDS
+        if clean in item.name.removeprefix("/").lower() or clean in item.summary.lower()
+    ]
 
 
 def palette_prefix(value: str) -> str:
@@ -91,15 +146,13 @@ def route_input(text: str, has_active_run: bool) -> Intent:
         return Intent("noop")
     if value == "/":
         return Intent("palette")
-    if value.startswith("/"):
+    if is_slash_composer(value):
         command, _, argument = value.partition(" ")
-        name = command[1:].lower()
-        if name == "new":
-            name = "run"
-        known = {item.name[1:] for item in COMMANDS}
-        if name not in known:
+        name = COMMAND_ALIASES.get(command[1:].lower(), command[1:].lower())
+        item = next((candidate for candidate in COMMANDS if candidate.name[1:] == name), None)
+        if item is None:
             return Intent("error", f"Unknown command: {command}")
-        return Intent(name, argument.strip() or None, next(item.mutates for item in COMMANDS if item.name == f"/{name}"))
+        return Intent(name, argument.strip() or None, item.mutates)
     return Intent("steer" if has_active_run else "run", value, True)
 
 
@@ -112,6 +165,708 @@ def terminal_safe(value: Any) -> str:
         else ""
         for character in text
     )
+
+
+@dataclass
+class OverlayItem:
+    key: str
+    title: str
+    detail: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Overlay:
+    kind: str
+    title: str = ""
+    body: str = ""
+    items: list[OverlayItem] = field(default_factory=list)
+    selected: int = 0
+    mode: str = ""
+
+
+@dataclass
+class TuiHooks:
+    discover_sessions: Callable[..., list[dict[str, Any]]] | None = None
+    adopt: Callable[..., ActionResult] | None = None
+    start_run: Callable[..., ActionResult] | None = None
+    create_worktree: Callable[..., Path] | None = None
+    queue_steer: Callable[..., ActionResult] | None = None
+    resume: Callable[..., ActionResult] | None = None
+    stop: Callable[..., ActionResult] | None = None
+    run_exists: Callable[..., bool] | None = None
+    list_models: Callable[..., list[dict[str, Any]]] | None = None
+    doctor: Callable[..., dict[str, Any]] | None = None
+    write_report: Callable[..., Path] | None = None
+
+
+class TuiController:
+    """Codex-style TUI state machine: persistent composer, slash menu, confirm cards."""
+
+    def __init__(
+        self,
+        *,
+        repo: Path | None = None,
+        runs: list[Any] | None = None,
+        hooks: TuiHooks | None = None,
+    ):
+        self.repo = Path(repo).expanduser() if repo is not None else None
+        self.runs: list[Any] = list(runs or [])
+        self.hooks = hooks or TuiHooks()
+        self.selected = 0
+        self.view = "dashboard"
+        self.content: str | None = None
+        self.composer = ""
+        self.overlay: Overlay | None = None
+        self.message = "Type / to discover commands."
+        self.scroll = 0
+        self.quit = False
+        self.pending: dict[str, Any] | None = None
+        self.awaiting: str | None = None
+        self.catalog_errors: list[str] = []
+
+    def handle_key(self, key: str) -> None:
+        if self.quit:
+            return
+        if key == "ctrl-c":
+            self.quit = True
+            return
+        if self.overlay is not None:
+            self._handle_overlay_key(key)
+            return
+        if key == "esc":
+            self._handle_esc()
+            return
+        if key == "up":
+            if not self.composer:
+                self.selected = max(0, self.selected - 1)
+            return
+        if key == "down":
+            if not self.composer:
+                self.selected = min(max(0, len(self.runs) - 1), self.selected + 1)
+            return
+        if key == "pageup":
+            self.scroll = max(0, self.scroll - 10)
+            return
+        if key == "pagedown":
+            self.scroll += 10
+            return
+        if key == "enter":
+            self._submit()
+            return
+        if key == "backspace":
+            self.composer = self.composer[:-1]
+            return
+        if len(key) == 1 and key.isprintable():
+            if len(self.composer) < MAX_GOAL_CHARS:
+                self.composer += key
+            if is_slash_composer(self.composer):
+                self._sync_slash_menu()
+
+    def render(self, width: int = 80, height: int = 24) -> str:
+        width = max(40, width)
+        height = max(8, height)
+        if self.content is not None:
+            body = self.content
+        else:
+            body = render_dashboard(self.runs, self.selected, width, errors=self.catalog_errors)
+        lines: list[str] = []
+        for source in (terminal_safe(body).splitlines() or [""]):
+            lines.extend(
+                textwrap.wrap(source, max(20, width - 1), replace_whitespace=False, drop_whitespace=False) or [""]
+            )
+        overlay_lines = self._overlay_lines(width, height)
+        footer = [terminal_safe(self._footer_message())[: max(1, width - 1)], f"Input › {self.composer}"[: max(1, width - 1)]]
+        reserved = len(overlay_lines) + 2
+        visible_h = max(1, height - reserved)
+        start = min(self.scroll, max(0, len(lines) - visible_h))
+        visible = lines[start : start + visible_h]
+        while len(visible) < visible_h:
+            visible.append("")
+        return "\n".join(visible + overlay_lines + footer)
+
+    def _overlay_lines(self, width: int, height: int) -> list[str]:
+        overlay = self.overlay
+        if overlay is None:
+            return []
+        out = [f"── {overlay.title} ──"[: width - 1]]
+        if overlay.body:
+            for line in overlay.body.splitlines() or [""]:
+                out.extend(
+                    textwrap.wrap(terminal_safe(line), max(20, width - 1), replace_whitespace=False, drop_whitespace=False)
+                    or [""]
+                )
+        if overlay.items:
+            limit = max(3, height - len(out) - 4)
+            start = 0
+            if overlay.selected >= start + limit:
+                start = overlay.selected - limit + 1
+            window = overlay.items[start : start + limit]
+            for index, item in enumerate(window, start=start):
+                mark = "▶" if index == overlay.selected else " "
+                detail = f"  {item.detail}" if item.detail else ""
+                out.append(f"{mark} {item.key:<12} {item.title}{detail}"[: width - 1])
+        return out
+
+    def _footer_message(self) -> str:
+        overlay = self.overlay
+        if overlay is None:
+            return self.message
+        if overlay.kind == "slash":
+            return "↑/↓ select · Enter runs · Esc closes the menu"
+        if overlay.kind == "picker":
+            return "↑/↓ select a session · Enter continues · Esc cancels"
+        if overlay.kind == "confirm":
+            if overlay.mode == "worktree":
+                return "Type a worktree label · Enter continues · Esc cancels"
+            return "Empty Enter confirms · Esc cancels · type a verify command then Enter to add it"
+        return self.message
+
+    def _selected_run(self) -> Any | None:
+        if not self.runs:
+            return None
+        return self.runs[min(max(0, self.selected), len(self.runs) - 1)]
+
+    def _has_active(self) -> bool:
+        run = self._selected_run()
+        return bool(run is not None and getattr(run, "active", False))
+
+    def _sync_slash_menu(self) -> None:
+        if not is_slash_composer(self.composer):
+            if self.overlay and self.overlay.kind == "slash":
+                self.overlay = None
+            return
+        matches = slash_commands(palette_prefix(self.composer))
+        selected = self.overlay.selected if self.overlay and self.overlay.kind == "slash" else 0
+        items = [OverlayItem(item.name, item.summary, item.usage, {"mutates": item.mutates}) for item in matches]
+        self.overlay = Overlay(
+            kind="slash",
+            title="COMMANDS",
+            items=items,
+            selected=min(selected, max(0, len(items) - 1)),
+        )
+
+    def _handle_esc(self) -> None:
+        if self.view not in {"dashboard", "multi"}:
+            self.view = "dashboard"
+            self.content = None
+            self.scroll = 0
+            return
+        if self.composer or self.awaiting:
+            self.composer = ""
+            self.awaiting = None
+            return
+
+    def _handle_overlay_key(self, key: str) -> None:
+        overlay = self.overlay
+        if overlay is None:
+            return
+        if overlay.kind == "slash":
+            if key == "esc":
+                self.overlay = None
+                self.composer = ""
+                return
+            if key == "up":
+                overlay.selected = max(0, overlay.selected - 1)
+                return
+            if key == "down":
+                overlay.selected = min(max(0, len(overlay.items) - 1), overlay.selected + 1)
+                return
+            if key == "enter":
+                self._submit_slash()
+                return
+            if key == "backspace":
+                self.composer = self.composer[:-1]
+                if not self.composer:
+                    self.overlay = None
+                else:
+                    self._sync_slash_menu()
+                return
+            if len(key) == 1 and key.isprintable() and len(self.composer) < MAX_GOAL_CHARS:
+                self.composer += key
+                self._sync_slash_menu()
+            return
+        if overlay.kind == "picker":
+            if key == "esc":
+                self.overlay = None
+                self.composer = ""
+                return
+            if key == "up":
+                overlay.selected = max(0, overlay.selected - 1)
+                return
+            if key == "down":
+                overlay.selected = min(max(0, len(overlay.items) - 1), overlay.selected + 1)
+                return
+            if key == "enter":
+                typed = self.composer.strip()
+                if typed and not typed.isdigit():
+                    self._open_adopt_confirm(typed, None)
+                    return
+                if typed.isdigit() and overlay.items and 1 <= int(typed) <= len(overlay.items):
+                    chosen = overlay.items[int(typed) - 1]
+                elif overlay.items:
+                    chosen = overlay.items[min(overlay.selected, len(overlay.items) - 1)]
+                else:
+                    self.message = "No conversation selected. Type an exact thread ID."
+                    return
+                thread = chosen.payload.get("thread_id")
+                if not thread:
+                    self.message = "Pick a conversation with a thread ID, or type the exact thread ID."
+                    return
+                self._open_adopt_confirm(str(thread), chosen.payload)
+                return
+            if key == "backspace":
+                self.composer = self.composer[:-1]
+                return
+            if len(key) == 1 and key.isprintable() and len(self.composer) < MAX_GOAL_CHARS:
+                self.composer += key
+            return
+        if overlay.kind == "confirm":
+            if key == "esc":
+                self.overlay = None
+                self.pending = None
+                self.composer = ""
+                return
+            if key == "enter":
+                if overlay.mode == "worktree":
+                    label = self.composer.strip()
+                    if not label:
+                        self.message = "Worktree label is required because this workspace already has a run."
+                        return
+                    if self.pending is not None:
+                        self.pending["worktree"] = label
+                    self.composer = ""
+                    self._show_run_preview()
+                    return
+                typed = self.composer.strip()
+                if typed == "/" or (is_slash_composer(typed) and typed.count("/") == 1):
+                    self.composer = ""
+                    self.message = "Slash commands are unavailable on this confirm card. Empty Enter confirms; Esc cancels."
+                    return
+                if self.pending and self.pending.get("kind") in {"run", "adopt"} and typed:
+                    self._add_verify(typed)
+                    self.composer = ""
+                    self._refresh_confirm_body()
+                    return
+                self._commit_confirm()
+                return
+            if key == "backspace":
+                self.composer = self.composer[:-1]
+                return
+            if len(key) == 1 and key.isprintable() and len(self.composer) < MAX_GOAL_CHARS:
+                self.composer += key
+
+    def _submit_slash(self) -> None:
+        overlay = self.overlay
+        composer = self.composer
+        self.overlay = None
+        self.composer = ""
+        if overlay and overlay.items:
+            chosen = overlay.items[min(overlay.selected, len(overlay.items) - 1)]
+            kind = "quit" if chosen.key in {"/quit", "/exit"} else chosen.key[1:]
+            argument = None
+            if is_slash_composer(composer) and composer.strip() not in {"/", chosen.key}:
+                parsed = route_input(composer, self._has_active())
+                if parsed.kind == kind:
+                    argument = parsed.argument
+            mutates = bool(chosen.payload.get("mutates"))
+            self._dispatch(Intent(kind, argument, mutates))
+            return
+        self._dispatch(route_input(composer, self._has_active()))
+
+    def _submit(self) -> None:
+        if self.awaiting == "run_goal":
+            goal = self.composer.strip()
+            self.composer = ""
+            self.awaiting = None
+            if goal:
+                self._open_run_confirm(goal)
+            return
+        if self.awaiting == "steer":
+            instruction = self.composer.strip()
+            self.composer = ""
+            self.awaiting = None
+            if instruction:
+                self._dispatch(Intent("steer", instruction, True))
+            return
+        text = self.composer
+        if not text.strip():
+            run = self._selected_run()
+            if run is not None:
+                self.view = "status"
+                self.content = self._safe_view("status", run)
+                self.scroll = 0
+            return
+        self.composer = ""
+        self._dispatch(route_input(text, self._has_active()))
+
+    def _dispatch(self, intent: Intent) -> None:
+        if intent.kind == "noop":
+            return
+        if intent.kind == "quit":
+            self.quit = True
+            return
+        if intent.kind == "error":
+            self.message = intent.argument or "Unknown command"
+            return
+        if intent.kind in {"palette", "help"}:
+            self.view = "help"
+            self.content = HELP_TEXT
+            self.scroll = 0
+            return
+        if intent.kind == "multi":
+            self.view = "dashboard"
+            self.content = None
+            self.scroll = 0
+            return
+        if intent.kind == "run":
+            if intent.argument:
+                self._open_run_confirm(intent.argument)
+            else:
+                self.awaiting = "run_goal"
+                self.message = "Type the overall goal, then Enter."
+            return
+        if intent.kind == "adopt":
+            if intent.argument:
+                self._open_adopt_confirm(intent.argument, None)
+            else:
+                self._open_adopt_picker()
+            return
+        if intent.kind == "models":
+            self.view = "models"
+            self.content = self._models_view()
+            self.scroll = 0
+            return
+        if intent.kind == "doctor":
+            self.view = "doctor"
+            repo = (self._selected_run().repo if self._selected_run() is not None else self.repo) or Path.cwd()
+            self.content = self._doctor_view(Path(repo))
+            self.scroll = 0
+            return
+        if intent.kind == "steer":
+            self._open_steer_confirm(intent.argument)
+            return
+        if intent.kind in VIEW_COMMANDS:
+            run = self._selected_run()
+            if run is None:
+                self.message = "No run selected. Use /run or enter a natural-language goal."
+                return
+            self.view = intent.kind
+            self.content = self._safe_view(intent.kind, run)
+            self.scroll = 0
+            return
+        if intent.kind == "report":
+            run = self._selected_run()
+            if run is None:
+                self.message = "No run selected. Use /run or enter a natural-language goal."
+                return
+            self.pending = {"kind": "report", "run": run}
+            self.overlay = Overlay(
+                kind="confirm",
+                title="WRITE REPORT",
+                body="Write a durable report from trusted state and verification evidence?",
+            )
+            return
+        if intent.kind == "stop":
+            run = self._selected_run()
+            if run is None:
+                self.message = "No run selected. Use /run or enter a natural-language goal."
+                return
+            self.pending = {"kind": "stop", "run": run}
+            self.overlay = Overlay(
+                kind="confirm",
+                title="STOP RUN",
+                body=f"Stop {run.state.get('run_id', run)} and preserve its exact thread/state?",
+            )
+            return
+        if intent.kind == "resume":
+            run = self._selected_run()
+            if run is None:
+                self.message = "No run selected. Use /run or enter a natural-language goal."
+                return
+            self.pending = {"kind": "resume", "run": run}
+            self.overlay = Overlay(
+                kind="confirm",
+                title="RESUME RUN",
+                body=f"Resume exact thread {run.thread_id or '(not captured)'} in its repo-specific user service?\nThis starts a writer only after no interactive Codex process is using the workspace.",
+            )
+            return
+        self.message = f"Unknown command: {intent.kind}"
+
+    def _safe_view(self, view: str, run: Any) -> str:
+        try:
+            return _CursesApp._view_content(view, run)
+        except Exception as exc:
+            return f"{view.upper()} unavailable: {type(exc).__name__}"
+
+    def _models_view(self) -> str:
+        try:
+            models = self.hooks.list_models() if self.hooks.list_models else list_models()
+        except RuntimeError as exc:
+            return f"MODELS\n{exc}"
+        return "MODELS · live installed Codex catalog\n" + "\n".join(
+            f"{item['slug']:<24} default={item['default_reasoning_level']} · {','.join(item['supported_reasoning_levels'])}"
+            for item in models
+        )
+
+    def _doctor_view(self, repo: Path) -> str:
+        report = self.hooks.doctor(repo) if self.hooks.doctor else doctor_snapshot(repo)
+        lines = [
+            f"Nightwatch doctor: {report['status']}",
+            f"Codex: {report.get('codex_version') or '(missing)'}",
+            f"Auth: {report['auth']['status']}",
+            f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})",
+        ]
+        if report["quota"].get("primary"):
+            lines.append(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
+        if report["quota"].get("secondary"):
+            lines.append(f"weekly: {report['quota']['secondary'].get('used_percent')}% used, reset={report['quota']['secondary'].get('resets_at')}")
+        lines.append(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
+        return "\n".join(lines)
+
+    def _open_run_confirm(self, goal: str) -> None:
+        repo = Path(self.repo or Path.cwd())
+        exists_fn = self.hooks.run_exists
+        if exists_fn is None:
+            try:
+                exists = NightwatchStore(repo).exists()
+            except (OSError, StateIntegrityError, GitError):
+                exists = False
+        else:
+            exists = bool(exists_fn(repo))
+        self.pending = {"kind": "run", "goal": goal, "repo": repo, "verify": [], "model": None, "effort": None, "worktree": None}
+        self.composer = ""
+        if exists:
+            self.overlay = Overlay(
+                kind="confirm",
+                mode="worktree",
+                title="WORKTREE REQUIRED",
+                body="This workspace already has a run. Type an isolated worktree label, then Enter.\nNightwatch will not start a second writer in the same working directory.",
+            )
+            return
+        self._show_run_preview()
+
+    def _show_run_preview(self) -> None:
+        pending = self.pending or {}
+        repo = Path(pending.get("repo") or self.repo or Path.cwd())
+        label = pending.get("worktree")
+        target = repo.parent / ".worktrees" / repo.name / label if label else repo
+        checks = pending.get("verify") or []
+        verify_text = "\n             ".join(checks) if checks else "none (cannot reach trusted DONE)"
+        self.overlay = Overlay(
+            kind="confirm",
+            mode="run",
+            title="CONFIRM RUN",
+            body="\n".join([
+                "NEW SUPERVISED RUN",
+                f"Goal        {pending.get('goal')}",
+                f"Workspace   {target}",
+                f"Isolation   {'new worktree from committed HEAD' if label else 'current workspace'}",
+                "Model       Codex default",
+                "Reasoning   Codex default",
+                f"Verification {verify_text}",
+                "Service      repo-specific systemd user unit",
+                "Type a verify command and Enter to add it; empty Enter confirms.",
+            ]),
+        )
+
+    def _open_adopt_picker(self) -> None:
+        repo = Path(self.repo or Path.cwd())
+        discover = self.hooks.discover_sessions or list_adoptable_sessions
+        try:
+            sessions = discover(repo)
+        except Exception as exc:
+            sessions = []
+            self.message = f"Could not list Codex sessions: {type(exc).__name__}"
+        items: list[OverlayItem] = []
+        unbound: list[dict[str, Any]] = []
+        for session in sessions:
+            if session.get("thread_source") == "subagent":
+                continue
+            if not session.get("thread_id"):
+                unbound.append(session)
+                continue
+            title = str(session.get("title") or "")[:60]
+            proof = "live" if session.get("live") else "recent"
+            pid = f"PID {session['pid']}" if session.get("pid") else proof
+            items.append(
+                OverlayItem(
+                    str(session["thread_id"]),
+                    title or proof,
+                    pid,
+                    session,
+                )
+            )
+        live_note = ""
+        if unbound:
+            live_note = "LIVE CODEX WITHOUT PROVEN THREAD\n" + "\n".join(
+                f"PID {item.get('pid')} · {item.get('title')}" for item in unbound
+            ) + "\nPick a conversation below or type the exact thread ID.\n\n"
+        body = live_note + (
+            "↑/↓ select · Enter adopts · type an exact thread ID as fallback"
+            if items
+            else "No adoptable conversations. Type an exact thread ID."
+        )
+        self.overlay = Overlay(kind="picker", title="ADOPT CODEX SESSION", body=body, items=items)
+        self.composer = ""
+
+    def _open_adopt_confirm(self, thread: str, session: dict[str, Any] | None) -> None:
+        repo = Path(self.repo or Path.cwd())
+        goal = adopt_goal_text((session or {}).get("title"), thread)
+        self.pending = {
+            "kind": "adopt",
+            "thread": thread,
+            "goal": goal,
+            "repo": repo,
+            "verify": [],
+            "model": (session or {}).get("model"),
+            "session": session,
+        }
+        self.composer = ""
+        self._show_adopt_preview()
+
+    def _show_adopt_preview(self) -> None:
+        pending = self.pending or {}
+        checks = pending.get("verify") or []
+        verify_text = "\n             ".join(checks) if checks else "none (cannot reach trusted DONE)"
+        goal = str(pending.get("goal") or "")
+        if len(goal) > MAX_ADOPT_GOAL_DISPLAY:
+            goal = goal[: MAX_ADOPT_GOAL_DISPLAY - 1] + "…"
+        self.overlay = Overlay(
+            kind="confirm",
+            mode="adopt",
+            title="CONFIRM ADOPT",
+            body="\n".join([
+                "ADOPT EXACT THREAD",
+                f"Thread       {pending.get('thread')}",
+                f"Workspace    {pending.get('repo')}",
+                f"Goal         {goal}",
+                "Model        preserve Codex/default",
+                "Reasoning    preserve Codex/default",
+                f"Verification {verify_text}",
+                "Binds the thread only. Interactive Codex is not killed; /resume starts a writer after it exits.",
+                "Type a verify command and Enter to add it; empty Enter confirms.",
+            ]),
+        )
+
+    def _open_steer_confirm(self, instruction: str | None) -> None:
+        run = self._selected_run()
+        if run is None or not getattr(run, "active", False):
+            self.message = "No active run selected. Use /run or /adopt first."
+            return
+        if getattr(run, "terminal", False):
+            self.message = (
+                "Instruction was NOT queued because this Nightwatch run is terminal.\n"
+                "Use /resume or start a new supervised run before steering."
+            )
+            return
+        if not instruction:
+            self.awaiting = "steer"
+            self.message = "Type the instruction for the selected exact thread."
+            return
+        self.pending = {"kind": "steer", "instruction": instruction, "run": run}
+        self.overlay = Overlay(
+            kind="confirm",
+            title="CONFIRM STEER",
+            body=f"Queue to exact thread {run.thread_id}?\n\n{instruction}",
+        )
+
+    def _add_verify(self, command: str) -> None:
+        if self.pending is None:
+            return
+        checks = list(self.pending.get("verify") or [])
+        if len(checks) >= MAX_VERIFY_COMMANDS:
+            self.message = "Maximum verification commands reached."
+            return
+        try:
+            checks.append(validate_human_text(command, "verification command", MAX_INSTRUCTION_CHARS))
+        except ValueError as exc:
+            self.message = str(exc)
+            return
+        self.pending["verify"] = checks
+
+    def _refresh_confirm_body(self) -> None:
+        if not self.pending:
+            return
+        if self.pending.get("kind") == "run":
+            self._show_run_preview()
+        elif self.pending.get("kind") == "adopt":
+            self._show_adopt_preview()
+
+    def _commit_confirm(self) -> None:
+        pending = self.pending
+        self.overlay = None
+        self.pending = None
+        self.composer = ""
+        if not pending:
+            return
+        kind = pending.get("kind")
+        if kind == "run":
+            self.message = self._commit_run(pending)
+        elif kind == "adopt":
+            self.message = self._commit_adopt(pending)
+        elif kind == "steer":
+            fn = self.hooks.queue_steer or queue_steer
+            result = fn(pending["run"].store, pending["instruction"])
+            self.message = result.message
+        elif kind == "stop":
+            fn = self.hooks.stop or stop_run
+            result = fn(pending["run"].repo)
+            self.message = result.message
+        elif kind == "resume":
+            fn = self.hooks.resume or resume_service
+            result = fn(pending["run"].repo)
+            self.message = result.message
+        elif kind == "report":
+            self.message = self._commit_report(pending["run"])
+
+    def _commit_run(self, pending: dict[str, Any]) -> str:
+        repo = Path(pending["repo"])
+        label = pending.get("worktree")
+        try:
+            if label:
+                create = self.hooks.create_worktree or create_worktree
+                repo = create(repo, label)
+            spec = RunSpec(
+                repo,
+                pending["goal"],
+                pending.get("model"),
+                pending.get("effort"),
+                tuple(pending.get("verify") or ()),
+                service=True,
+            )
+            start = self.hooks.start_run or start_run
+            result = start(spec, run_in_service=True)
+            return result.message
+        except (ValueError, GitError, StateIntegrityError) as exc:
+            return f"Run not started: {exc}"
+
+    def _commit_adopt(self, pending: dict[str, Any]) -> str:
+        try:
+            spec = RunSpec(
+                Path(pending["repo"]),
+                adopt_goal_text(pending.get("goal"), pending.get("thread")),
+                pending.get("model") if isinstance(pending.get("model"), str) else None,
+                None,
+                tuple(pending.get("verify") or ()),
+                thread_id=str(pending["thread"]),
+                service=False,
+            )
+            adopt = self.hooks.adopt or adopt_run
+            result = adopt(spec)
+            return result.message
+        except (ValueError, GitError) as exc:
+            return f"Adoption invalid: {exc}"
+
+    def _commit_report(self, run: Any) -> str:
+        try:
+            if self.hooks.write_report:
+                path = self.hooks.write_report(run)
+            else:
+                path = run.store.write_report(build_report(run.store, run.store.load_state(), run.store.load_state().get("last_verification")))
+            return f"Report written: {path}"
+        except Exception as exc:
+            return f"Report not written: {type(exc).__name__}"
 
 
 @dataclass
@@ -238,13 +993,72 @@ def _agent_summary(state: dict[str, Any]) -> str:
     return str(state.get("state") or "IDLE")
 
 
+def agent_work_report(store: NightwatchStore) -> dict[str, Any]:
+    """Untrusted mailbox work report. Never mixed into trusted verified percent."""
+    empty = {"ok": False, "implemented": [], "working": [], "blocked": [], "percent": None, "untrusted": True}
+    try:
+        raw = read_mailbox_json(store, "progress.json")
+    except (ValueError, StateIntegrityError, OSError):
+        return empty
+    if not isinstance(raw, dict):
+        return empty
+
+    def _lines(key: str) -> list[str]:
+        value = raw.get(key)
+        if not isinstance(value, list):
+            return []
+        rows: list[str] = []
+        for item in value[:8]:
+            if isinstance(item, str) and item.strip():
+                rows.append(" ".join(item.split()))
+        return rows
+
+    implemented = _lines("implemented")
+    working = _lines("working")
+    blocked = _lines("blocked")
+    total = len(implemented) + len(working) + len(blocked)
+    percent = round(100 * len(implemented) / total, 1) if total else None
+    return {
+        "ok": True,
+        "implemented": implemented,
+        "working": working,
+        "blocked": blocked,
+        "percent": percent,
+        "untrusted": True,
+    }
+
+
+def _clip(text: str, width: int) -> str:
+    width = max(24, width)
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def format_agent_work(store: NightwatchStore, width: int = 100) -> list[str]:
+    report = agent_work_report(store)
+    if not report["ok"]:
+        return ["Work       (no agent mailbox progress yet)"]
+    percent = f"{report['percent']}%" if report["percent"] is not None else "n/a"
+    lines = [
+        f"Work       agent-reported {percent} of {len(report['implemented']) + len(report['working']) + len(report['blocked'])} items · UNTRUSTED",
+        f"           done {len(report['implemented'])} · doing {len(report['working'])} · blocked {len(report['blocked'])}",
+    ]
+    for label, rows in (("Done", report["implemented"][:3]), ("Now", report["working"][:3]), ("Left/blocked", report["blocked"][:3])):
+        if not rows:
+            continue
+        lines.append(f"  {label:<12} {_clip(rows[0], width - 16)}")
+        for extra in rows[1:]:
+            lines.append(f"               {_clip(extra, width - 16)}")
+    lines.append("Trusted    verified % only moves after frozen Nightwatch checks, not agent narrative")
+    return lines
+
+
 def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100, errors: list[str] | None = None) -> str:
     width = max(60, width)
     selected = min(max(0, selected), max(0, len(runs) - 1))
     error_header = f" · {len(errors)} trusted run failed integrity validation" if errors else ""
     lines = [
         f"Nightwatch {__version__} · MULTI-THREAD CONTROL",
-        f"Runs {len(runs)}{error_header} · ↑/↓ select · / commands · Esc quit",
+        f"Runs {len(runs)}{error_header} · ↑/↓ select · / commands · Esc cancel · /quit leaves",
         "─" * min(width, 120),
     ]
     if errors:
@@ -262,8 +1076,10 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
         thread = run.thread_id or "capturing…"
         model = state.get("model") or "Codex default"
         effort = state.get("reasoning_effort") or "default"
+        work = agent_work_report(run.store)
+        agent_pct = f"agent {work['percent']}%" if work.get("percent") is not None else "agent n/a"
         lines.append(f"{marker} {state['state']:<19} {run.repo.name:<22} {thread[:24]}")
-        lines.append(f"    {_bar(progress['verified_percent'])} {progress['verified_percent']:>5}%  {model} · {effort}  quota {_quota_line(state)}")
+        lines.append(f"    {_bar(progress['verified_percent'])} trusted {progress['verified_percent']:>5}% · {agent_pct}  {model} · {effort}  quota {_quota_line(state)}")
     if runs:
         run = runs[selected]
         state = run.state
@@ -277,9 +1093,9 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
             f"Current    {(current or {}).get('id', 'complete')} · {(current or {}).get('title', 'all trusted milestones verified')}",
             f"Last       {state.get('last_event') or '(none)'}",
             f"Next       {_next_action(state)}",
-            "Source: trusted state + sequence-validated events",
         ])
-    lines.append("Input › natural language starts a goal (or steers an active run); / opens command palette")
+        lines.extend(format_agent_work(run.store, width))
+        lines.append("Source: trusted state + sequence-validated events · agent work is untrusted mailbox")
     return terminal_safe("\n".join(lines))
 
 
@@ -297,7 +1113,7 @@ def status_run(run: RunRecord) -> str:
         f"Generation  {state.get('generation')} · recoveries {state.get('recoveries', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Quota       {_quota_line(state)} · authority {state.get('quota_source') or '(none)'}",
-        f"Progress    {_bar(progress['verified_percent'], 24)} {progress['verified_percent']}% verified",
+        f"Progress    {_bar(progress['verified_percent'], 24)} {progress['verified_percent']}% trusted verified",
         f"Milestones  {progress['implemented_count']}/{progress['total_count']} implemented · {progress['verified_count']}/{progress['total_count']} verified",
         f"Current     {(current or {}).get('id', 'complete')} · {(current or {}).get('title', 'all trusted milestones verified')}",
         f"Last        #{latest.get('seq', '?')} {latest.get('event') or state.get('last_event')} · {latest.get('reason') or '(no reason)'}",
@@ -305,6 +1121,7 @@ def status_run(run: RunRecord) -> str:
         f"Updated     {state.get('updated_at')}",
         "Provenance  trusted state + hash-bound policy + sequence-validated events",
     ]
+    lines.extend(format_agent_work(run.store, 100))
     if state.get("last_error") or state.get("blocker"):
         lines.append(f"Blocker     {state.get('last_error') or state.get('blocker')}")
     return terminal_safe("\n".join(lines))
@@ -420,32 +1237,35 @@ def _thread(run: RunRecord) -> str:
 def _quota(run: RunRecord) -> str:
     state = run.state
     quota = state.get("quota") or {}
-    lines = [f"QUOTA · authority={state.get('quota_source') or '(none)'}"]
+    lines = [f"QUOTA · last trusted sample authority={state.get('quota_source') or '(none)'}"]
     for key, label in (("primary", "5h"), ("secondary", "weekly")):
         window = quota.get(key) if isinstance(quota, dict) else None
         if isinstance(window, dict):
             lines.append(f"{label:<8} {window.get('used_percent')}% used · reset={window.get('resets_at')} · window={window.get('window_duration_mins')}m")
+    lines.append(f"Sampled at {quota.get('read_at') if isinstance(quota, dict) else None}")
+    try:
+        live = make_quota_provider().read()
+        primary = f"{live.primary.used_percent}%" if live.primary else "?"
+        weekly = f"{live.secondary.used_percent}%" if live.secondary else "?"
+        lines.append(f"Live now   5h {primary} · week {weekly} · {live.source}")
+    except Exception as exc:
+        lines.append(f"Live now   unavailable ({type(exc).__name__})")
     lines.append(f"Next resume {state.get('next_resume_at') or '(not waiting)'}")
+    lines.append("Dashboard quota is the last trusted sample; live refresh is this /quota view.")
     return terminal_safe("\n".join(lines))
 
 
 class _CursesApp:
     def __init__(self, screen, initial_repo: Path | None = None):
         self.screen = screen
-        self.initial_repo = initial_repo
         self.catalog = RunCatalog()
-        self.runs: list[RunRecord] = []
-        self.selected = 0
-        self.view = "multi"
-        self.content: str | None = None
-        self.message = "Type / to discover commands."
+        self.controller = TuiController(repo=initial_repo)
         self.previous_states: dict[str, str] = {}
-        self.scroll = 0
 
     def run(self) -> int:
         import curses
 
-        curses.curs_set(0)
+        curses.curs_set(1)
         self.screen.keypad(True)
         self.screen.timeout(1000)
         if curses.has_colors():
@@ -455,192 +1275,75 @@ class _CursesApp:
             curses.init_pair(2, curses.COLOR_GREEN, -1)
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_RED, -1)
-        while True:
+        while not self.controller.quit:
             self._refresh_runs()
             self._draw()
             try:
                 key = self.screen.get_wch()
             except curses.error:
                 continue
-            if key == curses.KEY_UP:
-                self.selected = max(0, self.selected - 1)
-                self.content = None
-                self.scroll = 0
-            elif key == curses.KEY_DOWN:
-                self.selected = min(max(0, len(self.runs) - 1), self.selected + 1)
-                self.content = None
-                self.scroll = 0
-            elif key in ("\n", "\r"):
-                if self.runs:
-                    self.view = "status"
-                    self.content = status_run(self.runs[self.selected])
-                    self.scroll = 0
-            elif key == curses.KEY_NPAGE:
-                self.scroll += max(1, self.screen.getmaxyx()[0] - 4)
-            elif key == curses.KEY_PPAGE:
-                self.scroll = max(0, self.scroll - max(1, self.screen.getmaxyx()[0] - 4))
-            elif key == "\x1b":
-                return 0
-            elif isinstance(key, str) and (key == "/" or key.isprintable()):
-                line = self._read_line(key)
-                if line is not None and self._handle(route_input(line, bool((_selected(self.runs, self.selected) or _NullRun()).active))):
-                    return 0
+            self.controller.handle_key(self._normalize(key))
+        return 0
+
+    @staticmethod
+    def _normalize(key: str | int) -> str:
+        import curses
+
+        if key in (curses.KEY_UP,):
+            return "up"
+        if key in (curses.KEY_DOWN,):
+            return "down"
+        if key in (curses.KEY_PPAGE,):
+            return "pageup"
+        if key in (curses.KEY_NPAGE,):
+            return "pagedown"
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            return "backspace"
+        if key in ("\n", "\r"):
+            return "enter"
+        if key == "\x1b":
+            return "esc"
+        if key == "\x03":
+            return "ctrl-c"
+        if isinstance(key, str):
+            return key
+        return ""
 
     def _refresh_runs(self) -> None:
         import curses
 
-        self.runs = self.catalog.discover()
-        self.selected = min(self.selected, max(0, len(self.runs) - 1))
-        current = {item.state["run_id"]: item.state["state"] for item in self.runs}
+        self.controller.runs = self.catalog.discover()
+        self.controller.catalog_errors = self.catalog.errors
+        self.controller.selected = min(self.controller.selected, max(0, len(self.controller.runs) - 1))
+        current = {item.state["run_id"]: item.state["state"] for item in self.controller.runs}
         terminal = {item.value for item in TERMINAL_STATES}
         for run_id, state_value in current.items():
             previous = self.previous_states.get(run_id)
             if previous and previous != state_value and state_value in terminal:
                 curses.beep()
-                self.message = f"{state_value}: {run_id} · use /recap or /report"
+                self.controller.message = f"{state_value}: {run_id} · use /recap or /report"
         self.previous_states = current
-        selected = _selected(self.runs, self.selected)
-        if selected and self.view in {"status", "plan", "logs", "timeline", "explain", "thread", "quota", "recap"}:
-            self.content = self._view_content(self.view, selected)
+        selected = _selected(self.controller.runs, self.controller.selected)
+        if selected and self.controller.view in VIEW_COMMANDS and self.controller.overlay is None:
+            self.controller.content = self._view_content(self.controller.view, selected)
 
     def _draw(self) -> None:
         height, width = self.screen.getmaxyx()
-        body = self.content if self.content is not None else render_dashboard(self.runs, self.selected, width, errors=self.catalog.errors)
-        lines = []
-        for source_line in body.splitlines():
-            safe_line = terminal_safe(source_line)
-            lines.extend(textwrap.wrap(safe_line, max(20, width - 1), replace_whitespace=False, drop_whitespace=False) or [""])
+        body = self.controller.render(width, height)
         self.screen.erase()
-        visible = lines[self.scroll : self.scroll + max(0, height - 2)]
-        for row, line in enumerate(visible):
+        for row, line in enumerate(body.splitlines()[: max(0, height)]):
             try:
-                self.screen.addnstr(row, 0, line, max(1, width - 1))
+                self.screen.addnstr(row, 0, terminal_safe(line), max(1, width - 1))
             except Exception:
                 pass
         try:
-            self.screen.addnstr(max(0, height - 2), 0, "─" * max(1, width - 1), max(1, width - 1))
-            footer = f"{self.message} · PgUp/PgDn scroll"
-            self.screen.addnstr(max(0, height - 1), 0, footer, max(1, width - 1))
+            cursor_row = max(0, height - 1)
+            prefix = "Input › "
+            cursor_col = min(width - 2, len(prefix) + len(self.controller.composer))
+            self.screen.move(cursor_row, max(0, cursor_col))
         except Exception:
             pass
         self.screen.refresh()
-
-    def _read_line(self, initial: str) -> str | None:
-        import curses
-
-        value = initial
-        while True:
-            height, width = self.screen.getmaxyx()
-            self.screen.move(max(0, height - 1), 0)
-            self.screen.clrtoeol()
-            self.screen.addnstr(max(0, height - 1), 0, f"› {value}", max(1, width - 1))
-            if value.startswith("/"):
-                matches = slash_commands(palette_prefix(value))
-                for offset, command in enumerate(matches[: min(8, max(0, height - 3))], start=2):
-                    row = height - offset
-                    self.screen.move(row, 0)
-                    self.screen.clrtoeol()
-                    self.screen.addnstr(row, 0, f"{command.name:<12} {command.summary}", max(1, width - 1))
-            self.screen.refresh()
-            try:
-                key = self.screen.get_wch()
-            except curses.error:
-                continue
-            if key in ("\n", "\r"):
-                return value
-            if key == "\x1b":
-                return None
-            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                value = value[:-1]
-            elif isinstance(key, str) and key.isprintable() and len(value) < MAX_GOAL_CHARS:
-                value += key
-
-    def _prompt(self, label: str, default: str = "") -> str | None:
-        initial = default
-        self.message = f"{label} (Esc cancels)"
-        value = self._read_line(initial)
-        self.message = "Type / to discover commands."
-        return value
-
-    def _confirm(self, preview: str) -> bool:
-        import curses
-
-        self.content = preview + "\n\nEnter confirms · Esc cancels"
-        self.scroll = 0
-        self._draw()
-        while True:
-            try:
-                key = self.screen.get_wch()
-            except curses.error:
-                continue
-            if key in ("\n", "\r", "\x1b"):
-                self.content = None
-                return key in ("\n", "\r")
-
-    def _handle(self, intent: Intent) -> bool:
-        run = _selected(self.runs, self.selected)
-        if intent.kind == "quit":
-            return True
-        if intent.kind in {"palette", "help"}:
-            self.view = "static"
-            self.content = "COMMAND PALETTE\n" + "\n".join(f"{item.name:<12} {item.summary}\n             {item.usage}" for item in COMMANDS)
-            return False
-        if intent.kind == "error":
-            self.message = intent.argument or "Unknown command"
-            return False
-        if intent.kind == "multi":
-            self.view = "multi"
-            self.content = None
-            self.scroll = 0
-            return False
-        if intent.kind == "run":
-            self._run_wizard(intent.argument)
-            return False
-        if intent.kind == "adopt":
-            self._adopt_wizard(intent.argument)
-            return False
-        if intent.kind == "models":
-            self.view = "static"
-            self.content = self._models_view()
-            self.scroll = 0
-            return False
-        if intent.kind == "doctor":
-            self.view = "static"
-            self.content = self._doctor_view((run.repo if run else self.initial_repo) or Path.cwd())
-            self.scroll = 0
-            return False
-        if run is None:
-            self.message = "No run selected. Use /run or enter a natural-language goal."
-            return False
-        if intent.kind in {"status", "plan", "timeline", "explain", "thread", "quota", "recap", "logs"}:
-            self.view = intent.kind
-            self.content = self._view_content(intent.kind, run)
-        elif intent.kind == "report":
-            if self._confirm("Write a durable report from trusted state and verification evidence?"):
-                path = run.store.write_report(build_report(run.store, run.store.load_state(), run.store.load_state().get("last_verification")))
-                self.message = f"Report written: {path}"
-        elif intent.kind == "steer":
-            if run.terminal:
-                self.message = (
-                    "Instruction was NOT queued because this Nightwatch run is terminal.\n"
-                    "Use /resume or start a new supervised run before steering."
-                )
-                self.scroll = 0
-                return False
-            instruction = intent.argument or self._prompt("Instruction for the selected exact thread")
-            if instruction and self._confirm(f"Queue to exact thread {run.thread_id}?\n\n{instruction}"):
-                result = queue_steer(run.store, instruction)
-                self.message = result.message
-        elif intent.kind == "stop":
-            if self._confirm(f"Stop {run.state['run_id']} and preserve its exact thread/state?"):
-                result = stop_run(run.repo)
-                self.message = result.message
-        elif intent.kind == "resume":
-            if self._confirm(f"Resume exact thread {run.thread_id or '(not captured)'} in its repo-specific user service?"):
-                result = resume_service(run.repo)
-                self.message = result.message
-        self.scroll = 0
-        return False
 
     @staticmethod
     def _view_content(view: str, run: RunRecord) -> str:
@@ -662,164 +1365,6 @@ class _CursesApp:
             return "SUPERVISOR LOG\n" + _safe_tail(run.store.log_path)
         except (OSError, StateIntegrityError):
             return "No safe supervisor log is available."
-
-    def _run_wizard(self, initial_goal: str | None) -> None:
-        goal = initial_goal or self._prompt("Overall goal")
-        if not goal:
-            return
-        default_repo = str(self.initial_repo or Path.cwd())
-        repo_text = self._prompt("Git repository or existing worktree", default_repo)
-        if not repo_text:
-            return
-        try:
-            root = repo_root(Path(repo_text).expanduser())
-            existing = NightwatchStore(root).exists()
-        except (GitError, StateIntegrityError) as exc:
-            self.message = f"Repository unavailable: {type(exc).__name__}"
-            return
-        worktree_label = None
-        if existing:
-            worktree_label = self._prompt("This workspace already has a run; new isolated worktree label")
-            if not worktree_label:
-                self.message = "A second writer cannot use the same workspace; run cancelled."
-                return
-        model = self._prompt("Model (blank = Codex default)")
-        effort = self._prompt("Reasoning level (blank = Codex default)")
-        checks: list[str] = []
-        while len(checks) < MAX_VERIFY_COMMANDS:
-            command = self._prompt("Frozen verification command (blank finishes)")
-            if not command:
-                break
-            checks.append(command)
-        target = root.parent / ".worktrees" / root.name / worktree_label if worktree_label else root
-        preview = "\n".join([
-            "NEW SUPERVISED RUN",
-            f"Goal        {goal}",
-            f"Workspace   {target}",
-            f"Isolation   {'new worktree from committed HEAD' if worktree_label else 'current workspace'}",
-            f"Model       {model or 'Codex default'}",
-            f"Reasoning   {effort or 'Codex default'}",
-            "Verification " + ("\n             ".join(checks) if checks else "none (cannot reach trusted DONE)"),
-            "Service      repo-specific systemd user unit",
-        ])
-        if not self._confirm(preview):
-            return
-        try:
-            # Validate every user-controlled value before creating a worktree.
-            spec = RunSpec(target, goal, model or None, effort or None, tuple(checks), service=True)
-            if worktree_label:
-                created = create_worktree(root, worktree_label)
-                if created != spec.repo:
-                    raise StateIntegrityError("created worktree does not match the confirmed target")
-            root = spec.repo
-            self.message = self._start_spec(spec)
-            self.initial_repo = root
-        except (ValueError, GitError, StateIntegrityError) as exc:
-            self.message = f"Run not started: {exc}"
-
-    def _adopt_wizard(self, initial_thread: str | None) -> None:
-        repo_text = self._prompt("Git repository/worktree", str(self.initial_repo or Path.cwd()))
-        if not repo_text:
-            return
-        try:
-            root = repo_root(Path(repo_text).expanduser())
-        except GitError as exc:
-            self.message = f"Adoption invalid: {exc}"
-            return
-        sessions = find_proven_codex_sessions(root) if not initial_thread else []
-        selected_session: dict[str, Any] | None = None
-        thread = initial_thread
-        if not thread and sessions:
-            self.content = "ACTIVE CODEX SESSIONS · proven by PID + rollout + repository\n" + "\n".join(
-                f"{index}. {item.get('thread_id')} · PID {item.get('pid')} · {item.get('model') or '(model unknown)'} · {str(item.get('title') or '')[:60]}"
-                for index, item in enumerate(sessions, start=1)
-            )
-            choice = self._prompt("Session number or exact thread ID")
-            self.content = None
-            if choice and choice.isdigit() and 1 <= int(choice) <= len(sessions):
-                selected_session = sessions[int(choice) - 1]
-                thread = str(selected_session["thread_id"])
-            else:
-                thread = choice
-        if not thread:
-            recent_threads = find_active_threads_for_repo(root)
-            if recent_threads:
-                self.content = "RECENT CODEX CONVERSATIONS · from local repository history\n" + "\n".join(
-                    f"{index}. {item.get('id')} · {item.get('model') or 'default'} · {str(item.get('title') or item.get('first_user_message') or '(no title)')[:60]}"
-                    for index, item in enumerate(recent_threads, start=1)
-                )
-                choice = self._prompt("Conversation number or exact thread ID")
-                self.content = None
-                if choice and choice.isdigit() and 1 <= int(choice) <= len(recent_threads):
-                    selected_session = recent_threads[int(choice) - 1]
-                    thread = str(selected_session["id"])
-                else:
-                    thread = choice
-        if not thread:
-            thread = self._prompt("No proven active session found; enter exact thread ID")
-        default_goal = str((selected_session or {}).get("title") or "Supervise adopted conversation")
-        goal = self._prompt("Overall goal", default_goal)
-        if not thread or not goal:
-            return
-        model = self._prompt("Model (blank = preserve Codex/default)")
-        effort = self._prompt("Reasoning level (blank = preserve Codex/default)")
-        checks: list[str] = []
-        while len(checks) < MAX_VERIFY_COMMANDS:
-            command = self._prompt("Frozen verification command (blank finishes)")
-            if not command:
-                break
-            checks.append(command)
-        try:
-            spec = RunSpec(root, goal, model or None, effort or None, tuple(checks), thread_id=thread, service=True)
-        except (ValueError, GitError) as exc:
-            self.message = f"Adoption invalid: {exc}"
-            return
-        preview = "\n".join([
-            "ADOPT EXACT THREAD",
-            f"Thread       {thread}",
-            f"Workspace    {root}",
-            f"Goal         {goal}",
-            f"Model        {model or 'preserve Codex/default'}",
-            f"Reasoning    {effort or 'preserve Codex/default'}",
-            "Verification " + ("\n             ".join(checks) if checks else "none (cannot reach trusted DONE)"),
-        ])
-        if self._confirm(preview):
-            self.message = self._start_spec(spec)
-
-    @staticmethod
-    def _start_spec(spec: RunSpec) -> str:
-        result = start_run(spec, run_in_service=spec.service)
-        return result.message
-
-    @staticmethod
-    def _models_view() -> str:
-        try:
-            models = list_models()
-        except RuntimeError as exc:
-            return f"MODELS\n{exc}"
-        return "MODELS · live installed Codex catalog\n" + "\n".join(
-            f"{item['slug']:<24} default={item['default_reasoning_level']} · {','.join(item['supported_reasoning_levels'])}" for item in models
-        )
-
-    @staticmethod
-    def _doctor_view(repo: Path) -> str:
-        report = doctor_snapshot(repo)
-        lines = [
-            f"Nightwatch doctor: {report['status']}",
-            f"Codex: {report.get('codex_version') or '(missing)'}",
-            f"Auth: {report['auth']['status']}",
-            f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})",
-        ]
-        if report["quota"].get("primary"):
-            lines.append(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
-        if report["quota"].get("secondary"):
-            lines.append(f"weekly: {report['quota']['secondary'].get('used_percent')}% used, reset={report['quota']['secondary'].get('resets_at')}")
-        lines.append(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
-        return "\n".join(lines)
-
-
-class _NullRun:
-    active = False
 
 
 def run_tui(initial_repo: str | Path | None = None) -> int:

@@ -203,8 +203,7 @@ def find_proven_codex_sessions(
         if not fd_dir.exists():
             continue
 
-        proven_rollout: Path | None = None
-        proven_meta: dict[str, Any] | None = None
+        matches: list[tuple[Path, dict[str, Any]]] = []
 
         try:
             fd_names = os.listdir(str(fd_dir))
@@ -217,14 +216,14 @@ def find_proven_codex_sessions(
                 if "rollout-" in target_link and target_link.endswith(".jsonl"):
                     meta = extract_rollout_meta(target_link)
                     if meta and meta.get("thread_id") and meta.get("cwd") == str(target_repo):
-                        proven_rollout = Path(target_link)
-                        proven_meta = meta
-                        break
+                        matches.append((Path(target_link), meta))
             except OSError:
                 continue
 
-        if not proven_rollout or not proven_meta:
+        if not matches:
             continue
+        preferred = [item for item in matches if item[1].get("thread_source") == "user"]
+        proven_rollout, proven_meta = (preferred or matches)[0]
 
         if not process_matches(ident_start):
             continue
@@ -248,6 +247,72 @@ def find_proven_codex_sessions(
         })
 
     return proven_sessions
+
+
+def list_adoptable_sessions(
+    repo: str | Path,
+    codex_home: str | Path | None = None,
+    include_subagents: bool = False,
+) -> list[dict[str, Any]]:
+    """List live and recent Codex sessions for adoption.
+
+    Live processes are included when their cwd matches the repository, even if a
+    rollout JSONL file descriptor cannot be proven. Subagent threads stay hidden
+    unless explicitly requested.
+    """
+    target_repo = Path(repo).resolve()
+    proven = find_proven_codex_sessions(target_repo, codex_home=codex_home)
+    processes = find_repo_codex_processes(target_repo)
+    sqlite_threads = find_active_threads_for_repo(target_repo, codex_home)
+    items: list[dict[str, Any]] = []
+    seen_threads: set[str] = set()
+    proven_pids: set[int] = set()
+
+    for session in proven:
+        thread_id = session.get("thread_id")
+        proven_pids.add(session["pid"])
+        if session.get("thread_source") == "subagent" and not include_subagents:
+            continue
+        items.append({**session, "kind": "live", "live": True, "proof": "pid_rollout"})
+        if isinstance(thread_id, str):
+            seen_threads.add(thread_id)
+
+    for proc in processes:
+        if proc["pid"] in proven_pids:
+            continue
+        items.append({
+            "kind": "live",
+            "live": True,
+            "proof": "pid_cwd",
+            "pid": proc["pid"],
+            "executable": proc.get("executable"),
+            "cmdline": proc.get("cmdline"),
+            "thread_id": None,
+            "title": "Interactive Codex (thread not proven from rollout)",
+            "thread_source": "user",
+        })
+
+    for thread in sqlite_threads:
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or thread_id in seen_threads:
+            continue
+        if thread.get("thread_source") == "subagent" and not include_subagents:
+            continue
+        items.append({
+            "kind": "recent",
+            "live": False,
+            "proof": "sqlite",
+            "pid": None,
+            "thread_id": thread_id,
+            "title": thread.get("title") or thread.get("first_user_message"),
+            "model": thread.get("model"),
+            "branch": thread.get("git_branch"),
+            "rollout_path": thread.get("rollout_path"),
+            "thread_source": thread.get("thread_source"),
+            "sqlite_thread": thread,
+        })
+        seen_threads.add(thread_id)
+    return items
 
 
 def start_prompt(store: NightwatchStore, goal: str) -> str:

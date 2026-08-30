@@ -27,7 +27,7 @@ from .storage import (
     redact,
     repo_identity,
 )
-from .supervisor import Supervisor
+from .supervisor import Supervisor, find_repo_codex_processes
 
 MAX_GOAL_CHARS = 4_000
 MAX_INSTRUCTION_CHARS = 4_000
@@ -109,6 +109,11 @@ def service_text(service_root: Path) -> str:
     return "# nightwatch-install\n" + rendered
 
 
+def launcher_is_reusable(text: str) -> bool:
+    """Keep an existing nightwatch launcher: install.sh marker or pip console script."""
+    return "nightwatch-install:" in text or "from nightwatch.cli import main" in text
+
+
 def validate_install_targets(service_root: Path | None = None) -> None:
     launcher, service = install_paths(service_root)
     if launcher.exists() or launcher.is_symlink():
@@ -116,7 +121,7 @@ def validate_install_targets(service_root: Path | None = None) -> None:
             existing = launcher.read_text(encoding="utf-8")
         except OSError:
             existing = ""
-        if "nightwatch-install:" not in existing:
+        if not launcher_is_reusable(existing):
             raise SystemExit(f"nightwatch: refusing to overwrite existing {launcher}")
     if service_root is None or not service.exists():
         return
@@ -156,10 +161,20 @@ def install_user_files(service_root: Path | None = None) -> tuple[Path, Path | N
     source_root = Path(__file__).resolve().parents[1]
     launcher, service = install_paths(service_root)
     launcher_text = f"#!/bin/sh\n# nightwatch-install: {source_root}\nexec python3 {source_root / 'bin' / 'nightwatch'} \"$@\"\n"
-    backup_marked_install(launcher)
-    atomic_write(launcher, launcher_text, 0o755)
+    existing_launcher = ""
+    if launcher.exists() or launcher.is_symlink():
+        existing_launcher = launcher.read_text(encoding="utf-8", errors="replace")
+    if existing_launcher and launcher_is_reusable(existing_launcher):
+        pass
+    else:
+        if existing_launcher:
+            backup_marked_install(launcher)
+        atomic_write(launcher, launcher_text, 0o755)
     if service_root is not None:
-        backup_marked_install(service)
+        if service.exists() and "nightwatch-install" in service.read_text(encoding="utf-8", errors="replace"):
+            backup_marked_install(service)
+        elif service.exists():
+            raise SystemExit(f"nightwatch: refusing to overwrite existing {service}")
         atomic_write(service, service_text(service_root), 0o600)
         return launcher, service
     return launcher, None
@@ -190,6 +205,10 @@ def start_user_service(service_unit_name: str = "nightwatch.service") -> None:
 
 def resume_service(repo: Path) -> ActionResult:
     root = repo_root(repo)
+    live = find_repo_codex_processes(root)
+    if live:
+        pids = ", ".join(str(item["pid"]) for item in live)
+        return ActionResult(False, f"Interactive Codex still running (PID {pids}); close it before /resume")
     try:
         validate_install_targets(root)
         _launcher, service = install_user_files(root)
@@ -198,6 +217,27 @@ def resume_service(repo: Path) -> ActionResult:
         return ActionResult(True, f"Resume service started: {service.name if service else name}")
     except (RuntimeError, SystemExit, OSError) as exc:
         return ActionResult(False, f"Resume service was not started: {exc}")
+
+
+def adopt_run(spec: RunSpec) -> ActionResult:
+    bound = RunSpec(
+        spec.repo,
+        spec.goal,
+        spec.model,
+        spec.reasoning_effort,
+        spec.verify_commands,
+        spec.thread_id,
+        service=False,
+    )
+    result = start_run(bound, run_in_service=False)
+    if not result.ok:
+        return result
+    live = find_repo_codex_processes(bound.repo)
+    suffix = " Use /resume to start unattended supervision."
+    if live:
+        pids = ", ".join(str(item["pid"]) for item in live)
+        suffix = f" Interactive Codex still running (PID {pids}); /resume after it exits."
+    return ActionResult(True, f"Adopted thread {bound.thread_id} as NEW.{suffix}")
 
 
 def stop_run(repo: Path) -> ActionResult:
