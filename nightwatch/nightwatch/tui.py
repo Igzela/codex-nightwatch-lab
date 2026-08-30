@@ -27,7 +27,7 @@ from .operations import (
     validate_human_text,
 )
 from .storage import MAX_EVENT_BYTES, NightwatchStore, StateIntegrityError, control_plane_root
-from .supervisor import build_report, find_proven_codex_sessions, pid_alive, process_matches
+from .supervisor import build_report, find_active_threads_for_repo, find_proven_codex_sessions, pid_alive, process_matches
 
 _validate_human_text = validate_human_text
 
@@ -742,6 +742,20 @@ class _CursesApp:
             else:
                 thread = choice
         if not thread:
+            recent_threads = find_active_threads_for_repo(root)
+            if recent_threads:
+                self.content = "RECENT CODEX CONVERSATIONS · from local repository history\n" + "\n".join(
+                    f"{index}. {item.get('id')} · {item.get('model') or 'default'} · {str(item.get('title') or item.get('first_user_message') or '(no title)')[:60]}"
+                    for index, item in enumerate(recent_threads, start=1)
+                )
+                choice = self._prompt("Conversation number or exact thread ID")
+                self.content = None
+                if choice and choice.isdigit() and 1 <= int(choice) <= len(recent_threads):
+                    selected_session = recent_threads[int(choice) - 1]
+                    thread = str(selected_session["id"])
+                else:
+                    thread = choice
+        if not thread:
             thread = self._prompt("No proven active session found; enter exact thread ID")
         default_goal = str((selected_session or {}).get("title") or "Supervise adopted conversation")
         goal = self._prompt("Overall goal", default_goal)
@@ -820,4 +834,7 @@ def run_tui(initial_repo: str | Path | None = None) -> int:
             root = repo_root(initial_repo)
         except GitError:
             root = None
-    return int(curses.wrapper(lambda screen: _CursesApp(screen, root).run()))
+    try:
+        return int(curses.wrapper(lambda screen: _CursesApp(screen, root).run()))
+    except KeyboardInterrupt:
+        return 0
