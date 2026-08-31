@@ -113,23 +113,23 @@ cd /path/to/my-project
 nightwatch
 ```
 
-Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed.
+Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed. Empty-input hotkeys are `a` adopt, `r` run, `s` status, `d` dashboard, and `?` help; `/` opens the full command palette. Use `/run` or `/steer` explicitly when entering text that begins with a hotkey.
 
 ```text
 Nightwatch 0.3.1 · MULTI-THREAD CONTROL
-Runs 2 · ↑/↓ select · / commands · Esc quit
+Runs 2 · ↑/↓ select · a adopt · r run · s status · d dashboard · ? help · / commands
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
-    ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
+    ███████████░░░░░░░ 61% trusted  · agent 42%  gpt-5.6-luna · high
   WAIT_QUOTA          inventory-import       01a050bd-82ae…
-    ███████░░░░░░░░░░░ 38%  gpt-5.6-luna · medium
+    ███████░░░░░░░░░░░ 38% trusted  · agent n/a  gpt-5.6-luna · medium
 
 Thread     01a050ac-1149… · generation 2
 Agent      RUNNING · PID 18234 · resume
 Next       continue current milestone
 Source: trusted state + sequence-validated events
 
-Input › natural language starts a goal (or steers an active run); / opens command palette
+Input › natural language starts a goal (or steers an active run); a/r/s/d/? are quick actions; / opens command palette
 ```
 
 Typing `/` opens the described command palette. Important views include `/status`, `/plan`, `/timeline`, `/explain`, `/thread`, `/quota`, `/logs`, `/recap`, and `/report`. Mutating commands such as `/run`, `/adopt`, `/steer`, `/resume`, and `/stop` show a confirmation preview first. `/adopt` labels each candidate as LIVE + PROVEN or RECENT HISTORY; a live process whose exact thread cannot be proven is shown separately, and manual thread entry is explicitly marked unproven. After adoption, the dashboard says `ADOPTED` until `/resume` starts supervision.
@@ -303,7 +303,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 147 tests
+Ran 155 tests
 OK
 ```
 

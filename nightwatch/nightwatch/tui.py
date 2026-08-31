@@ -32,6 +32,8 @@ from .milestones import read_mailbox_json
 from .quota import make_quota_provider
 from .storage import MAX_EVENT_BYTES, NightwatchStore, StateIntegrityError, control_plane_root
 from .supervisor import build_report, list_adoptable_sessions, pid_alive, process_matches
+from .theme import smooth_gauge
+from .views import render_dashboard_view, render_modal
 
 MAX_GOAL_CHARS = 4_000
 MAX_INSTRUCTION_CHARS = 4_000
@@ -88,9 +90,29 @@ COMMANDS = (
 
 COMMAND_ALIASES = {"new": "run", "exit": "quit"}
 VIEW_COMMANDS = {"status", "plan", "logs", "timeline", "explain", "thread", "quota", "recap"}
+
+
+@dataclass(frozen=True)
+class Intent:
+    kind: str
+    argument: str | None = None
+    requires_confirmation: bool = False
+
+HOTKEYS = {
+    "a": Intent("adopt", requires_confirmation=True),
+    "r": Intent("run", requires_confirmation=True),
+    "s": Intent("status"),
+    "d": Intent("dashboard"),
+    "?": Intent("help"),
+}
+
+
 HELP_TEXT = """COMMANDS AND KEYS
 Type / to open the command menu. Filter by typing; ↑/↓ select; Enter runs the highlighted command.
 Without / , text is a new goal or a steer to the selected active run. Mutating actions confirm first.
+
+Empty-input hotkeys: a adopt · r run · s status · d dashboard · ? help.
+To enter text beginning with a hotkey, use /run or /steer explicitly.
 
 Esc closes the command menu, then a picker/confirm card, then a view, then clears the input.
 Empty dashboard Esc does not quit. Leave with /quit, /exit, or Ctrl+C.
@@ -131,13 +153,6 @@ def slash_commands(prefix: str = "") -> list[SlashCommand]:
 def palette_prefix(value: str) -> str:
     parts = value.removeprefix("/").split(maxsplit=1)
     return parts[0] if parts else ""
-
-
-@dataclass(frozen=True)
-class Intent:
-    kind: str
-    argument: str | None = None
-    requires_confirmation: bool = False
 
 
 def route_input(text: str, has_active_run: bool) -> Intent:
@@ -218,7 +233,7 @@ class TuiController:
         self.content: str | None = None
         self.composer = ""
         self.overlay: Overlay | None = None
-        self.message = "Type / to discover commands."
+        self.message = "Hotkeys: a adopt · r run · s status · d dashboard · ? help · / commands"
         self.scroll = 0
         self.quit = False
         self.pending: dict[str, Any] | None = None
@@ -257,6 +272,9 @@ class TuiController:
         if key == "backspace":
             self.composer = self.composer[:-1]
             return
+        if key in HOTKEYS and not self.composer and self.awaiting is None:
+            self._dispatch(HOTKEYS[key])
+            return
         if len(key) == 1 and key.isprintable():
             if len(self.composer) < MAX_GOAL_CHARS:
                 self.composer += key
@@ -272,6 +290,9 @@ class TuiController:
             body = render_dashboard(self.runs, self.selected, width, errors=self.catalog_errors)
         lines: list[str] = []
         for source in (terminal_safe(body).splitlines() or [""]):
+            if any(glyph in source for glyph in "╭╮╰╯─│"):
+                lines.append(source)
+                continue
             lines.extend(
                 textwrap.wrap(source, max(20, width - 1), replace_whitespace=False, drop_whitespace=False) or [""]
             )
@@ -289,24 +310,16 @@ class TuiController:
         overlay = self.overlay
         if overlay is None:
             return []
-        out = [f"── {overlay.title} ──"[: width - 1]]
-        if overlay.body:
-            for line in overlay.body.splitlines() or [""]:
-                out.extend(
-                    textwrap.wrap(terminal_safe(line), max(20, width - 1), replace_whitespace=False, drop_whitespace=False)
-                    or [""]
-                )
-        if overlay.items:
-            limit = max(3, height - len(out) - 4)
-            start = 0
-            if overlay.selected >= start + limit:
-                start = overlay.selected - limit + 1
-            window = overlay.items[start : start + limit]
-            for index, item in enumerate(window, start=start):
-                mark = "▶" if index == overlay.selected else " "
-                detail = f"  {item.detail}" if item.detail else ""
-                out.append(f"{mark} {item.key:<12} {item.title}{detail}"[: width - 1])
-        return out
+        items = [(item.key, item.title, item.detail) for item in overlay.items]
+        modal = render_modal(
+            terminal_safe(overlay.title),
+            terminal_safe(overlay.body),
+            items,
+            selected=overlay.selected,
+            width=max(32, width - 1),
+            height=max(5, height - 4),
+        )
+        return terminal_safe(modal).splitlines()
 
     def _footer_message(self) -> str:
         overlay = self.overlay
@@ -514,7 +527,7 @@ class TuiController:
             self.content = HELP_TEXT
             self.scroll = 0
             return
-        if intent.kind == "multi":
+        if intent.kind in {"multi", "dashboard"}:
             self.view = "dashboard"
             self.content = None
             self.scroll = 0
@@ -960,8 +973,7 @@ class RunCatalog:
 
 
 def _bar(percent: float, width: int = 18) -> str:
-    filled = min(width, max(0, round(percent / 100 * width)))
-    return "█" * filled + "░" * (width - filled)
+    return smooth_gauge(percent, width)
 
 
 def _quota_line(state: dict[str, Any]) -> str:
@@ -1108,22 +1120,16 @@ def format_agent_work(store: NightwatchStore, width: int = 100) -> list[str]:
 
 
 def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100, errors: list[str] | None = None) -> str:
-    width = max(60, width)
+    width = max(40, width)
     selected = min(max(0, selected), max(0, len(runs) - 1))
-    error_header = f" · {len(errors)} trusted run failed integrity validation" if errors else ""
-    lines = [
-        f"Nightwatch {__version__} · MULTI-THREAD CONTROL",
-        f"Runs {len(runs)}{error_header} · ↑/↓ select · / commands · Esc cancel · /quit leaves",
-        "─" * min(width, 120),
-    ]
+    run_lines: list[str] = []
     if errors:
-        lines.append(f"⚠ TRUSTED STATE ERRORS: {len(errors)}")
+        run_lines.append(f"⚠ TRUSTED STATE ERRORS: {len(errors)}")
         for err in errors[:5]:
-            lines.append(f"  {err}")
-        lines.append("  Use explicit CLI/recovery inspection before touching that run.")
-        lines.append("─" * min(width, 120))
+            run_lines.append(f"  {err}")
+        run_lines.append("Use explicit CLI/recovery inspection before touching that run.")
     if not runs:
-        lines.extend(["No trusted runs discovered.", "Type a natural-language goal or /run to create one."])
+        run_lines.extend(["No trusted runs discovered.", "Press r or use /run to create one; press a to adopt an exact thread."])
     for index, run in enumerate(runs):
         state = run.state
         progress = plan_progress(run.plan)
@@ -1133,15 +1139,16 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
         effort = state.get("reasoning_effort") or "default"
         work = agent_work_report(run.store)
         agent_pct = f"agent {work['percent']}%" if work.get("percent") is not None else "agent n/a"
-        lines.append(f"{marker} {state['state']:<19} {run.repo.name:<22} {thread[:24]}")
-        lines.append(f"    {_bar(progress['verified_percent'])} trusted {progress['verified_percent']:>5}% · {agent_pct}  {model} · {effort}  quota {_quota_line(state)}")
+        run_lines.append(f"{marker} {state['state']:<9} {run.repo.name:<14} {thread[:20]}")
+        run_lines.append(f"  {_bar(progress['verified_percent'], width=10)} trusted {progress['verified_percent']:>5}% · {agent_pct}")
+        run_lines.append(f"  {model} · {effort} · quota {_quota_line(state)}")
+    detail_lines: list[str] = []
     if runs:
         run = runs[selected]
         state = run.state
         current = next((item for item in run.plan["milestones"] if item.get("status") != "verified"), None)
         thread_label = run.thread_id or ("First launch deferred — no Codex thread created yet" if state.get("state") == State.WAIT_QUOTA.value else "Creating/capturing exact thread")
-        lines.extend([
-            "─" * min(width, 120),
+        detail_lines.extend([
             f"Goal       {str(state.get('goal') or '')[: max(10, width - 12)]}",
             f"Repository {run.repo}",
             f"Branch     {getattr(run, 'branch', '(unknown)')}",
@@ -1152,9 +1159,24 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
             f"Last       {state.get('last_event') or '(none)'}",
             f"Next       {_next_action(state)}",
         ])
-        lines.extend(format_agent_work(run.store, width))
-        lines.append("Source: trusted state + sequence-validated events · agent work is untrusted mailbox")
-    return terminal_safe("\n".join(lines))
+        detail_lines.extend(format_agent_work(run.store, width))
+        detail_lines.append("Source: trusted state + sequence-validated events · agent work is untrusted mailbox")
+    else:
+        detail_lines.extend([
+            "No selected run.",
+            "Nightwatch will not guess among ambiguous conversations.",
+            "Use a to inspect adopt candidates or r to create a supervised run.",
+        ])
+    return terminal_safe(
+        render_dashboard_view(
+            __version__,
+            len(runs),
+            run_lines,
+            detail_lines,
+            integrity_errors=len(errors or []),
+            width=width,
+        )
+    )
 
 
 def status_run(run: RunRecord) -> str:
@@ -1339,6 +1361,8 @@ class _CursesApp:
             curses.init_pair(2, curses.COLOR_GREEN, -1)
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_RED, -1)
+            curses.init_pair(5, curses.COLOR_BLUE, -1)
+            curses.init_pair(6, curses.COLOR_WHITE, -1)
         while not self.controller.quit:
             self._refresh_runs()
             self._draw()

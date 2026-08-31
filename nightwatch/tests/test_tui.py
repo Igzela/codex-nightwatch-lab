@@ -41,6 +41,7 @@ from nightwatch.tui import (  # noqa: E402
     status_run,
     terminal_safe,
 )
+from nightwatch.views import render_dual_panel, render_modal  # noqa: E402
 
 
 def git_repo(root: Path) -> None:
@@ -53,6 +54,23 @@ def git_repo(root: Path) -> None:
 
 
 class TuiTests(unittest.TestCase):
+    def test_pure_views_adapt_panels_and_modals_to_terminal_space(self):
+        wide = render_dual_panel(["left"], ["right"], width=100)
+        self.assertEqual(wide.splitlines()[0].count("╭"), 2)
+        narrow = render_dual_panel(["left"], ["right"], width=80)
+        self.assertGreaterEqual(narrow.splitlines()[0].count("╭"), 1)
+        self.assertIn("SELECTED RUN", narrow)
+        modal = render_modal(
+            "ADOPT",
+            "Choose an exact thread.",
+            [("T1", "first", "LIVE + PROVEN"), ("T2", "second", "RECENT HISTORY")],
+            selected=1,
+            width=48,
+            height=8,
+        )
+        self.assertIn("▶ T2", modal)
+        self.assertIn("RECENT HISTORY", modal)
+
     def test_slash_palette_is_discoverable_and_described(self):
         commands = slash_commands()
         names = {item.name for item in commands}
@@ -476,6 +494,39 @@ def _type(ui: TuiController, text: str) -> None:
 
 
 class TuiControllerTests(unittest.TestCase):
+    def test_empty_input_hotkeys_open_help_dashboard_and_run_prompt(self):
+        ui = TuiController()
+        ui.handle_key("?")
+        self.assertEqual(ui.view, "help")
+        self.assertIn("Empty-input hotkeys", ui.content or "")
+        ui.handle_key("d")
+        self.assertEqual(ui.view, "dashboard")
+        self.assertIsNone(ui.content)
+        ui.handle_key("r")
+        self.assertEqual(ui.awaiting, "run_goal")
+
+    def test_status_hotkey_uses_selected_run_without_creating_input(self):
+        ui = TuiController(runs=[_fake_run()])
+        ui.handle_key("s")
+        self.assertEqual(ui.view, "status")
+        self.assertEqual(ui.composer, "")
+
+    def test_adopt_hotkey_opens_exact_thread_picker(self):
+        ui = TuiController(
+            repo=Path("/tmp/nightwatch-adopt-hotkey"),
+            hooks=TuiHooks(
+                discover_sessions=lambda _repo: [{
+                    "thread_id": "THREAD-HOTKEY",
+                    "title": "recent goal",
+                    "live": False,
+                    "proof": "history",
+                }],
+            ),
+        )
+        ui.handle_key("a")
+        self.assertEqual(ui.overlay.kind, "picker")
+        self.assertEqual(ui.overlay.items[0].key, "THREAD-HOTKEY")
+
     def test_slash_opens_full_command_menu(self):
         ui = TuiController()
         ui.handle_key("/")

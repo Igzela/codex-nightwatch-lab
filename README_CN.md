@@ -113,23 +113,23 @@ cd /path/to/my-project
 nightwatch
 ```
 
-未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
+未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。空输入时可用快捷键 `a` 收养、`r` 新建、`s` 状态、`d` 返回 Dashboard、`?` 帮助；`/` 打开完整命令面板。如果输入内容以快捷键开头，请明确使用 `/run` 或 `/steer`。
 
 ```text
 Nightwatch 0.3.1 · MULTI-THREAD CONTROL
-Runs 2 · ↑/↓ select · / commands · Esc quit
+Runs 2 · ↑/↓ select · a adopt · r run · s status · d dashboard · ? help · / commands
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
-    ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
+    ███████████░░░░░░░ 61% trusted  · agent 42%  gpt-5.6-luna · high
   WAIT_QUOTA          inventory-import       01a050bd-82ae…
-    ███████░░░░░░░░░░░ 38%  gpt-5.6-luna · medium
+    ███████░░░░░░░░░░░ 38% trusted  · agent n/a  gpt-5.6-luna · medium
 
 Thread     01a050ac-1149… · generation 2
 Agent      RUNNING · PID 18234 · resume
 Next       continue current milestone
 Source: trusted state + sequence-validated events
 
-Input › natural language starts a goal (or steers an active run); / opens command palette
+Input › natural language starts a goal (or steers an active run); a/r/s/d/? are quick actions; / opens command palette
 ```
 
 输入 `/` 会展开带说明的命令面板。主要观察入口包括 `/status`、`/plan`、`/timeline`、`/explain`、`/thread`、`/quota`、`/logs`、`/recap` 和 `/report`；`/run`、`/adopt`、`/steer`、`/resume`、`/stop` 等状态变更操作都会先显示确认预览。`/adopt` 会明确标记 `LIVE + PROVEN` 或 `RECENT HISTORY`；无法证明 exact thread 的活跃进程会单独显示，手工输入 Thread ID 也会明确标记为未证明。收养完成后，Dashboard 会显示 `ADOPTED`，直到 `/resume` 真正启动受控监督。
@@ -303,7 +303,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 147 tests
+Ran 155 tests
 OK
 ```
 
