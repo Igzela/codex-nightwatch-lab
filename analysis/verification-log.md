@@ -60,9 +60,13 @@ one lease, and same-thread post-reset success before changing this to PASS.
 
 ## 0.4 account-pool extension
 
-- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 192 tests.
-- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 192 tests;
+- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 193 tests.
+- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 193 tests;
   compileall also passed.
+- One preceding Python 3.11 full-suite attempt reported a single state-identity
+  failure in `test_state_is_outside_workspace_and_legacy_state_is_ignored`;
+  the isolated test and an immediate full-suite rerun both passed. This is
+  recorded as a non-reproduced test-harness observation, not hidden as a pass.
 - Fake account-pool E2E: **PASS** for A→B quota rotation, all-account wait,
   reset re-probe, return to A, controlled handoff, weekly governing quota,
   global leases, crash release, stale PID protection, and opaque auth refresh

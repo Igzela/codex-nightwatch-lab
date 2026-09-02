@@ -6,7 +6,7 @@ This addendum supersedes the historical fake-only checkpoint below. The
 historical evidence is retained and explicitly labeled; it is not reused as
 proof of the real integration gates.
 
-FINAL_HEAD: 6139102d5bfe7cef4a462c4e77d920a5e202bc37
+FINAL_HEAD: df245c7f752b501bb185d9eee501957ac1148c15
 VERSION: 0.4.0
 PR: #1
 PR_STATE: DRAFT
@@ -20,7 +20,7 @@ CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af4
 CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
 CODEX_AUTH_JSON_SCHEMA: 1
 
-UNIT_TEST_COUNT: 192
+UNIT_TEST_COUNT: 193
 CI_311: PASS
 CI_312: PASS
 CI_313: PASS
@@ -86,10 +86,12 @@ a disposable Git repository, completed `DONE`, and preserved the canonical
 active account; the unusable second candidate was skipped. No credentials or
 token differences were logged.
 
-The hardening checkpoint `6139102` additionally makes active-account
+The hardening checkpoint `df245c7` additionally makes active-account
 read/import/restore one canonical transaction, passes the directory lock FD to
 the codex-auth child, rejects replaced metadata paths, and exercises seven
 capsule crash seams plus the three canonical registry crash-hook boundaries.
+It also proves that replacement of the hidden per-account lock root cannot
+bypass a still-live lease through the supported acquisition boundary.
 The report commit is documentation-only; `FINAL_HEAD` identifies the exact
 implementation checkpoint covered by these results.
 
