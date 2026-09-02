@@ -1315,6 +1315,19 @@ print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': []}), flus
             with self.assertRaises(AccountSchemaError):
                 broker.acquire(timeout=0.2)
 
+    def test_registry_lock_rejects_replaced_metadata_path(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-path-replace-") as temporary:
+            root = Path(temporary)
+            broker = AccountRegistryLockBroker(root / "control")
+            lock = broker.acquire(timeout=0.2)
+            lock.release()
+            original = root / "original-lock"
+            broker.path.rename(original)
+            broker.path.write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(AccountSchemaError):
+                broker.acquire(timeout=0.2)
+            self.assertTrue(original.exists())
+
     def test_registry_lock_rejects_symlinked_lock_path(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-registry-symlink-") as temporary:
             root = Path(temporary)

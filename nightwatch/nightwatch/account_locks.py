@@ -26,8 +26,9 @@ from .testing import crash_hook
 class AccountRegistryLock(AbstractContextManager["AccountRegistryLock"]):
     """One kernel-held canonical registry lock with auditable ownership."""
 
-    def __init__(self, handle: Any, path: Path, metadata: dict[str, Any]):
+    def __init__(self, handle: Any, lock_fd: int, path: Path, metadata: dict[str, Any]):
         self._handle = handle
+        self._lock_fd = lock_fd
         self.path = path
         self.metadata = metadata
         self._released = False
@@ -43,7 +44,7 @@ class AccountRegistryLock(AbstractContextManager["AccountRegistryLock"]):
         kernel lock until its own exit instead of mutating the registry after
         the parent has released the lock by dying.
         """
-        return self._handle.fileno()
+        return self._lock_fd
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         self.release()
@@ -60,10 +61,17 @@ class AccountRegistryLock(AbstractContextManager["AccountRegistryLock"]):
             self._handle.flush()
             os.fsync(self._handle.fileno())
         finally:
-            crash_hook("BEFORE_REGISTRY_UNLOCK")
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-            self._handle.close()
-            self._released = True
+            try:
+                crash_hook("BEFORE_REGISTRY_UNLOCK")
+            finally:
+                try:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                finally:
+                    try:
+                        self._handle.close()
+                    finally:
+                        os.close(self._lock_fd)
+                        self._released = True
 
     def _write_metadata(self, value: dict[str, Any]) -> None:
         self._handle.seek(0)
@@ -93,7 +101,12 @@ def _identity_matches(record: dict[str, Any]) -> bool:
 
 
 class AccountRegistryLockBroker:
-    """Fail-closed filesystem lock for canonical codex-auth registry work."""
+    """Fail-closed filesystem lock for canonical codex-auth registry work.
+
+    The kernel lock is held on the trusted control-plane directory inode, not
+    the mutable metadata pathname. This prevents lock-file replacement from
+    creating two independently locked inodes.
+    """
 
     def __init__(self, root: str | Path | None = None, timeout: float = 10.0):
         candidate = Path(root or control_plane_root()).expanduser()
@@ -108,6 +121,14 @@ class AccountRegistryLockBroker:
         self.root = candidate.resolve()
         self._root_identity = (info.st_dev, info.st_ino)
         self.path = self.root / "account-registry.lock"
+        try:
+            path_info = os.lstat(self.path)
+        except FileNotFoundError:
+            self._path_identity = None
+        else:
+            if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+                raise AccountSchemaError("canonical registry lock path is not a regular file")
+            self._path_identity = (path_info.st_dev, path_info.st_ino)
         self.timeout = max(0.0, float(timeout))
         os.chmod(self.root, 0o700)
 
@@ -122,38 +143,50 @@ class AccountRegistryLockBroker:
     def acquire(self, *, operation: str = "registry", timeout: float | None = None) -> AccountRegistryLock:
         crash_hook("BEFORE_REGISTRY_LOCK")
         self._assert_root()
-        path = self.path
+        root_descriptor: int | None = None
+        handle: Any | None = None
         try:
-            existing = os.lstat(path)
-            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                raise AccountSchemaError("canonical registry lock path is not a regular file")
-        except FileNotFoundError:
-            pass
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags, 0o600)
-            opened = os.fstat(descriptor)
-            if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-                os.close(descriptor)
-                raise AccountSchemaError("canonical registry lock path is unsafe")
-            handle = os.fdopen(descriptor, "r+", encoding="utf-8")
-        except OSError as exc:
-            raise AccountSchemaError("canonical registry lock path cannot be opened safely") from exc
-        try:
-            # Re-check the directory inode after open so a rename/replacement
-            # race cannot silently move this lock operation to an old root.
+            root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            root_descriptor = os.open(self.root, root_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("canonical registry lock root is unsafe")
             self._assert_root()
-            os.fchmod(handle.fileno(), 0o600)
             limit = self.timeout if timeout is None else max(0.0, float(timeout))
             deadline = time.monotonic() + limit
             while True:
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError as exc:
                     if time.monotonic() >= deadline:
                         raise AccountBusy("canonical registry lock is busy") from exc
                     time.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
+            # The directory lock serializes all trusted contenders even if a
+            # metadata file is renamed/replaced while this process waits.
+            self._assert_root()
+            path = self.path
+            try:
+                existing = os.lstat(path)
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                    raise AccountSchemaError("canonical registry lock path is not a regular file")
+                if self._path_identity is not None and (existing.st_dev, existing.st_ino) != self._path_identity:
+                    raise AccountSchemaError("canonical registry lock path was replaced")
+            except FileNotFoundError:
+                if self._path_identity is not None:
+                    raise AccountSchemaError("canonical registry lock path disappeared")
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags, 0o600)
+                opened = os.fstat(descriptor)
+                named = os.stat(path, follow_symlinks=False)
+                if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                    os.close(descriptor)
+                    raise AccountSchemaError("canonical registry lock path is unsafe")
+                handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+                os.fchmod(handle.fileno(), 0o600)
+            except OSError as exc:
+                raise AccountSchemaError("canonical registry lock path cannot be opened safely") from exc
             previous = self._read_metadata(handle)
             if previous is not None:
                 required = {"schema_version", "lock_kind", "pid", "starttime", "executable", "operation", "acquired_at"}
@@ -173,15 +206,23 @@ class AccountRegistryLockBroker:
                 "operation": str(operation)[:80],
                 "acquired_at": now_iso(),
             }
-            lock = AccountRegistryLock(handle, path, metadata)
+            lock = AccountRegistryLock(handle, root_descriptor, path, metadata)
             lock._write_metadata(metadata)
             crash_hook("AFTER_REGISTRY_LOCK")
+            if self._path_identity is None:
+                self._path_identity = (opened.st_dev, opened.st_ino)
+            root_descriptor = None
+            handle = None
             return lock
         except Exception:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if root_descriptor is not None:
+                    fcntl.flock(root_descriptor, fcntl.LOCK_UN)
             finally:
-                handle.close()
+                if handle is not None:
+                    handle.close()
+                if root_descriptor is not None:
+                    os.close(root_descriptor)
             raise
 
     @staticmethod
