@@ -8,8 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 168 Passing](https://img.shields.io/badge/Tests-168%20Passing-success.svg)](#测试验证)
-[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+[![Tests: 188 Passing](https://img.shields.io/badge/Tests-188%20Passing-success.svg)](#测试验证)
+[![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
 
@@ -58,7 +58,7 @@
 - 🔄 **官方 App Server 协议直连**：通过 JSON-RPC 2.0 stdio 协议直连 Codex 内部 `account/rateLimits/read`，精准获取 5h 与周配额重置 Epoch，杜绝脆弱的正则表达式或 ANSI 屏幕抓取。
 - 🧵 **精确 Thread ID 级断点续传**：跨配额周期与系统重启时，严格执行 `codex exec --json resume <thread_id> -` 精准接续原会话，坚决拒绝模糊的 `--last` 猜测。
 - 👥 **可选账号池**：显式选择的账号子集只会在 provider 退出后轮换；每个账号使用全局 lease，通过新的 App Server 配额会话检查，并同时受 5 小时和 weekly 限制约束。
-- 🔐 **规范认证同步串行化**：规范 `codex-auth` 注册表操作在账号 lease 之后获取短时内核锁，并在 provider 执行前释放；provider capsule 只保留被选账号，启动前删除全账号 staging。
+- 🔐 **规范认证同步串行化**：规范 `codex-auth` 注册表操作在账号 lease 之后获取外部受信控制面目录上的短时内核锁，并在 provider 执行前释放；provider capsule 只保留被选账号，启动前删除全账号 staging。
 - 🔒 **受信任控制面物理隔离**：核心状态与验收规则保存在 Git 工作区之外（`~/.local/state/codex-nightwatch/`，`0700` 权限），模型沙箱只能读写信箱，绝无可能篡改验收规则。
 - 🧪 **冻结真实验收门禁**：任务完成（`DONE`）必须严格通过用户预冻结的 `--verify` 命令（如 `pytest -q`、`cargo test`、`git diff --check`），彻底杜绝模型幻觉。
 - 🛡️ **无侵入伴随监听与自动接管（`nightwatch watch`）**：安全监听终端中正在运行的交互式 Codex 会话，在不打断前台的前提下实时统计 Token 与配额，并在触发上限或终端关闭后自动无缝接管夜间续跑。
@@ -88,7 +88,7 @@ nightwatch doctor
 ```
 ```text
 Nightwatch doctor: ok
-Codex: codex-cli 0.150.1
+Codex: codex-cli 0.152.1
 Auth: ok
 Quota authority: LIVE_APP_SERVER (live_app_server)
 5h: 7.0% used, reset=1787866896
@@ -320,11 +320,11 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 168 tests
+Ran 188 tests
 OK
 ```
 
-- ✅ 真实 Codex 0.150.1 App Server 实时配额 JSON-RPC 通信验证
+- ✅ 真实 Codex 0.152.1 App Server 实时配额 JSON-RPC 通信验证
 - ✅ 真实多进程并发冲突与竞争防御实测
 - ✅ SIGKILL 异常崩溃后 Linux PID 身份重校验与精确 Thread 恢复
 - ✅ 符号链接穿透与 Mailbox 命令注入反制

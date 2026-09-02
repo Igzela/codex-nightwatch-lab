@@ -1,6 +1,100 @@
 # Nightwatch 0.4.0 Account Pool Final Report
 
-FINAL_HEAD: 325b2aa1fe523b9b5b202094c9e51b710eb0c75c
+## Hardening acceptance addendum — 2026-09-02
+
+This addendum supersedes the historical fake-only checkpoint below. The
+historical evidence is retained and explicitly labeled; it is not reused as
+proof of the real integration gates.
+
+FINAL_HEAD: 2644ef0c32b387c14eeec6db901b6320068c04ec
+VERSION: 0.4.0
+PR: #1
+PR_STATE: DRAFT
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_SHA: 0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a
+CODEX_AUTH_TEST_BINARY: /home/igzela/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af460f8a65b69
+CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
+CODEX_AUTH_JSON_SCHEMA: 1
+
+UNIT_TEST_COUNT: 188
+CI_311: PASS
+CI_312: PASS
+CI_313: PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+PACKAGE_INSTALL: PASS
+DOCTOR: PASS
+
+REMOVE_SCHEMA_REAL_CONTRACT: PASS
+CANONICAL_REGISTRY_LOCK: PASS
+CONCURRENT_A_B_REFRESH_PRESERVATION: PASS
+ACCOUNT_LEASE_PARALLELISM: PASS
+REGISTRY_LOCK_PROVIDER_SCOPE: PASS
+LOCK_ORDER: account lease -> registry lock
+LOCK_ORDER_RESULT: PASS
+NORMAL_QUOTA_CYCLES_OVER_20: PASS
+NORMAL_QUOTA_CYCLES_TESTED: 30
+RECOVERY_FAILURE_CIRCUIT_BREAKER: PASS
+PROVIDER_CAPSULE_SELECTED_ACCOUNT_ONLY: PASS
+ALL_ACCOUNT_EXPORT_REMOVED_BEFORE_PROVIDER: PASS
+
+REAL_CODEX_AUTH_LIST: PASS
+REAL_CODEX_AUTH_SWITCH: PASS
+REAL_CODEX_AUTH_REMOVE: PASS
+REAL_CODEX_AUTH_IMPORT_EXPORT: PASS
+REAL_TWO_ACCOUNT_DISCOVERY: PASS
+REAL_ACCOUNT_A_APP_SERVER: PASS
+REAL_ACCOUNT_B_APP_SERVER: FAIL
+REAL_AUTH_REFRESH_PRESERVATION: INCONCLUSIVE
+CROSS_ACCOUNT_EXACT_THREAD: INCONCLUSIVE
+CONTROLLED_THREAD_HANDOFF: PASS
+REAL_TWO_ACCOUNT_NIGHTWATCH_SMOKE: PASS
+REAL_NATURAL_ACCOUNT_ROTATION: NOT_OBSERVED
+
+CURRENT_ONLY_REGRESSION: PASS
+DEFERRED_START_REGRESSION: PASS
+ADOPT_REGRESSION: PASS
+MULTI_RUN_REGRESSION: PASS
+
+KNOWN_LIMITATIONS:
+
+- Live canonical discovery found three stored accounts. The active account
+  returned authoritative App Server quota; the selected second account
+  returned upstream `401 Unauthorized` token-parsing errors. The other
+  non-active candidate showed the same condition. This prevents a real
+  two-usable-account acceptance, so the PR remains Draft.
+- Real two-account auth-refresh preservation cannot be classified PASS while
+  the second account cannot complete an authoritative App Server session.
+- Cross-account exact-thread portability was not attempted after the failed
+  second-account gate and remains INCONCLUSIVE. Production behavior remains
+  `CONTROLLED_THREAD_HANDOFF` (mission continuity yes; conversation continuity
+  is a new thread).
+- Natural quota rotation was not observed and no quota was intentionally
+  consumed to manufacture it.
+
+MERGE_DECISION: KEEP_DRAFT
+READY_FOR_REVIEW: NO
+
+Evidence details: the isolated real contract smoke exercised import, list,
+switch, remove, export, and import/export round-trip through Nightwatch's
+adapter. The real Nightwatch routing smoke used exactly two authorized keys in
+a disposable Git repository, completed `DONE`, and preserved the canonical
+active account; the unusable second candidate was skipped. No credentials or
+token differences were logged.
+
+The hardening checkpoint `2644ef0` additionally makes active-account
+read/import/restore one canonical transaction, passes the directory lock FD to
+the codex-auth child, rejects replaced metadata paths, and exercises seven
+capsule crash seams. The report commit is documentation-only; `FINAL_HEAD`
+identifies the exact implementation checkpoint covered by these results.
+
+## Historical fake-only checkpoint
+
+HISTORICAL_FINAL_HEAD: 325b2aa1fe523b9b5b202094c9e51b710eb0c75c
 BRANCH: account-pool-0-4
 VERSION: 0.4.0
 DATE: 2026-09-02

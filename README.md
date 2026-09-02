@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 168 Passing](https://img.shields.io/badge/Tests-168%20Passing-success.svg)](#validation)
+[![Tests: 188 Passing](https://img.shields.io/badge/Tests-188%20Passing-success.svg)](#validation)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -58,7 +58,7 @@ You give your AI coding agent a complex milestone before going to sleep. You wak
 - 🔄 **Authoritative Quota Recovery**: Communicates directly with the official Codex App Server over JSON-RPC 2.0 stdio (`account/rateLimits/read`). No brittle regex scraping or ANSI parsing.
 - 🧵 **Exact-Thread Continuation**: Resumes the *exact* session thread (`codex exec --json resume <thread_id> -`) across quota windows and crashes when that route is proven. Never uses `--last` guesswork.
 - 👥 **Opt-in Account Pool**: An explicitly selected pool can rotate only after a provider exits. Each account is leased globally, checked by a fresh App Server quota session, and evaluated against both 5h and weekly limits.
-- 🔐 **Serialized Canonical Auth Sync**: Canonical `codex-auth` registry operations use a short-lived kernel lock acquired after the account lease and released before provider execution. Provider capsules retain only the selected account; all-account staging is removed before launch.
+- 🔐 **Serialized Canonical Auth Sync**: Canonical `codex-auth` registry operations use a short-lived kernel lock on the trusted external control-plane directory, acquired after the account lease and released before provider execution. Provider capsules retain only the selected account; all-account staging is removed before launch.
 - 🔒 **Tamper-Proof Trust Boundary**: State lives outside the Git workspace in `~/.local/state/codex-nightwatch/` (0700 permissions). Model-proposed verification scripts are strictly rejected.
 - 🧪 **Frozen Verification Gate**: Goal completion (`DONE`) strictly requires your frozen `--verify` commands (e.g. `pytest`, `cargo test`, `git diff --check`) to exit `0`.
 - 🛡️ **Zero-Interruption Live Watching (`nightwatch watch`)**: Passively monitors existing interactive terminal sessions without collision or interruption. With `--auto-takeover`, seamlessly takes over overnight when quota runs out.
@@ -322,7 +322,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 168 tests
+Ran 188 tests
 OK
 ```
 
