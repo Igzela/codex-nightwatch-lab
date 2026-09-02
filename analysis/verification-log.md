@@ -60,8 +60,8 @@ one lease, and same-thread post-reset success before changing this to PASS.
 
 ## 0.4 account-pool extension
 
-- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 188 tests.
-- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 188 tests;
+- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 189 tests.
+- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 189 tests;
   compileall also passed.
 - Fake account-pool E2E: **PASS** for A→B quota rotation, all-account wait,
   reset re-probe, return to A, controlled handoff, weekly governing quota,
@@ -75,3 +75,12 @@ one lease, and same-thread post-reset success before changing this to PASS.
   returned validated 5h and weekly windows. No real two-account rotation was
   attempted because the installed account tool could not provide the required
   local machine-readable pool contract.
+- Isolated upstream `codex-auth 0.3.0-alpha.11` at commit
+  `0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a`: **PASS** for the real adapter
+  contract smoke covering list, switch, remove, import, export, and
+  import/export round-trip. The host `0.2.10` binary was not overwritten.
+- Canonical discovery through that isolated binary: **PASS**, three stored
+  accounts found without switching the user's active account. The active
+  account App Server probe passed; both tested non-active snapshots returned
+  upstream 401 token-parse failures, so real two-account acceptance remains
+  blocked.

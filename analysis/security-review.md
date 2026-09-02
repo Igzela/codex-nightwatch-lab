@@ -1,12 +1,14 @@
 # Release hardening security review
 
-Date: 2026-08-28 (Asia/Shanghai)
+Date: 2026-09-02 (Asia/Tokyo)
 
 ## Status
 
-**USABLE_PENDING_REAL_QUOTA_SOAK**. The only intentionally pending gate is a
-natural provider quota exhaustion/recovery cycle; no quota was burned to force
-it.
+**BLOCKED_PENDING_REAL_TWO_ACCOUNT_ACCEPTANCE**. No quota was burned to force
+a natural exhaustion/recovery cycle. The isolated codex-auth contract smoke
+passed, but one tested non-active account cannot complete an authoritative App
+Server session, so refresh-preservation and cross-account exact-thread gates
+remain inconclusive.
 
 ## Closed release blockers
 
@@ -31,8 +33,8 @@ it.
 - Fake App Server verifies required initialize response, `initialized`
   notification, request ordering, wrong IDs, notifications, malformed JSON,
   timeout, exit, error response, and millisecond resets.
-- Real Codex `0.150.1` App Server handshake and rate-limit read passed on this
-  machine. It returned live 5h and weekly windows.
+- Historical 0.3 real Codex `0.150.1` App Server handshake and rate-limit read
+  passed on this machine. It returned live 5h and weekly windows.
 - A real user-systemd disposable fixture reached DONE; a second fixture was
   SIGKILLed after exact thread capture, systemd restarted it, and it resumed
   `TEST-001` rather than opening a second thread.
@@ -49,6 +51,13 @@ it.
 - Regression coverage also proves that replacing an already initialized
   mailbox root with a symlink is rejected on later reads, and that a state-home
   symlink resolving into the workspace is rejected before creation.
+
+- Current 0.4 regression coverage is 189 tests. The audited upstream
+  `codex-auth 0.3.0-alpha.11` binary was built in isolation and passed the
+  Nightwatch adapter contract smoke for list, switch, remove, import, export,
+  and round-trip behavior. Canonical discovery found three stored accounts;
+  the active account App Server probe passed, while both tested non-active
+  snapshots returned upstream 401 token-parse failures.
 
 ## Residual limits
 
@@ -68,7 +77,13 @@ it.
 - Per-account lock files are held for the complete App Server/provider
   lifetime. Symlinked roots/paths, corrupt metadata, stale PID reuse, and
   changed ownership fail closed without deleting another owner's record.
+- Canonical registry synchronization uses a short-lived directory-inode kernel
+  lock after the account lease; the metadata pathname is checked for symlink,
+  corruption, and replacement, and the lock is not held during provider work.
 - AUTO_POOL selection is explicitly scoped to the run's authorized subset and
   requires authoritative 5h plus weekly quota. Cross-account exact-thread
   continuity is not advertised; the tested fallback is an audited controlled
   mission handoff.
+- Real two-account Nightwatch routing reached DONE with exactly two authorized
+  keys in a disposable repository and preserved the canonical active account,
+  but this does not substitute for the failed second-account App Server gate.
