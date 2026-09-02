@@ -6,7 +6,7 @@ This addendum supersedes the historical fake-only checkpoint below. The
 historical evidence is retained and explicitly labeled; it is not reused as
 proof of the real integration gates.
 
-FINAL_HEAD: fe54951c153f7a8f12f72455cb063d44060fc9b5
+FINAL_HEAD: 9f00ce1b855371ed71648c44b7fc7482a3cc1ec3
 VERSION: 0.4.0
 PR: #1
 PR_STATE: DRAFT
@@ -20,7 +20,7 @@ CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af4
 CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
 CODEX_AUTH_JSON_SCHEMA: 1
 
-UNIT_TEST_COUNT: 189
+UNIT_TEST_COUNT: 190
 CI_311: PASS
 CI_312: PASS
 CI_313: PASS
@@ -86,7 +86,7 @@ a disposable Git repository, completed `DONE`, and preserved the canonical
 active account; the unusable second candidate was skipped. No credentials or
 token differences were logged.
 
-The hardening checkpoint `fe54951` additionally makes active-account
+The hardening checkpoint `9f00ce1` additionally makes active-account
 read/import/restore one canonical transaction, passes the directory lock FD to
 the codex-auth child, rejects replaced metadata paths, and exercises seven
 capsule crash seams plus the three canonical registry crash-hook boundaries.
