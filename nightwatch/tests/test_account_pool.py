@@ -544,6 +544,93 @@ class AccountProbeTests(unittest.TestCase):
 
 
 class AccountPoolFakeE2ETests(unittest.TestCase):
+    def test_after_provider_exit_crash_releases_account_lease_and_reconciles(self):
+        fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
+        with tempfile.TemporaryDirectory(prefix="nightwatch-pool-provider-exit-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            for args in (
+                ("init", "-q"),
+                ("config", "user.email", "nightwatch@example.invalid"),
+                ("config", "user.name", "Nightwatch"),
+            ):
+                subprocess.run(["git", *args], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            plan = root / "plan.json"
+            progress = root / "progress.json"
+            plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "crash recovery", "weight": 1}]}), encoding="utf-8")
+            progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}), encoding="utf-8")
+            state_home = root / "state"
+            lease_root = root / "leases"
+            capsule_root = root / "capsules"
+            once_file = root / "crash-once"
+            store = NightwatchStore(repo, state_home=state_home)
+            store.initialize(
+                "pool-provider-exit",
+                "recover after provider exit",
+                str(repo),
+                verify_commands=["test -f fake-implemented.txt", "git diff --check"],
+                account_mode="AUTO_POOL",
+                authorized_accounts=["user::a", "user::b"],
+            )
+            child_code = (
+                "import sys; from pathlib import Path; "
+                "from nightwatch.account_broker import AccountLeaseBroker, AccountPoolCoordinator, account_fingerprint; "
+                "from nightwatch.models import QuotaSnapshot, QuotaWindow; "
+                "from nightwatch.storage import NightwatchStore; from nightwatch.supervisor import Supervisor; "
+                "from test_account_pool import _FakeAuth, _FakeCapsule, _StaticQuota; "
+                "quota = QuotaSnapshot('live_app_server', 'now', QuotaWindow('5h', 10, 300, None), QuotaWindow('weekly', 20, 10080, None)); "
+                "coordinator = AccountPoolCoordinator(_FakeAuth(), AccountLeaseBroker(sys.argv[3]), "
+                "quota_factory=lambda _home, _fingerprint, _fd: _StaticQuota(quota), "
+                "capsule_factory=lambda _adapter, key, _run, _generation, **_kwargs: _FakeCapsule(Path(sys.argv[4]) / account_fingerprint(key))); "
+                "Supervisor(NightwatchStore(sys.argv[1], state_home=sys.argv[2]), account_pool=coordinator).execute(start=True)"
+            )
+            environment = dict(os.environ)
+            environment.update({
+                "PYTHONPATH": os.pathsep.join((str(PRODUCT), str(PRODUCT / "tests"))),
+                "NIGHTWATCH_CODEX_BIN": str(fake_codex),
+                "NIGHTWATCH_SKIP_AUTH_CHECK": "1",
+                "FAKE_CODEX_SCENARIO": "normal",
+                "FAKE_CODEX_RESUME_SCENARIO": "normal",
+                "FAKE_CODEX_PLAN_FILE": str(plan),
+                "FAKE_CODEX_PROGRESS_FILE": str(progress),
+                "NIGHTWATCH_ENABLE_TEST_CRASH_HOOKS": "1",
+                "NIGHTWATCH_TEST_CRASH_POINT": "AFTER_PROVIDER_EXIT",
+                "NIGHTWATCH_TEST_CRASH_ONCE_FILE": str(once_file),
+            })
+            child = subprocess.run(
+                [sys.executable, "-c", child_code, str(repo), str(state_home), str(lease_root), str(capsule_root)],
+                cwd=repo,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(child.returncode, -9, child.stderr)
+            crashed = store.load_state()
+            self.assertIsNone(crashed["active_process"])
+            self.assertIsNone(crashed["account_lease"])
+            self.assertEqual(crashed["account_claim"]["phase"], "provider_exited")
+            selected_key = crashed["current_account_key"]
+            available = AccountLeaseBroker(lease_root).acquire(selected_key, "reconciler", repo)
+            available.release()
+
+            coordinator = AccountPoolCoordinator(
+                _FakeAuth(),
+                AccountLeaseBroker(lease_root),
+                quota_factory=lambda _home, _fingerprint, _fd: _StaticQuota(snapshot(10, 20)),
+                capsule_factory=lambda _adapter, key, _run, _generation, **_kwargs: _FakeCapsule(capsule_root / account_fingerprint(key)),
+            )
+            with patch.dict(os.environ, environment, clear=False):
+                final = Supervisor(store, account_pool=coordinator).execute(start=False)
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertIsNone(final["account_lease"])
+
     def test_a_to_b_wait_and_return_to_a_uses_controlled_handoffs(self):
         fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
         with tempfile.TemporaryDirectory(prefix="nightwatch-pool-e2e-") as temporary:
@@ -933,6 +1020,10 @@ class AccountLeaseTests(unittest.TestCase):
             path.write_text(json.dumps({
                 "schema_version": 1,
                 "account_fingerprint": account_fingerprint("user::a"),
+                "lock_root": {
+                    "device": broker._lock_root_identity[0],
+                    "inode": broker._lock_root_identity[1],
+                },
                 "run_id": "old",
                 "repo": "/old",
                 "pid": os.getpid(),
@@ -1049,10 +1140,57 @@ class AccountLeaseTests(unittest.TestCase):
                 broker._lock_root.rename(old_lock_root)
                 broker._lock_root.mkdir(mode=0o700)
                 replacement_broker = AccountLeaseBroker(lease_root)
-                with self.assertRaises(AccountBusy):
+                with self.assertRaises(AccountSchemaError):
                     replacement_broker.acquire("user::a", "run-b", "/repo-b")
             finally:
                 lease.release()
+
+    def test_replacing_hidden_lease_lock_root_fails_closed_while_descendant_holds_fd(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-hidden-lease-descendant-") as temporary:
+            root = Path(temporary)
+            lease_root = root / "leases"
+            child_code = (
+                "import os, subprocess, sys; "
+                "from nightwatch.account_broker import AccountLeaseBroker; "
+                "lease = AccountLeaseBroker(sys.argv[1]).acquire('user::a', 'run-a', '/repo-a'); "
+                "provider = subprocess.Popen(['/bin/sleep', '30'], stdin=subprocess.DEVNULL, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(lease.fd,)); "
+                "print(provider.pid, flush=True); os._exit(0)"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(PRODUCT)
+            supervisor = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(lease_root)],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            provider_pid: int | None = None
+            try:
+                assert supervisor.stdout is not None
+                provider_pid = int(supervisor.stdout.readline().strip())
+                supervisor.wait(timeout=5)
+                self.assertEqual(supervisor.returncode, 0)
+                hidden_root = root / ".leases.account-locks"
+                hidden_root.rename(root / "old-account-locks")
+                hidden_root.mkdir(mode=0o700)
+                replacement_broker = AccountLeaseBroker(lease_root)
+                with self.assertRaises(AccountSchemaError):
+                    replacement_broker.acquire("user::a", "run-b", "/repo-b")
+            finally:
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                    supervisor.wait(timeout=5)
+                if provider_pid is not None:
+                    try:
+                        os.kill(provider_pid, 9)
+                    except ProcessLookupError:
+                        pass
+                if supervisor.stdout is not None:
+                    supervisor.stdout.close()
+                if supervisor.stderr is not None:
+                    supervisor.stderr.close()
 
 
 class RegistryLockTests(unittest.TestCase):

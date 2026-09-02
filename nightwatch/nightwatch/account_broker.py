@@ -706,9 +706,22 @@ class AccountLeaseBroker:
                 raise AccountUnavailable("account lease path cannot be opened safely") from exc
             previous = AccountLease._read_metadata(handle)
             if previous is not None:
-                required = {"schema_version", "account_fingerprint", "run_id", "repo", "pid", "starttime", "executable", "phase"}
-                if set(previous) < required or previous.get("schema_version") != 1 or previous.get("account_fingerprint") != fingerprint:
+                required = {"schema_version", "account_fingerprint", "lock_root", "run_id", "repo", "pid", "starttime", "executable", "phase"}
+                lock_root = previous.get("lock_root")
+                if (
+                    not required.issubset(previous)
+                    or previous.get("schema_version") != 1
+                    or previous.get("account_fingerprint") != fingerprint
+                    or not isinstance(lock_root, dict)
+                    or type(lock_root.get("device")) is not int
+                    or type(lock_root.get("inode")) is not int
+                ):
                     raise AccountSchemaError("account lease metadata is invalid")
+                if (lock_root["device"], lock_root["inode"]) != self._lock_root_identity:
+                    # A stale-looking owner may still have a provider child
+                    # holding the old directory lock FD. Never migrate live
+                    # metadata across lock-domain replacement automatically.
+                    raise AccountSchemaError("account lease lock domain changed unexpectedly")
                 if _identity_matches(previous):
                     raise AccountBusy("account lease metadata identifies a live owner")
             identity = supervisor_identity or _linux_process_identity(os.getpid())
@@ -717,6 +730,10 @@ class AccountLeaseBroker:
             metadata = {
                 "schema_version": 1,
                 "account_fingerprint": fingerprint,
+                "lock_root": {
+                    "device": self._lock_root_identity[0],
+                    "inode": self._lock_root_identity[1],
+                },
                 "run_id": str(run_id),
                 "repo": str(Path(repo).resolve()),
                 "pid": identity["pid"],
