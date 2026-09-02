@@ -586,18 +586,37 @@ class AccountLeaseBroker:
             raise AccountSchemaError("account lease root is unsafe")
         self.root = candidate.resolve()
         self._root_identity = (info.st_dev, info.st_ino)
+        self._lock_root = self.root.parent / f".{self.root.name}.account-locks"
+        if self._lock_root.exists() or self._lock_root.is_symlink():
+            lock_root_info = os.lstat(self._lock_root)
+            if stat.S_ISLNK(lock_root_info.st_mode) or not stat.S_ISDIR(lock_root_info.st_mode):
+                raise AccountSchemaError("account lease lock root must be a real directory")
+        self._lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_root_info = os.lstat(self._lock_root)
+        if stat.S_ISLNK(lock_root_info.st_mode) or not stat.S_ISDIR(lock_root_info.st_mode):
+            raise AccountSchemaError("account lease lock root is unsafe")
+        self._lock_root_identity = (lock_root_info.st_dev, lock_root_info.st_ino)
         root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        lock_root_descriptor: int | None = None
         try:
             root_descriptor = os.open(self.root, root_flags)
             root_info = os.fstat(root_descriptor)
             if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
                 raise AccountSchemaError("account lease root is unsafe")
             os.fchmod(root_descriptor, 0o700)
+            lock_root_descriptor = os.open(self._lock_root, root_flags)
+            lock_root_info = os.fstat(lock_root_descriptor)
+            if not stat.S_ISDIR(lock_root_info.st_mode) or (lock_root_info.st_dev, lock_root_info.st_ino) != self._lock_root_identity:
+                raise AccountSchemaError("account lease lock root is unsafe")
+            os.fchmod(lock_root_descriptor, 0o700)
         except OSError as exc:
             raise AccountSchemaError("account lease root cannot be opened safely") from exc
         finally:
-            if "root_descriptor" in locals():
+            if root_descriptor is not None:
                 os.close(root_descriptor)
+            if lock_root_descriptor is not None:
+                os.close(lock_root_descriptor)
 
     def _assert_root(self) -> None:
         try:
@@ -606,6 +625,14 @@ class AccountLeaseBroker:
             raise AccountSchemaError("account lease root disappeared") from exc
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self._root_identity:
             raise AccountSchemaError("account lease root was replaced")
+
+    def _assert_lock_root(self) -> None:
+        try:
+            info = os.lstat(self._lock_root)
+        except OSError as exc:
+            raise AccountSchemaError("account lease lock root disappeared") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self._lock_root_identity:
+            raise AccountSchemaError("account lease lock root was replaced")
 
     def lease_path(self, account_key: str) -> Path:
         return self.root / f"{account_fingerprint(account_key)}.lock"
@@ -621,27 +648,29 @@ class AccountLeaseBroker:
     ) -> AccountLease:
         fingerprint = account_fingerprint(account_key)
         path = self.lease_path(account_key)
+        self._assert_lock_root()
         self._assert_root()
+        lock_root_descriptor: int | None = None
         root_descriptor: int | None = None
         lock_fd: int | None = None
         handle: Any | None = None
         try:
             root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            root_descriptor = os.open(self.root, root_flags)
-            root_info = os.fstat(root_descriptor)
-            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
-                raise AccountSchemaError("account lease root is unsafe")
-            self._assert_root()
-            lock_dir_name = f".{fingerprint}"
+            lock_root_descriptor = os.open(self._lock_root, root_flags)
+            lock_root_info = os.fstat(lock_root_descriptor)
+            if not stat.S_ISDIR(lock_root_info.st_mode) or (lock_root_info.st_dev, lock_root_info.st_ino) != self._lock_root_identity:
+                raise AccountSchemaError("account lease lock root is unsafe")
+            self._assert_lock_root()
+            lock_dir_name = fingerprint
             try:
-                os.mkdir(lock_dir_name, mode=0o700, dir_fd=root_descriptor)
+                os.mkdir(lock_dir_name, mode=0o700, dir_fd=lock_root_descriptor)
             except FileExistsError:
                 pass
-            lock_dir_info = os.stat(lock_dir_name, dir_fd=root_descriptor, follow_symlinks=False)
+            lock_dir_info = os.stat(lock_dir_name, dir_fd=lock_root_descriptor, follow_symlinks=False)
             if stat.S_ISLNK(lock_dir_info.st_mode) or not stat.S_ISDIR(lock_dir_info.st_mode):
                 raise AccountSchemaError("account lease lock directory is unsafe")
             lock_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            lock_fd = os.open(lock_dir_name, lock_flags, dir_fd=root_descriptor)
+            lock_fd = os.open(lock_dir_name, lock_flags, dir_fd=lock_root_descriptor)
             opened_lock_dir = os.fstat(lock_fd)
             if not stat.S_ISDIR(opened_lock_dir.st_mode) or (opened_lock_dir.st_dev, opened_lock_dir.st_ino) != (lock_dir_info.st_dev, lock_dir_info.st_ino):
                 raise AccountSchemaError("account lease lock directory was replaced")
@@ -649,6 +678,12 @@ class AccountLeaseBroker:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise AccountBusy(f"account {fingerprint} is busy") from exc
+            self._assert_lock_root()
+            self._assert_root()
+            root_descriptor = os.open(self.root, root_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("account lease root is unsafe")
             self._assert_root()
             lease_name = path.name
             try:
@@ -692,6 +727,8 @@ class AccountLeaseBroker:
             }
             lease = AccountLease(handle, lock_fd, path, metadata, (opened.st_dev, opened.st_ino))
             lease._write_metadata(metadata)
+            os.close(lock_root_descriptor)
+            lock_root_descriptor = None
             root_descriptor = None
             lock_fd = None
             handle = None
@@ -707,6 +744,8 @@ class AccountLeaseBroker:
                     os.close(lock_fd)
                 if root_descriptor is not None:
                     os.close(root_descriptor)
+                if lock_root_descriptor is not None:
+                    os.close(lock_root_descriptor)
             raise
 
 

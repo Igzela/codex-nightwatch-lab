@@ -105,7 +105,9 @@ class AccountRegistryLockBroker:
 
     The kernel lock is held on the trusted control-plane directory inode, not
     the mutable metadata pathname. This prevents lock-file replacement from
-    creating two independently locked inodes.
+    creating two independently locked inodes. The parent directory is the
+    stable anchor, so replacing the configured root cannot split the lock
+    domain while an operation is in flight.
     """
 
     def __init__(self, root: str | Path | None = None, timeout: float = 10.0):
@@ -120,6 +122,11 @@ class AccountRegistryLockBroker:
             raise AccountSchemaError("canonical registry lock root is unsafe")
         self.root = candidate.resolve()
         self._root_identity = (info.st_dev, info.st_ino)
+        self._anchor = self.root.parent
+        anchor_info = os.lstat(self._anchor)
+        if stat.S_ISLNK(anchor_info.st_mode) or not stat.S_ISDIR(anchor_info.st_mode):
+            raise AccountSchemaError("canonical registry lock anchor must be a real directory")
+        self._anchor_identity = (anchor_info.st_dev, anchor_info.st_ino)
         self.path = self.root / "account-registry.lock"
         try:
             path_info = os.lstat(self.path)
@@ -130,7 +137,25 @@ class AccountRegistryLockBroker:
                 raise AccountSchemaError("canonical registry lock path is not a regular file")
             self._path_identity = (path_info.st_dev, path_info.st_ino)
         self.timeout = max(0.0, float(timeout))
-        os.chmod(self.root, 0o700)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        try:
+            root_descriptor = os.open(self.root, directory_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("canonical registry lock root is unsafe")
+            os.fchmod(root_descriptor, 0o700)
+        finally:
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
+    def _assert_anchor(self) -> None:
+        try:
+            info = os.lstat(self._anchor)
+        except OSError as exc:
+            raise AccountSchemaError("canonical registry lock anchor disappeared") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self._anchor_identity:
+            raise AccountSchemaError("canonical registry lock anchor was replaced")
 
     def _assert_root(self) -> None:
         try:
@@ -142,28 +167,34 @@ class AccountRegistryLockBroker:
 
     def acquire(self, *, operation: str = "registry", timeout: float | None = None) -> AccountRegistryLock:
         crash_hook("BEFORE_REGISTRY_LOCK")
+        self._assert_anchor()
         self._assert_root()
+        anchor_descriptor: int | None = None
         root_descriptor: int | None = None
         handle: Any | None = None
         try:
-            root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            root_descriptor = os.open(self.root, root_flags)
-            root_info = os.fstat(root_descriptor)
-            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
-                raise AccountSchemaError("canonical registry lock root is unsafe")
-            self._assert_root()
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            anchor_descriptor = os.open(self._anchor, directory_flags)
+            anchor_info = os.fstat(anchor_descriptor)
+            if not stat.S_ISDIR(anchor_info.st_mode) or (anchor_info.st_dev, anchor_info.st_ino) != self._anchor_identity:
+                raise AccountSchemaError("canonical registry lock anchor is unsafe")
+            self._assert_anchor()
             limit = self.timeout if timeout is None else max(0.0, float(timeout))
             deadline = time.monotonic() + limit
             while True:
                 try:
-                    fcntl.flock(root_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(anchor_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError as exc:
                     if time.monotonic() >= deadline:
                         raise AccountBusy("canonical registry lock is busy") from exc
                     time.sleep(min(0.01, max(0.001, deadline - time.monotonic())))
-            # The directory lock serializes all trusted contenders even if a
-            # metadata file is renamed/replaced while this process waits.
+            self._assert_anchor()
+            self._assert_root()
+            root_descriptor = os.open(self.root, directory_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("canonical registry lock root is unsafe")
             self._assert_root()
             # Use the already-open root directory as the path anchor. A final
             # pathname check alone cannot stop a root rename between the
@@ -209,23 +240,27 @@ class AccountRegistryLockBroker:
                 "operation": str(operation)[:80],
                 "acquired_at": now_iso(),
             }
-            lock = AccountRegistryLock(handle, root_descriptor, self.path, metadata)
+            lock = AccountRegistryLock(handle, anchor_descriptor, self.path, metadata)
             lock._write_metadata(metadata)
             crash_hook("AFTER_REGISTRY_LOCK")
             if self._path_identity is None:
                 self._path_identity = (opened.st_dev, opened.st_ino)
+            os.close(root_descriptor)
             root_descriptor = None
+            anchor_descriptor = None
             handle = None
             return lock
         except Exception:
             try:
-                if root_descriptor is not None:
-                    fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+                if anchor_descriptor is not None:
+                    fcntl.flock(anchor_descriptor, fcntl.LOCK_UN)
             finally:
                 if handle is not None:
                     handle.close()
                 if root_descriptor is not None:
                     os.close(root_descriptor)
+                if anchor_descriptor is not None:
+                    os.close(anchor_descriptor)
             raise
 
     @staticmethod

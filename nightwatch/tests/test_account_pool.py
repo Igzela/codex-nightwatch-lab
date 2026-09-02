@@ -1019,6 +1019,25 @@ class AccountLeaseTests(unittest.TestCase):
                     lease.release()
             self.assertTrue(replacement.exists())
 
+    def test_replacing_held_account_lease_root_does_not_split_exclusion(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-lease-root-replace-") as temporary:
+            root = Path(temporary)
+            lease_root = root / "leases"
+            broker = AccountLeaseBroker(lease_root)
+            lease = broker.acquire("user::a", "run-a", "/repo-a")
+            old_root = root / "old-leases"
+            try:
+                lease_root.rename(old_root)
+                lease_root.mkdir(mode=0o700)
+                replacement_broker = AccountLeaseBroker(lease_root)
+                with self.assertRaises(AccountBusy):
+                    replacement_broker.acquire("user::a", "run-b", "/repo-b")
+                with self.assertRaises(AccountSchemaError):
+                    lease.release()
+            finally:
+                if not lease._released:
+                    lease.release()
+
 
 class RegistryLockTests(unittest.TestCase):
     def test_registry_transaction_serializes_active_restore(self):
@@ -1416,6 +1435,22 @@ print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': []}), flus
             with self.assertRaises(AccountSchemaError):
                 broker.acquire(timeout=0.2)
             self.assertTrue(original.exists())
+
+    def test_replacing_held_registry_root_does_not_split_lock_domain(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-root-replace-") as temporary:
+            root = Path(temporary)
+            registry_root = root / "control"
+            broker = AccountRegistryLockBroker(registry_root)
+            lock = broker.acquire(timeout=0.2)
+            old_root = root / "old-control"
+            try:
+                registry_root.rename(old_root)
+                registry_root.mkdir(mode=0o700)
+                replacement_broker = AccountRegistryLockBroker(registry_root)
+                with self.assertRaises(AccountBusy):
+                    replacement_broker.acquire(timeout=0.05)
+            finally:
+                lock.release()
 
     def test_registry_lock_rejects_symlinked_lock_path(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-registry-symlink-") as temporary:
