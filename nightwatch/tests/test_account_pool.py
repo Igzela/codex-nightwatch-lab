@@ -1230,6 +1230,76 @@ finally:
                 if child.stderr is not None:
                     child.stderr.close()
 
+    def test_registry_crash_hooks_cover_canonical_import_boundaries(self):
+        points = ("BEFORE_REGISTRY_LOCK", "AFTER_REGISTRY_LOCK", "BEFORE_REGISTRY_UNLOCK")
+        fake_code = """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ['CODEX_HOME'])
+registry = home / 'registry.json'
+if sys.argv[1] == 'import':
+    value = json.loads(registry.read_text())
+    for path in Path(sys.argv[2]).glob('*.auth.json'):
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+"""
+        for point in points:
+            with self.subTest(point=point):
+                with tempfile.TemporaryDirectory(prefix="nightwatch-registry-hook-") as temporary:
+                    root = Path(temporary)
+                    canonical = root / "canonical"
+                    canonical.mkdir(mode=0o700)
+                    (canonical / "registry.json").write_text(json.dumps({
+                        "accounts": {
+                            "user::a": {"account_key": "user::a", "token": "a-old"},
+                            "user::b": {"account_key": "user::b", "token": "b-old"},
+                        },
+                        "active": "user::a",
+                    }), encoding="utf-8")
+                    source = root / "source"
+                    source.mkdir(mode=0o700)
+                    (source / "a.auth.json").write_text(json.dumps({"account_key": "user::a", "token": "a-new"}), encoding="utf-8")
+                    binary = root / "codex-auth"
+                    binary.write_text(fake_code, encoding="utf-8")
+                    binary.chmod(0o700)
+                    child_code = (
+                        "import sys; "
+                        "from nightwatch.account_broker import AccountRegistryLockBroker, CodexAuthAdapter; "
+                        "CodexAuthAdapter(binary=sys.argv[1], codex_home=sys.argv[2], "
+                        "registry_lock=AccountRegistryLockBroker(sys.argv[4])).import_accounts(sys.argv[3])"
+                    )
+                    environment = dict(os.environ)
+                    environment.update({
+                        "PYTHONPATH": str(PRODUCT),
+                        "NIGHTWATCH_ENABLE_TEST_CRASH_HOOKS": "1",
+                        "NIGHTWATCH_TEST_CRASH_POINT": point,
+                    })
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_code, str(binary), str(canonical), str(source), str(root / "control")],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        self.assertEqual(child.wait(timeout=5), -9, point)
+                        registry = json.loads((canonical / "registry.json").read_text(encoding="utf-8"))
+                        expected = "a-new" if point == "BEFORE_REGISTRY_UNLOCK" else "a-old"
+                        self.assertEqual(registry["accounts"]["user::a"]["token"], expected)
+                        self.assertEqual(registry["accounts"]["user::b"]["token"], "b-old")
+                        broker = AccountRegistryLockBroker(root / "control")
+                        lock = broker.acquire(timeout=0.2)
+                        lock.release()
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait(timeout=5)
+                        if child.stdout is not None:
+                            child.stdout.close()
+                        if child.stderr is not None:
+                            child.stderr.close()
+
     def test_codex_auth_child_keeps_registry_lock_after_parent_crash(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-registry-child-crash-") as temporary:
             root = Path(temporary)
