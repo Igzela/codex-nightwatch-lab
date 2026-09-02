@@ -52,7 +52,7 @@ remain inconclusive.
   mailbox root with a symlink is rejected on later reads, and that a state-home
   symlink resolving into the workspace is rejected before creation.
 
-- Current 0.4 regression coverage is 190 tests. The audited upstream
+- Current 0.4 regression coverage is 192 tests. The audited upstream
   `codex-auth 0.3.0-alpha.11` binary was built in isolation and passed the
   Nightwatch adapter contract smoke for list, switch, remove, import, export,
   and round-trip behavior. Canonical discovery found three stored accounts;

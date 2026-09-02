@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 190 Passing](https://img.shields.io/badge/Tests-190%20Passing-success.svg)](#测试验证)
+[![Tests: 192 Passing](https://img.shields.io/badge/Tests-192%20Passing-success.svg)](#测试验证)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -320,7 +320,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 190 tests
+Ran 192 tests
 OK
 ```
 

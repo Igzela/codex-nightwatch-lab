@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 190 Passing](https://img.shields.io/badge/Tests-190%20Passing-success.svg)](#validation)
+[![Tests: 192 Passing](https://img.shields.io/badge/Tests-192%20Passing-success.svg)](#validation)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -322,7 +322,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 190 tests
+Ran 192 tests
 OK
 ```
 

@@ -60,8 +60,8 @@ one lease, and same-thread post-reset success before changing this to PASS.
 
 ## 0.4 account-pool extension
 
-- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 190 tests.
-- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 190 tests;
+- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 192 tests.
+- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 192 tests;
   compileall also passed.
 - Fake account-pool E2E: **PASS** for A→B quota rotation, all-account wait,
   reset re-probe, return to A, controlled handoff, weekly governing quota,
