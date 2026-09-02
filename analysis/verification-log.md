@@ -60,8 +60,8 @@ one lease, and same-thread post-reset success before changing this to PASS.
 
 ## 0.4 account-pool extension
 
-- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 193 tests.
-- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 193 tests;
+- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 195 tests.
+- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 195 tests;
   compileall also passed.
 - One preceding Python 3.11 full-suite attempt reported a single state-identity
   failure in `test_state_is_outside_workspace_and_legacy_state_is_ignored`;
@@ -71,6 +71,10 @@ one lease, and same-thread post-reset success before changing this to PASS.
   reset re-probe, return to A, controlled handoff, weekly governing quota,
   global leases, crash release, stale PID protection, and opaque auth refresh
   preservation.
+- Fault coverage includes a real `AFTER_PROVIDER_EXIT` SIGKILL followed by
+  account-lease reacquisition and successful supervisor reconciliation, plus
+  hidden lock-root replacement while a descendant retains the inherited lease
+  FD.
 - Historical host-only check: installed `codex-auth 0.2.10` does not expose
   the required schema-v1 JSON commands (rc=2, empty stdout), so AUTO_POOL
   without the isolated test override is safely unavailable; CURRENT_ONLY
