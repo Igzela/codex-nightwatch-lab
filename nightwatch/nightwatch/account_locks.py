@@ -165,9 +165,12 @@ class AccountRegistryLockBroker:
             # The directory lock serializes all trusted contenders even if a
             # metadata file is renamed/replaced while this process waits.
             self._assert_root()
-            path = self.path
+            # Use the already-open root directory as the path anchor. A final
+            # pathname check alone cannot stop a root rename between the
+            # check and metadata access.
+            lock_name = self.path.name
             try:
-                existing = os.lstat(path)
+                existing = os.stat(lock_name, dir_fd=root_descriptor, follow_symlinks=False)
                 if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
                     raise AccountSchemaError("canonical registry lock path is not a regular file")
                 if self._path_identity is not None and (existing.st_dev, existing.st_ino) != self._path_identity:
@@ -177,9 +180,9 @@ class AccountRegistryLockBroker:
                     raise AccountSchemaError("canonical registry lock path disappeared")
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
             try:
-                descriptor = os.open(path, flags, 0o600)
+                descriptor = os.open(lock_name, flags, 0o600, dir_fd=root_descriptor)
                 opened = os.fstat(descriptor)
-                named = os.stat(path, follow_symlinks=False)
+                named = os.stat(lock_name, dir_fd=root_descriptor, follow_symlinks=False)
                 if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
                     os.close(descriptor)
                     raise AccountSchemaError("canonical registry lock path is unsafe")
@@ -206,7 +209,7 @@ class AccountRegistryLockBroker:
                 "operation": str(operation)[:80],
                 "acquired_at": now_iso(),
             }
-            lock = AccountRegistryLock(handle, root_descriptor, path, metadata)
+            lock = AccountRegistryLock(handle, root_descriptor, self.path, metadata)
             lock._write_metadata(metadata)
             crash_hook("AFTER_REGISTRY_LOCK")
             if self._path_identity is None:

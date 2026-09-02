@@ -1000,6 +1000,25 @@ class AccountLeaseTests(unittest.TestCase):
                 broker.acquire("user::a", "run", "/repo")
             self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
 
+    def test_replacing_held_account_lease_path_does_not_bypass_exclusion(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-lease-path-replace-") as temporary:
+            root = Path(temporary)
+            broker = AccountLeaseBroker(root / "leases")
+            lease = broker.acquire("user::a", "run-a", "/repo-a")
+            replacement = root / "replacement.lock"
+            try:
+                path = broker.lease_path("user::a")
+                path.rename(replacement)
+                path.write_text("{}\n", encoding="utf-8")
+                with self.assertRaises(AccountBusy):
+                    broker.acquire("user::a", "run-b", "/repo-b")
+                with self.assertRaises(AccountSchemaError):
+                    lease.release()
+            finally:
+                if not lease._released:
+                    lease.release()
+            self.assertTrue(replacement.exists())
+
 
 class RegistryLockTests(unittest.TestCase):
     def test_registry_transaction_serializes_active_restore(self):

@@ -494,10 +494,12 @@ def _identity_matches(record: dict[str, Any]) -> bool:
 class AccountLease(AbstractContextManager["AccountLease"]):
     """A lifetime-held, metadata-audited lease for one OAuth account."""
 
-    def __init__(self, handle: Any, path: Path, metadata: dict[str, Any]):
+    def __init__(self, handle: Any, lock_fd: int, path: Path, metadata: dict[str, Any], path_identity: tuple[int, int]):
         self._handle = handle
+        self._lock_fd = lock_fd
         self.path = path
         self.metadata = metadata
+        self._path_identity = path_identity
         self._released = False
 
     def set_phase(self, phase: str) -> None:
@@ -510,12 +512,13 @@ class AccountLease(AbstractContextManager["AccountLease"]):
     def fd(self) -> int:
         if self._released:
             raise AccountBrokerError("account lease is not active")
-        return self._handle.fileno()
+        return self._lock_fd
 
     def release(self) -> None:
         if self._released:
             return
         try:
+            self._assert_metadata_path()
             current = self._read_metadata(self._handle)
             if current != self.metadata:
                 # Never erase a record that no longer proves this owner.
@@ -525,19 +528,33 @@ class AccountLease(AbstractContextManager["AccountLease"]):
             self._handle.flush()
             os.fsync(self._handle.fileno())
         finally:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-            self._handle.close()
-            self._released = True
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            finally:
+                try:
+                    self._handle.close()
+                finally:
+                    os.close(self._lock_fd)
+                    self._released = True
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         self.release()
 
     def _write_metadata(self, value: dict[str, Any]) -> None:
+        self._assert_metadata_path()
         self._handle.seek(0)
         self._handle.truncate()
         self._handle.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
         self._handle.flush()
         os.fsync(self._handle.fileno())
+
+    def _assert_metadata_path(self) -> None:
+        try:
+            info = os.lstat(self.path)
+        except OSError as exc:
+            raise AccountSchemaError("account lease metadata path disappeared") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != self._path_identity:
+            raise AccountSchemaError("account lease metadata path was replaced")
 
     @staticmethod
     def _read_metadata(handle: Any) -> dict[str, Any] | None:
@@ -568,7 +585,27 @@ class AccountLeaseBroker:
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise AccountSchemaError("account lease root is unsafe")
         self.root = candidate.resolve()
-        os.chmod(self.root, 0o700)
+        self._root_identity = (info.st_dev, info.st_ino)
+        root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_descriptor = os.open(self.root, root_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("account lease root is unsafe")
+            os.fchmod(root_descriptor, 0o700)
+        except OSError as exc:
+            raise AccountSchemaError("account lease root cannot be opened safely") from exc
+        finally:
+            if "root_descriptor" in locals():
+                os.close(root_descriptor)
+
+    def _assert_root(self) -> None:
+        try:
+            info = os.lstat(self.root)
+        except OSError as exc:
+            raise AccountSchemaError("account lease root disappeared") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self._root_identity:
+            raise AccountSchemaError("account lease root was replaced")
 
     def lease_path(self, account_key: str) -> Path:
         return self.root / f"{account_fingerprint(account_key)}.lock"
@@ -582,33 +619,60 @@ class AccountLeaseBroker:
         supervisor_identity: dict[str, Any] | None = None,
         phase: str = "selected",
     ) -> AccountLease:
+        fingerprint = account_fingerprint(account_key)
         path = self.lease_path(account_key)
+        self._assert_root()
+        root_descriptor: int | None = None
+        lock_fd: int | None = None
+        handle: Any | None = None
         try:
-            existing = os.lstat(path)
-            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                raise AccountSchemaError("account lease path is not a regular file")
-        except FileNotFoundError:
-            pass
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags, 0o600)
-            opened = os.fstat(descriptor)
-            if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-                os.close(descriptor)
-                raise AccountSchemaError("account lease path is unsafe")
-            handle = os.fdopen(descriptor, "r+", encoding="utf-8")
-        except OSError as exc:
-            raise AccountUnavailable("account lease path cannot be opened safely") from exc
-        try:
-            os.chmod(path, 0o600)
+            root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            root_descriptor = os.open(self.root, root_flags)
+            root_info = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != self._root_identity:
+                raise AccountSchemaError("account lease root is unsafe")
+            self._assert_root()
+            lock_dir_name = f".{fingerprint}"
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.mkdir(lock_dir_name, mode=0o700, dir_fd=root_descriptor)
+            except FileExistsError:
+                pass
+            lock_dir_info = os.stat(lock_dir_name, dir_fd=root_descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(lock_dir_info.st_mode) or not stat.S_ISDIR(lock_dir_info.st_mode):
+                raise AccountSchemaError("account lease lock directory is unsafe")
+            lock_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(lock_dir_name, lock_flags, dir_fd=root_descriptor)
+            opened_lock_dir = os.fstat(lock_fd)
+            if not stat.S_ISDIR(opened_lock_dir.st_mode) or (opened_lock_dir.st_dev, opened_lock_dir.st_ino) != (lock_dir_info.st_dev, lock_dir_info.st_ino):
+                raise AccountSchemaError("account lease lock directory was replaced")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise AccountBusy(f"account {account_fingerprint(account_key)} is busy") from exc
+                raise AccountBusy(f"account {fingerprint} is busy") from exc
+            self._assert_root()
+            lease_name = path.name
+            try:
+                existing = os.stat(lease_name, dir_fd=root_descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                    raise AccountSchemaError("account lease path is not a regular file")
+            except FileNotFoundError:
+                pass
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(lease_name, flags, 0o600, dir_fd=root_descriptor)
+                opened = os.fstat(descriptor)
+                named = os.stat(lease_name, dir_fd=root_descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                    os.close(descriptor)
+                    raise AccountSchemaError("account lease path is unsafe")
+                handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+                os.fchmod(handle.fileno(), 0o600)
+            except OSError as exc:
+                raise AccountUnavailable("account lease path cannot be opened safely") from exc
             previous = AccountLease._read_metadata(handle)
             if previous is not None:
                 required = {"schema_version", "account_fingerprint", "run_id", "repo", "pid", "starttime", "executable", "phase"}
-                if set(previous) < required or previous.get("schema_version") != 1 or previous.get("account_fingerprint") != account_fingerprint(account_key):
+                if set(previous) < required or previous.get("schema_version") != 1 or previous.get("account_fingerprint") != fingerprint:
                     raise AccountSchemaError("account lease metadata is invalid")
                 if _identity_matches(previous):
                     raise AccountBusy("account lease metadata identifies a live owner")
@@ -617,7 +681,7 @@ class AccountLeaseBroker:
                 raise AccountUnavailable("Linux PID identity is unavailable for account lease")
             metadata = {
                 "schema_version": 1,
-                "account_fingerprint": account_fingerprint(account_key),
+                "account_fingerprint": fingerprint,
                 "run_id": str(run_id),
                 "repo": str(Path(repo).resolve()),
                 "pid": identity["pid"],
@@ -626,14 +690,23 @@ class AccountLeaseBroker:
                 "acquired_at": now_iso(),
                 "phase": phase,
             }
-            lease = AccountLease(handle, path, metadata)
+            lease = AccountLease(handle, lock_fd, path, metadata, (opened.st_dev, opened.st_ino))
             lease._write_metadata(metadata)
+            root_descriptor = None
+            lock_fd = None
+            handle = None
             return lease
         except Exception:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if lock_fd is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
             finally:
-                handle.close()
+                if handle is not None:
+                    handle.close()
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                if root_descriptor is not None:
+                    os.close(root_descriptor)
             raise
 
 
