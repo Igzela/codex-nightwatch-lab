@@ -1038,6 +1038,22 @@ class AccountLeaseTests(unittest.TestCase):
                 if not lease._released:
                     lease.release()
 
+    def test_replacing_hidden_lease_lock_root_fails_closed_on_live_metadata(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-hidden-lease-root-") as temporary:
+            root = Path(temporary)
+            lease_root = root / "leases"
+            broker = AccountLeaseBroker(lease_root)
+            lease = broker.acquire("user::a", "run-a", "/repo-a")
+            old_lock_root = root / "old-account-locks"
+            try:
+                broker._lock_root.rename(old_lock_root)
+                broker._lock_root.mkdir(mode=0o700)
+                replacement_broker = AccountLeaseBroker(lease_root)
+                with self.assertRaises(AccountBusy):
+                    replacement_broker.acquire("user::a", "run-b", "/repo-b")
+            finally:
+                lease.release()
+
 
 class RegistryLockTests(unittest.TestCase):
     def test_registry_transaction_serializes_active_restore(self):
