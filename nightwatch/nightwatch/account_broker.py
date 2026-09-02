@@ -14,7 +14,8 @@ import shutil
 import stat
 import subprocess
 import sys
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,7 @@ class CodexAuthAdapter:
         self.timeout = timeout
         self.canonical_registry = canonical_registry
         self.registry_lock = registry_lock
+        self._registry_context = ContextVar(f"nightwatch-registry-{id(self)}", default=None)
 
     def _resolved_binary(self) -> str | None:
         if os.sep in self.binary:
@@ -216,8 +218,9 @@ class CodexAuthAdapter:
         binary = self._resolved_binary()
         if binary is None:
             raise AccountUnavailable("codex-auth binary is unavailable")
-        with self._registry_guard(args):
+        with self._registry_guard(args) as registry_lock:
             try:
+                pass_fds = (registry_lock.fileno(),) if registry_lock is not None else ()
                 result = subprocess.run(
                     [binary, *args],
                     stdin=subprocess.DEVNULL,
@@ -227,6 +230,7 @@ class CodexAuthAdapter:
                     env=self._environment(),
                     timeout=self.timeout,
                     check=False,
+                    pass_fds=pass_fds,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise AccountUnavailable(f"codex-auth command unavailable: {type(exc).__name__}") from exc
@@ -254,9 +258,34 @@ class CodexAuthAdapter:
     def _valid_account_key(value: Any) -> bool:
         return isinstance(value, str) and bool(value.strip()) and all(ord(char) >= 32 for char in value)
 
+    @contextmanager
+    def registry_transaction(self, *, operation: str = "registry"):
+        """Hold the canonical lock across one logically atomic reconciliation.
+
+        This is deliberately narrower than a provider lease: callers use it
+        only for canonical active-account reads/imports/restores. Individual
+        adapter commands reuse the held lock through a context-local token.
+        """
+        if not self.canonical_registry:
+            yield None
+            return
+        current = self._registry_context.get()
+        if current is not None:
+            yield current
+            return
+        with self._registry_guard([operation]) as registry_lock:
+            token = self._registry_context.set(registry_lock)
+            try:
+                yield registry_lock
+            finally:
+                self._registry_context.reset(token)
+
     def _registry_guard(self, args: list[str]):
         if not self.canonical_registry:
             return nullcontext()
+        current = self._registry_context.get()
+        if current is not None:
+            return nullcontext(current)
         if self.registry_lock is None:
             self.registry_lock = AccountRegistryLockBroker()
         operation = args[0] if args and isinstance(args[0], str) else "registry"
@@ -760,13 +789,18 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         if len(exported) != 1:
             raise AccountSchemaError("account capsule synchronization did not produce exactly one auth snapshot")
         # Import is the documented registry synchronization path; no auth file
-        # contents are parsed or copied by Nightwatch itself.
-        crash_hook("BEFORE_CANONICAL_IMPORT")
-        self.adapter.import_accounts(self.sync_root)
-        crash_hook("AFTER_CANONICAL_IMPORT")
+        # contents are parsed or copied by Nightwatch itself. The active
+        # identity, import, and optional restore are one canonical-registry
+        # transaction so a concurrent Nightwatch sync cannot restore an
+        # active account it observed after this session began.
+        with self.adapter.registry_transaction(operation="capsule-sync"):
+            canonical_active = self.adapter.active_account()
+            crash_hook("BEFORE_CANONICAL_IMPORT")
+            self.adapter.import_accounts(self.sync_root)
+            crash_hook("AFTER_CANONICAL_IMPORT")
+            if canonical_active is not None and canonical_active.account_key != self.account_key:
+                self.adapter.switch(canonical_active.account_key)
         self._remove_staging(self.sync_root)
-        if canonical_active is not None and canonical_active.account_key != self.account_key:
-            self.adapter.switch(canonical_active.account_key)
 
     @staticmethod
     def _harden_tree(root: Path) -> None:

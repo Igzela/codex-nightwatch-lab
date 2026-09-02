@@ -35,6 +35,16 @@ class AccountRegistryLock(AbstractContextManager["AccountRegistryLock"]):
     def __enter__(self) -> "AccountRegistryLock":
         return self
 
+    def fileno(self) -> int:
+        """Return the kernel-lock descriptor for a trusted child process.
+
+        Canonical codex-auth must inherit this descriptor. If Nightwatch is
+        killed while codex-auth is still running, the child then keeps the
+        kernel lock until its own exit instead of mutating the registry after
+        the parent has released the lock by dying.
+        """
+        return self._handle.fileno()
+
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         self.release()
 

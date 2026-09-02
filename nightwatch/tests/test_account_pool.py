@@ -356,6 +356,100 @@ elif command == 'import':
         finally:
             fake.close()
 
+    def test_capsule_crash_seams_leave_parseable_registry_and_attributable_capsule(self):
+        create_points = ("AFTER_CANONICAL_EXPORT", "AFTER_CAPSULE_IMPORT", "AFTER_CAPSULE_PRUNE")
+        sync_points = ("BEFORE_CAPSULE_EXPORT", "AFTER_CAPSULE_EXPORT", "BEFORE_CANONICAL_IMPORT", "AFTER_CANONICAL_IMPORT")
+        fake_code = """#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+home = Path(__import__('os').environ['CODEX_HOME'])
+registry = home / 'registry.json'
+value = json.loads(registry.read_text()) if registry.exists() else {'accounts': {}, 'active': None}
+command = sys.argv[1]
+if command == 'list':
+    rows = [dict(row, active=key == value.get('active')) for key, row in value['accounts'].items()]
+    if '--active' in sys.argv:
+        rows = [row for row in rows if row['active']]
+    print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': rows}))
+elif command == 'switch':
+    value['active'] = sys.argv[2]
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'switch', 'switched_to': {'account_key': sys.argv[2]}}))
+elif command == 'remove':
+    key = sys.argv[2]
+    value['accounts'].pop(key, None)
+    if value.get('active') == key:
+        value['active'] = next(iter(value['accounts']), None)
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [{'account_key': key}]}))
+elif command == 'export':
+    destination = Path(sys.argv[2])
+    destination.mkdir(parents=True, exist_ok=True)
+    for key, row in value['accounts'].items():
+        (destination / (key.replace('::', '--') + '.auth.json')).write_text(json.dumps(row))
+elif command == 'import':
+    for path in Path(sys.argv[2]).glob('*.auth.json'):
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+"""
+        for point in (*create_points, *sync_points):
+            with self.subTest(point=point):
+                with tempfile.TemporaryDirectory(prefix="nightwatch-capsule-crash-") as temporary:
+                    root = Path(temporary)
+                    canonical = root / "canonical"
+                    canonical.mkdir(mode=0o700)
+                    (canonical / "registry.json").write_text(json.dumps({
+                        "accounts": {
+                            "user::a": {"account_key": "user::a", "token": "a-old"},
+                            "user::b": {"account_key": "user::b", "token": "b-old"},
+                        },
+                        "active": "user::a",
+                    }), encoding="utf-8")
+                    binary = root / "codex-auth"
+                    binary.write_text(fake_code, encoding="utf-8")
+                    binary.chmod(0o700)
+                    child_code = (
+                        "import sys; "
+                        "from nightwatch.account_broker import AccountCapsule, AccountRegistryLockBroker, CodexAuthAdapter; "
+                        "adapter = CodexAuthAdapter(binary=sys.argv[1], codex_home=sys.argv[2], "
+                        "registry_lock=AccountRegistryLockBroker(sys.argv[4])); "
+                        "capsule = AccountCapsule.create(adapter, 'user::a', 'crash-run', 1, sys.argv[3]); "
+                        "capsule.synchronize() if sys.argv[5] == 'sync' else None"
+                    )
+                    environment = dict(os.environ)
+                    environment.update({
+                        "PYTHONPATH": str(PRODUCT),
+                        "NIGHTWATCH_ENABLE_TEST_CRASH_HOOKS": "1",
+                        "NIGHTWATCH_TEST_CRASH_POINT": point,
+                    })
+                    mode = "sync" if point in sync_points else "create"
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_code, str(binary), str(canonical), str(root / "capsules"), str(root / "control"), mode],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        return_code = child.wait(timeout=5)
+                        diagnostics = child.stderr.read() if child.stderr is not None else ""
+                        self.assertEqual(return_code, -9, f"{point}: {diagnostics}")
+                        registry = json.loads((canonical / "registry.json").read_text(encoding="utf-8"))
+                        self.assertEqual(registry["accounts"]["user::b"]["token"], "b-old")
+                        capsule_dirs = [path for path in (root / "capsules").iterdir() if path.is_dir()]
+                        self.assertEqual(len(capsule_dirs), 1)
+                        manifest = json.loads((capsule_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
+                        self.assertEqual(manifest["account_fingerprint"], account_fingerprint("user::a"))
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait(timeout=5)
+                        if child.stdout is not None:
+                            child.stdout.close()
+                        if child.stderr is not None:
+                            child.stderr.close()
+
 
 class AccountSelectionTests(unittest.TestCase):
     def candidate(self, key: str, short: float | None, weekly: float | None, **kwargs) -> AccountCandidate:
@@ -908,6 +1002,75 @@ class AccountLeaseTests(unittest.TestCase):
 
 
 class RegistryLockTests(unittest.TestCase):
+    def test_registry_transaction_serializes_active_restore(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-active-") as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {
+                    "user::a": {"account_key": "user::a", "token": "a"},
+                    "user::b": {"account_key": "user::b", "token": "b"},
+                },
+                "active": "user::a",
+            }), encoding="utf-8")
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            (source / "a.auth.json").write_text(json.dumps({"account_key": "user::a", "token": "a-refreshed"}), encoding="utf-8")
+            binary = root / "codex-auth"
+            binary.write_text(
+                """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ['CODEX_HOME'])
+registry = home / 'registry.json'
+value = json.loads(registry.read_text())
+command = sys.argv[1]
+if command == 'list':
+    rows = [dict(row, active=key == value.get('active')) for key, row in value['accounts'].items()]
+    if '--active' in sys.argv:
+        rows = [row for row in rows if row['active']]
+    print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': rows}))
+elif command == 'switch':
+    value['active'] = sys.argv[2]
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'switch', 'switched_to': {'account_key': sys.argv[2]}}))
+elif command == 'import':
+    for path in Path(sys.argv[2]).glob('*.auth.json'):
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+""",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            adapter = CodexAuthAdapter(
+                binary=str(binary),
+                codex_home=canonical,
+                registry_lock=AccountRegistryLockBroker(root / "control"),
+            )
+            ready = threading.Event()
+            switched = threading.Event()
+
+            def external_switch() -> None:
+                ready.wait(timeout=2)
+                adapter.switch("user::b")
+                switched.set()
+
+            thread = threading.Thread(target=external_switch)
+            thread.start()
+            with adapter.registry_transaction(operation="capsule-sync"):
+                active = adapter.active_account()
+                self.assertEqual(active.account_key, "user::a")
+                ready.set()
+                self.assertFalse(switched.wait(0.05))
+                adapter.import_accounts(source)
+                adapter.switch(active.account_key)
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(switched.is_set())
+            self.assertEqual(json.loads((canonical / "registry.json").read_text())['active'], "user::b")
+
     def test_concurrent_canonical_refreshes_are_serialized_and_preserved(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-registry-lock-") as temporary:
             root = Path(temporary)
@@ -1066,6 +1229,69 @@ finally:
                     child.stdout.close()
                 if child.stderr is not None:
                     child.stderr.close()
+
+    def test_codex_auth_child_keeps_registry_lock_after_parent_crash(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-child-crash-") as temporary:
+            root = Path(temporary)
+            started = root / "started"
+            binary = root / "codex-auth"
+            binary.write_text(
+                """#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+Path(os.environ['FAKE_AUTH_STARTED']).write_text(str(os.getpid()))
+time.sleep(1.5)
+print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': []}), flush=True)
+""",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            code = (
+                "import sys; "
+                "from nightwatch.account_broker import CodexAuthAdapter, AccountRegistryLockBroker; "
+                "CodexAuthAdapter(binary=sys.argv[1], codex_home=sys.argv[2], "
+                "registry_lock=AccountRegistryLockBroker(sys.argv[3])).list_accounts()"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(PRODUCT)
+            environment["FAKE_AUTH_STARTED"] = str(started)
+            parent = subprocess.Popen(
+                [sys.executable, "-c", code, str(binary), str(canonical), str(root / "control")],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 2
+                while not started.exists() and time.monotonic() < deadline:
+                    self.assertIsNone(parent.poll())
+                    time.sleep(0.01)
+                self.assertTrue(started.exists())
+                parent.kill()
+                parent.wait(timeout=5)
+                broker = AccountRegistryLockBroker(root / "control")
+                with self.assertRaises(AccountBusy):
+                    broker.acquire(timeout=0.1)
+                deadline = time.monotonic() + 3
+                while True:
+                    try:
+                        lock = broker.acquire(timeout=0.1)
+                        break
+                    except AccountBusy:
+                        if time.monotonic() >= deadline:
+                            raise
+                lock.release()
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                if parent.stdout is not None:
+                    parent.stdout.close()
+                if parent.stderr is not None:
+                    parent.stderr.close()
 
     def test_registry_lock_rejects_symlink_corrupt_and_replaced_roots(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-registry-safety-") as temporary:
