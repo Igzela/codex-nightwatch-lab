@@ -164,6 +164,9 @@ def empty_state(
         "retry_attempt": 0,
         "crash_attempt": 0,
         "recoveries": 0,
+        "quota_cycles": 0,
+        "recovery_failures": 0,
+        "pool_probe_failures": 0,
         "last_event": "run_created",
         "last_provider_exit": None,
         "last_provider_signal": None,
@@ -207,6 +210,10 @@ def validate_state(state: dict[str, Any]) -> None:
         raise ValueError(f"unknown state: {state.get('state')!r}")
     if not isinstance(state.get("generation"), int) or state["generation"] < 1:
         raise ValueError("state.generation must be a positive integer")
+    for field_name in ("recoveries", "quota_cycles", "recovery_failures", "pool_probe_failures"):
+        value = state.get(field_name, 0)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"state.{field_name} must be a non-negative integer")
     if state.get("thread_id") is not None and not isinstance(state["thread_id"], str):
         raise ValueError("state.thread_id must be a string or null")
     if state.get("model") is not None:

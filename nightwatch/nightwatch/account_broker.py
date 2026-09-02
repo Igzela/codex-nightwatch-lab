@@ -14,35 +14,22 @@ import shutil
 import stat
 import subprocess
 import sys
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import fcntl
 
+from .account_errors import AccountBrokerError, AccountBusy, AccountSchemaError, AccountUnavailable
+from .account_locks import AccountRegistryLockBroker
 from .models import QuotaSnapshot
 from .storage import control_plane_root, now_iso
+from .testing import crash_hook
 
 
 SUPPORTED_JSON_SCHEMA = 1
 MAX_JSON_BYTES = 1_000_000
-
-
-class AccountBrokerError(RuntimeError):
-    """Base error for account discovery, activation, and lease operations."""
-
-
-class AccountUnavailable(AccountBrokerError):
-    """The optional codex-auth capability is missing or could not be used."""
-
-
-class AccountSchemaError(AccountBrokerError):
-    """A machine-readable document or lease record cannot be trusted."""
-
-
-class AccountBusy(AccountBrokerError):
-    """Another Nightwatch run currently owns the account lease."""
 
 
 def _looks_like_auth_failure(value: BaseException) -> bool:
@@ -101,10 +88,14 @@ class CodexAuthAdapter:
         binary: str | None = None,
         codex_home: str | Path | None = None,
         timeout: float = 10.0,
+        registry_lock: AccountRegistryLockBroker | None = None,
+        canonical_registry: bool = True,
     ) -> None:
         self.binary = binary or os.environ.get("NIGHTWATCH_CODEX_AUTH_BIN", "codex-auth")
         self.codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
         self.timeout = timeout
+        self.canonical_registry = canonical_registry
+        self.registry_lock = registry_lock
 
     def _resolved_binary(self) -> str | None:
         if os.sep in self.binary:
@@ -141,7 +132,7 @@ class CodexAuthAdapter:
             if not isinstance(item, dict):
                 raise AccountSchemaError("codex-auth account entry is not an object")
             key = item.get("account_key")
-            if not isinstance(key, str) or not key.strip():
+            if not self._valid_account_key(key):
                 raise AccountSchemaError("codex-auth account entry has no stable account_key")
             result.append(
                 AccountRecord(
@@ -195,7 +186,17 @@ class CodexAuthAdapter:
             raise ValueError("account_key must be a non-empty string")
         document = self._run_json(["remove", account_key, "--json"])
         removed = document.get("removed")
-        if not isinstance(removed, list) or account_key not in removed:
+        if not isinstance(removed, list):
+            raise AccountSchemaError("codex-auth remove result is not an account-object array")
+        matched = False
+        for entry in removed:
+            if not isinstance(entry, dict):
+                raise AccountSchemaError("codex-auth remove entry is not an account object")
+            removed_key = entry.get("account_key")
+            if not self._valid_account_key(removed_key):
+                raise AccountSchemaError("codex-auth remove entry has no stable account_key")
+            matched = matched or removed_key == account_key
+        if not matched:
             raise AccountSchemaError("codex-auth remove did not confirm the requested account")
 
     def _run_json(self, args: list[str]) -> dict[str, Any]:
@@ -215,19 +216,20 @@ class CodexAuthAdapter:
         binary = self._resolved_binary()
         if binary is None:
             raise AccountUnavailable("codex-auth binary is unavailable")
-        try:
-            result = subprocess.run(
-                [binary, *args],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=self._environment(),
-                timeout=self.timeout,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AccountUnavailable(f"codex-auth command unavailable: {type(exc).__name__}") from exc
+        with self._registry_guard(args):
+            try:
+                result = subprocess.run(
+                    [binary, *args],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=self._environment(),
+                    timeout=self.timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise AccountUnavailable(f"codex-auth command unavailable: {type(exc).__name__}") from exc
         stdout = result.stdout
         if not require_json:
             if result.returncode != 0:
@@ -247,6 +249,18 @@ class CodexAuthAdapter:
     @staticmethod
     def _optional_text(value: Any) -> str | None:
         return " ".join(value.split())[:160] if isinstance(value, str) and value.strip() else None
+
+    @staticmethod
+    def _valid_account_key(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip()) and all(ord(char) >= 32 for char in value)
+
+    def _registry_guard(self, args: list[str]):
+        if not self.canonical_registry:
+            return nullcontext()
+        if self.registry_lock is None:
+            self.registry_lock = AccountRegistryLockBroker()
+        operation = args[0] if args and isinstance(args[0], str) else "registry"
+        return self.registry_lock.acquire(operation=operation)
 
 
 @dataclass(frozen=True)
@@ -610,7 +624,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         self.codex_home = self.root / "codex-home"
         self.export_root = self.root / "canonical-export"
         self.sync_root = self.root / "synchronized-export"
-        self.capsule_adapter = CodexAuthAdapter(adapter.binary, self.codex_home, adapter.timeout)
+        self.capsule_adapter = CodexAuthAdapter(adapter.binary, self.codex_home, adapter.timeout, canonical_registry=False)
         self._closed = False
 
     @classmethod
@@ -645,14 +659,22 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
             capsule.codex_home.mkdir(mode=0o700)
             capsule.adapter.export_accounts(capsule.export_root)
             capsule._harden_tree(capsule.export_root)
+            crash_hook("AFTER_CANONICAL_EXPORT")
             capsule.capsule_adapter.import_accounts(capsule.export_root)
             capsule._harden_tree(capsule.codex_home)
+            crash_hook("AFTER_CAPSULE_IMPORT")
             # Keep the capsule single-account. This avoids stale mutable
             # snapshots for other accounts surviving beyond this lease.
             for record in capsule.capsule_adapter.list_accounts():
                 if record.account_key != account_key:
                     capsule.capsule_adapter.remove(record.account_key)
-            capsule.capsule_adapter.switch(account_key)
+            selected = capsule.capsule_adapter.switch(account_key)
+            records = capsule.capsule_adapter.list_accounts()
+            if len(records) != 1 or records[0].account_key != account_key or not selected.active or not records[0].active:
+                raise AccountSchemaError("account capsule did not reconcile to the selected active account")
+            # The provider must never see the all-account export staging area.
+            capsule._remove_staging(capsule.export_root)
+            crash_hook("AFTER_CAPSULE_PRUNE")
             return capsule
         except Exception:
             capsule.close(discard_unsynced=True)
@@ -719,20 +741,32 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
     def synchronize(self) -> None:
         if self._closed:
             raise AccountBrokerError("account capsule is closed")
+        # Importing a standard snapshot is a whole-registry operation and the
+        # upstream command makes the imported account active. Remember the
+        # canonical active identity so a finished provider session does not
+        # unexpectedly change the user's global current account.
+        canonical_active = self.adapter.active_account()
         # Query-switch first gives codex-auth its documented opportunity to
         # synchronize a refreshed active auth.json into the managed snapshot.
         self.capsule_adapter.switch(self.account_key)
         self._harden_tree(self.codex_home)
         self.sync_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.sync_root, 0o700)
+        crash_hook("BEFORE_CAPSULE_EXPORT")
         self.capsule_adapter.export_accounts(self.sync_root)
         self._harden_tree(self.sync_root)
+        crash_hook("AFTER_CAPSULE_EXPORT")
         exported = [path for path in self.sync_root.iterdir() if path.is_file() and path.name.endswith(".auth.json")]
         if len(exported) != 1:
             raise AccountSchemaError("account capsule synchronization did not produce exactly one auth snapshot")
         # Import is the documented registry synchronization path; no auth file
         # contents are parsed or copied by Nightwatch itself.
+        crash_hook("BEFORE_CANONICAL_IMPORT")
         self.adapter.import_accounts(self.sync_root)
+        crash_hook("AFTER_CANONICAL_IMPORT")
+        self._remove_staging(self.sync_root)
+        if canonical_active is not None and canonical_active.account_key != self.account_key:
+            self.adapter.switch(canonical_active.account_key)
 
     @staticmethod
     def _harden_tree(root: Path) -> None:
@@ -746,6 +780,18 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
                 os.chmod(path, 0o600)
             else:
                 raise AccountSchemaError("account capsule contains an unsupported file")
+
+    @staticmethod
+    def _remove_staging(root: Path) -> None:
+        """Remove one validated temporary export without following links."""
+        try:
+            info = os.lstat(root)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise AccountSchemaError("account capsule staging path is unsafe")
+        AccountCapsule._harden_tree(root)
+        shutil.rmtree(root)
 
     def close(self, *, discard_unsynced: bool = False) -> None:
         if self._closed:
@@ -763,4 +809,5 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         allowed = self.allowed_root
         if parent != allowed or self.root == allowed or self.root.is_symlink():
             raise AccountSchemaError("refusing to remove an unsafe account capsule path")
+        self._harden_tree(self.root)
         shutil.rmtree(self.root)

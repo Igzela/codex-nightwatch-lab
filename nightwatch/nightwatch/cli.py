@@ -399,6 +399,8 @@ def _render_status(value: dict[str, Any]) -> None:
     print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
     print(f"RUN_ID         {state['run_id']}")
     print(f"GENERATION     {state['generation']}")
+    print(f"QUOTA CYCLES   {state.get('quota_cycles', 0)}")
+    print(f"RECOVERY FAILS {state.get('recovery_failures', 0)}")
     account_mode = state.get("account_mode", "CURRENT_ONLY")
     authorized = state.get("authorized_accounts") or []
     current_account = state.get("current_account_fingerprint") or "(none selected)"

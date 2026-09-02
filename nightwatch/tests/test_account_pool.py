@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from nightwatch.account_broker import (  # noqa: E402
     AccountCapsule,
     AccountLeaseBroker,
     AccountPoolCoordinator,
+    AccountRegistryLockBroker,
     AccountSchemaError,
     AccountUnavailable,
     CodexAuthAdapter,
@@ -28,7 +30,7 @@ from nightwatch.account_broker import (  # noqa: E402
     select_best_account,
 )
 from nightwatch import cli  # noqa: E402
-from nightwatch.models import QuotaSnapshot, QuotaWindow  # noqa: E402
+from nightwatch.models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State  # noqa: E402
 from nightwatch.quota import AppServerQuotaProvider  # noqa: E402
 from nightwatch.storage import NightwatchStore  # noqa: E402
 from nightwatch.supervisor import Supervisor  # noqa: E402
@@ -68,10 +70,11 @@ def auth_payload(*, schema_version: int = 1, stderr: str | None = None) -> dict:
 
 
 class AuthBinary:
-    def __init__(self, payload: dict, *, sleep: float = 0, stderr: str = "", malformed: bool = False, argv_path: Path | None = None):
+    def __init__(self, payload: dict, *, sleep: float = 0, stderr: str = "", malformed: bool = False, argv_path: Path | None = None, remove_result: object | None = None):
         self.temporary = tempfile.TemporaryDirectory(prefix="nightwatch-auth-fake-")
         self.path = Path(self.temporary.name) / "codex-auth"
         argv_capture = f"open({str(argv_path)!r}, 'w').write(json.dumps(sys.argv[1:]))\n" if argv_path else ""
+        remove_result = [{"account_key": "user::a"}] if remove_result is None else remove_result
         code = (
             "#!/usr/bin/env python3\n"
             "import json, sys, time\n"
@@ -80,7 +83,10 @@ class AuthBinary:
             f"{argv_capture}"
             f"if {malformed!r}: print('not-json'); sys.exit(0)\n"
             f"payload = {payload!r}\n"
-            "if sys.argv[1:2] == ['switch']:\n"
+            f"remove_result = {remove_result!r}\n"
+            "if sys.argv[1:2] == ['remove']:\n"
+            "    payload = {'schema_version': 1, 'command': 'remove', 'removed': remove_result}\n"
+            "elif sys.argv[1:2] == ['switch']:\n"
             "    payload = {'schema_version': 1, 'command': 'switch', 'switched_to': {'account_key': sys.argv[2]}}\n"
             "print(json.dumps(payload))\n"
         )
@@ -153,6 +159,44 @@ class AccountBrokerContractTests(unittest.TestCase):
             adapter = CodexAuthAdapter(binary=str(fake.path))
             switched = adapter.switch("user::b")
             self.assertEqual(switched.account_key, "user::b")
+        finally:
+            fake.close()
+
+    def test_remove_accepts_real_schema_v1_account_array(self):
+        fake = AuthBinary(auth_payload(), remove_result=[{"account_key": "user::a", "unknown_optional": {"ignored": True}}])
+        try:
+            CodexAuthAdapter(binary=str(fake.path)).remove("user::a")
+        finally:
+            fake.close()
+
+    def test_remove_requires_requested_account_key(self):
+        fake = AuthBinary(auth_payload(), remove_result=[{"account_key": "user::b"}])
+        try:
+            with self.assertRaises(AccountSchemaError):
+                CodexAuthAdapter(binary=str(fake.path)).remove("user::a")
+        finally:
+            fake.close()
+
+    def test_remove_rejects_string_array_legacy_fake_shape(self):
+        fake = AuthBinary(auth_payload(), remove_result=["user::a"])
+        try:
+            with self.assertRaises(AccountSchemaError):
+                CodexAuthAdapter(binary=str(fake.path)).remove("user::a")
+        finally:
+            fake.close()
+
+    def test_remove_rejects_malformed_account_entries(self):
+        fake = AuthBinary(auth_payload(), remove_result=[{"alias": "missing stable key"}])
+        try:
+            with self.assertRaises(AccountSchemaError):
+                CodexAuthAdapter(binary=str(fake.path)).remove("user::a")
+        finally:
+            fake.close()
+
+    def test_remove_ignores_unknown_optional_fields(self):
+        fake = AuthBinary(auth_payload(), remove_result=[{"account_key": "user::a", "usage": {"access_token": "never retained"}, "future": [1, 2, 3]}])
+        try:
+            CodexAuthAdapter(binary=str(fake.path)).remove("user::a")
         finally:
             fake.close()
 
@@ -252,7 +296,7 @@ elif command == 'remove':
     if value.get('active') == key:
         value['active'] = next(iter(value['accounts']), None)
     registry.write_text(json.dumps(value))
-    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [key]}))
+    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [{'account_key': key, 'unknown_optional': True}]}))
 elif command == 'export':
     destination = Path(sys.argv[2])
     destination.mkdir(parents=True, exist_ok=True)
@@ -270,6 +314,13 @@ elif command == 'import':
             adapter = CodexAuthAdapter(binary=str(binary), codex_home=canonical)
             capsule_root = root / "capsules"
             capsule = AccountCapsule.create(adapter, "user::a", "run", 1, capsule_root)
+            self.assertFalse(capsule.export_root.exists())
+            for path in capsule.root.rglob("*.auth.json"):
+                self.assertTrue(path.is_relative_to(capsule.codex_home))
+            self.assertEqual(
+                [(record.account_key, record.active) for record in capsule.capsule_adapter.list_accounts()],
+                [("user::a", True)],
+            )
             capsule_registry = capsule.codex_home / "registry.json"
             refreshed = json.loads(capsule_registry.read_text())
             refreshed["accounts"]["user::a"]["token"] = "a-refreshed"
@@ -282,6 +333,7 @@ elif command == 'import':
 
             capsule_b = AccountCapsule.create(adapter, "user::b", "run", 2, capsule_root)
             capsule_b.close()
+            self.assertEqual(json.loads((canonical / "registry.json").read_text())["active"], "user::a")
             capsule_a = AccountCapsule.create(adapter, "user::a", "run", 3, capsule_root)
             self.assertEqual(json.loads((capsule_a.codex_home / "registry.json").read_text())["accounts"]["user::a"]["token"], "a-refreshed")
             capsule_a.close()
@@ -292,6 +344,17 @@ elif command == 'import':
             manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
             recovered = AccountCapsule.create(adapter, "user::a", "run", 4, capsule_root)
             recovered.close()
+
+    def test_capsule_prune_failure_cleans_temporary_credentials(self):
+        fake = AuthBinary(auth_payload(), remove_result=["user::b"])
+        try:
+            with tempfile.TemporaryDirectory(prefix="nightwatch-auth-capsule-failure-") as temporary:
+                root = Path(temporary) / "capsules"
+                with self.assertRaises(AccountSchemaError):
+                    AccountCapsule.create(CodexAuthAdapter(binary=str(fake.path)), "user::a", "run", 1, root)
+                self.assertEqual(list(root.iterdir()), [])
+        finally:
+            fake.close()
 
 
 class AccountSelectionTests(unittest.TestCase):
@@ -591,6 +654,156 @@ class AccountPoolFakeE2ETests(unittest.TestCase):
             self.assertEqual([event["event"] for event in events].count("account_pool_wait"), 2)
             self.assertEqual(json.loads((root / ".fake-codex-state.json").read_text(encoding="utf-8")), {"starts": 2, "resumes": 0, "thread_id": "POOL-2", "pool_counts": {b_fp: 1, a_fp: 1}})
 
+    def test_auto_pool_can_complete_more_than_20_normal_quota_cycles(self):
+        fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
+        with tempfile.TemporaryDirectory(prefix="nightwatch-pool-long-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+            git("init", "-q")
+            git("config", "user.email", "nightwatch@example.invalid")
+            git("config", "user.name", "Nightwatch")
+            (root / "README.md").write_text("fixture\n", encoding="utf-8")
+            git("add", "README.md")
+            git("commit", "-qm", "fixture")
+            plan = root / "plan-source.json"
+            plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "long pool mission", "weight": 1}]}), encoding="utf-8")
+            progress = root / "progress-source.json"
+            progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}), encoding="utf-8")
+            a, b = "user::long-a", "user::long-b"
+            a_fp, b_fp = account_fingerprint(a), account_fingerprint(b)
+
+            class PoolAuth:
+                def list_accounts(self):
+                    from nightwatch.account_broker import AccountRecord
+                    return [AccountRecord(a, alias="personal"), AccountRecord(b, alias="backup")]
+
+            class LongSequence:
+                def __init__(self):
+                    self.calls = 0
+
+                def __call__(self, _home, fingerprint, _fd):
+                    self.calls += 1
+                    probe = (self.calls - 1) // 2
+                    if probe == 0:
+                        used = (0, 20) if fingerprint == a_fp else (30, 40)
+                    elif probe % 4 in {0, 1}:
+                        used = (100, 30) if fingerprint == a_fp else (30, 40)
+                    elif probe % 4 == 2:
+                        used = (100, 100)
+                    else:
+                        used = (0, 20) if fingerprint == a_fp else (100, 100)
+                    now = int(time.time())
+                    return _StaticQuota(QuotaSnapshot(
+                        "live_app_server",
+                        "now",
+                        QuotaWindow("5h", used[0], 300, now),
+                        QuotaWindow("weekly", used[1], 10080, now + 1),
+                    ))
+
+            sequence = LongSequence()
+            coordinator = AccountPoolCoordinator(
+                PoolAuth(),
+                AccountLeaseBroker(Path(temporary) / "leases"),
+                quota_factory=sequence,
+                capsule_factory=lambda _adapter, key, _run_id, _generation, **_kwargs: _FakeCapsule(Path(temporary) / account_fingerprint(key)),
+            )
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize(
+                "pool-long-e2e",
+                "continue long pool mission",
+                str(root),
+                verify_commands=["test -f fake-implemented.txt", "git diff --check"],
+                account_mode="AUTO_POOL",
+                authorized_accounts=[a, b],
+            )
+            with patch.dict(os.environ, {
+                "NIGHTWATCH_CODEX_BIN": str(fake_codex),
+                "NIGHTWATCH_SKIP_AUTH_CHECK": "1",
+                "NIGHTWATCH_QUOTA_BUFFER_SECONDS": "0",
+                "FAKE_CODEX_SCENARIO": "pool_long",
+                "FAKE_CODEX_LONG_CYCLES": "30",
+                "FAKE_CODEX_ACCOUNT_A": a_fp,
+                "FAKE_CODEX_ACCOUNT_B": b_fp,
+                "FAKE_CODEX_PLAN_FILE": str(plan),
+                "FAKE_CODEX_PROGRESS_FILE": str(progress),
+            }, clear=False), patch("nightwatch.supervisor._sleep_until"):
+                final = Supervisor(store, account_pool=coordinator).execute(start=True)
+
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertEqual(final["quota_cycles"], 30)
+            self.assertEqual(final["recoveries"], 0)
+            self.assertEqual(final["recovery_failures"], 0)
+            self.assertEqual(final["account_generation"], 31)
+            codex_state = json.loads((root / ".fake-codex-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(codex_state["starts"] + codex_state.get("resumes", 0), 31)
+            self.assertEqual(codex_state["quota_events"], 30)
+            self.assertGreaterEqual(sequence.calls, 60)
+
+    def test_repeated_real_recovery_failures_still_trip_circuit_breaker(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-pool-failure-budget-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+
+            class BrokenAuth:
+                def list_accounts(self):
+                    raise AccountSchemaError("registry authority unavailable")
+
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("pool-failure", "failure budget", str(root), account_mode="AUTO_POOL", authorized_accounts=["user::a"])
+            store.transition(State.PREFLIGHT, "preflight_started", "test")
+            store.transition(State.RUNNING, "provider_launch_ready", "test")
+            store.transition(
+                State.WAIT_QUOTA,
+                "account_pool_wait",
+                "test wait",
+                {"next_resume_at": "2000-01-01T00:00:00Z", "account_reselect": True},
+            )
+            coordinator = AccountPoolCoordinator(BrokenAuth(), AccountLeaseBroker(Path(temporary) / "leases"))
+            supervisor = Supervisor(store, account_pool=coordinator)
+            with patch("nightwatch.supervisor._sleep_until"):
+                self.assertTrue(supervisor._wait_and_revalidate_pool())
+                self.assertTrue(supervisor._wait_and_revalidate_pool())
+                self.assertFalse(supervisor._wait_and_revalidate_pool())
+            state = store.load_state()
+            self.assertEqual(state["state"], State.BLOCKED.value)
+            self.assertEqual(state["recovery_failures"], 3)
+
+    def test_quota_cycles_are_reported_separately_from_failures(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-pool-counters-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("pool-counters", "counter test", str(root), account_mode="AUTO_POOL", authorized_accounts=["user::a"])
+            store.transition(State.PREFLIGHT, "preflight_started", "test")
+            store.transition(State.RUNNING, "provider_launch_ready", "test")
+            final = Supervisor(store, account_pool=object())._rotate_pool_after_quota(
+                ProviderResult(1, None, "THREAD", 1, 0, error_kind=ErrorKind.QUOTA_5H, reset_at=int(time.time()))
+            )
+            self.assertEqual(final["quota_cycles"], 1)
+            self.assertEqual(final["recovery_failures"], 0)
+            self.assertEqual(final["recoveries"], 0)
+
+    def test_current_only_existing_recovery_safety_is_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-current-recovery-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+            store.initialize("current-recovery", "current recovery", str(root))
+            store.transition(State.PREFLIGHT, "preflight_started", "test")
+            store.transition(State.RUNNING, "provider_launch_ready", "test")
+            store.mutate("set_recovery_budget", "test current-only budget", lambda item: {**item, "recoveries": 20})
+            final = Supervisor(store)._enter_quota_wait(
+                ProviderResult(1, None, "THREAD", 1, 0, error_kind=ErrorKind.QUOTA_5H, reset_at=int(time.time()))
+            )
+            self.assertEqual(final["state"], State.FAILED.value)
+
 
 class AccountLeaseTests(unittest.TestCase):
     def test_same_account_is_exclusive_and_different_account_is_independent(self):
@@ -691,6 +904,200 @@ class AccountLeaseTests(unittest.TestCase):
             lease_path.symlink_to(outside)
             with self.assertRaises(AccountSchemaError):
                 broker.acquire("user::a", "run", "/repo")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
+
+
+class RegistryLockTests(unittest.TestCase):
+    def test_concurrent_canonical_refreshes_are_serialized_and_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-lock-") as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {
+                    "user::a": {"account_key": "user::a", "token": "a-old"},
+                    "user::b": {"account_key": "user::b", "token": "b-old"},
+                },
+                "active": "user::a",
+            }), encoding="utf-8")
+            source_a = root / "source-a"
+            source_b = root / "source-b"
+            source_a.mkdir()
+            source_b.mkdir()
+            (source_a / "a.auth.json").write_text(json.dumps({"account_key": "user::a", "token": "a-new"}), encoding="utf-8")
+            (source_b / "b.auth.json").write_text(json.dumps({"account_key": "user::b", "token": "b-new"}), encoding="utf-8")
+            marker = root / "active-import"
+            binary = root / "codex-auth"
+            binary.write_text(
+                """#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+home = Path(os.environ['CODEX_HOME'])
+if sys.argv[1] != 'import':
+    print(json.dumps({'schema_version': 1, 'accounts': []}))
+    raise SystemExit(0)
+marker = Path(os.environ['FAKE_IMPORT_MARKER'])
+try:
+    fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+except FileExistsError:
+    raise SystemExit('overlapping canonical import')
+try:
+    value = json.loads((home / 'registry.json').read_text())
+    time.sleep(0.08)
+    for path in Path(sys.argv[2]).glob('*.auth.json'):
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    (home / 'registry.json').write_text(json.dumps(value))
+finally:
+    marker.unlink(missing_ok=True)
+""",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            lock = AccountRegistryLockBroker(root / "control")
+            adapter = CodexAuthAdapter(binary=str(binary), codex_home=canonical, registry_lock=lock)
+            errors: list[BaseException] = []
+            barrier = threading.Barrier(2)
+
+            def sync(source: Path) -> None:
+                try:
+                    barrier.wait(timeout=2)
+                    adapter.import_accounts(source)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.dict(os.environ, {"FAKE_IMPORT_MARKER": str(marker)}):
+                threads = [threading.Thread(target=sync, args=(source,)) for source in (source_a, source_b)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=3)
+            self.assertFalse(errors, errors)
+            final = json.loads((canonical / "registry.json").read_text(encoding="utf-8"))
+            self.assertEqual(final["accounts"]["user::a"]["token"], "a-new")
+            self.assertEqual(final["accounts"]["user::b"]["token"], "b-new")
+
+    def test_registry_lock_is_not_held_during_provider_scope(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-provider-") as temporary:
+            root = Path(temporary)
+            registry = AccountRegistryLockBroker(root / "control")
+            lease_broker = AccountLeaseBroker(root / "leases")
+            observed: list[bool] = []
+
+            def quota_factory(_home, _fingerprint, _fd):
+                lock = registry.acquire(operation="provider-scope", timeout=0.2)
+                try:
+                    observed.append(True)
+                finally:
+                    lock.release()
+                return _StaticQuota(snapshot(10, 20))
+
+            coordinator = AccountPoolCoordinator(
+                _FakeAuth(),
+                lease_broker,
+                quota_factory=quota_factory,
+                capsule_factory=lambda _adapter, key, _run_id, _generation, **_kwargs: _FakeCapsule(root / account_fingerprint(key)),
+            )
+            decision = coordinator.probe(["user::a"], "run", root, 1)
+            self.assertIsNotNone(decision.selected)
+            self.assertEqual(observed, [True])
+
+    def test_account_lease_precedes_registry_lock_without_deadlock(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-lock-order-") as temporary:
+            root = Path(temporary)
+            events: list[str] = []
+
+            class TracedLeaseBroker(AccountLeaseBroker):
+                def acquire(self, *args, **kwargs):
+                    events.append("account lease")
+                    return super().acquire(*args, **kwargs)
+
+            class TracedRegistryLockBroker(AccountRegistryLockBroker):
+                def acquire(self, *args, **kwargs):
+                    events.append("registry lock")
+                    return super().acquire(*args, **kwargs)
+
+            auth = AuthBinary(auth_payload())
+            try:
+                registry = TracedRegistryLockBroker(root / "control")
+                adapter = CodexAuthAdapter(binary=str(auth.path), codex_home=root / "canonical", registry_lock=registry)
+                lease_broker = TracedLeaseBroker(root / "leases")
+                home = root / "capsule"
+
+                def capsule_factory(current_adapter, _key, _run_id, _generation, **_kwargs):
+                    current_adapter.export_accounts(root / "export")
+                    home.mkdir(exist_ok=True)
+                    return _FakeCapsule(home)
+
+                coordinator = AccountPoolCoordinator(adapter, lease_broker, capsule_factory=capsule_factory)
+                with coordinator.session("user::a", "run", root, 1):
+                    pass
+                self.assertEqual(events[:2], ["account lease", "registry lock"])
+            finally:
+                auth.close()
+
+    def test_registry_lock_crash_releases_kernel_lock(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-crash-") as temporary:
+            root = Path(temporary)
+            code = (
+                "import sys, time; "
+                "from nightwatch.account_broker import AccountRegistryLockBroker; "
+                "lock = AccountRegistryLockBroker(sys.argv[1]).acquire(); "
+                "print('owned', flush=True); time.sleep(30)"
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(PRODUCT)
+            child = subprocess.Popen([sys.executable, "-c", code, str(root / "control")], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "owned")
+                broker = AccountRegistryLockBroker(root / "control")
+                with self.assertRaises(AccountBusy):
+                    broker.acquire(timeout=0.05)
+                child.kill()
+                child.wait(timeout=5)
+                lock = broker.acquire(timeout=0.2)
+                lock.release()
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=5)
+                if child.stdout is not None:
+                    child.stdout.close()
+                if child.stderr is not None:
+                    child.stderr.close()
+
+    def test_registry_lock_rejects_symlink_corrupt_and_replaced_roots(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-safety-") as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            linked = root / "linked"
+            linked.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(AccountSchemaError):
+                AccountRegistryLockBroker(linked)
+
+            broker = AccountRegistryLockBroker(root / "control")
+            broker.path.write_text("not-json\n", encoding="utf-8")
+            broker.path.chmod(0o600)
+            with self.assertRaises(AccountSchemaError):
+                broker.acquire(timeout=0.2)
+
+            broker.path.unlink()
+            broker.root.rename(root / "old-control")
+            (root / "control").mkdir()
+            with self.assertRaises(AccountSchemaError):
+                broker.acquire(timeout=0.2)
+
+    def test_registry_lock_rejects_symlinked_lock_path(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-registry-symlink-") as temporary:
+            root = Path(temporary)
+            broker = AccountRegistryLockBroker(root / "control")
+            outside = root / "outside"
+            outside.write_text("preserve\n", encoding="utf-8")
+            broker.path.symlink_to(outside)
+            with self.assertRaises(AccountSchemaError):
+                broker.acquire(timeout=0.2)
             self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
 
 

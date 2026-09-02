@@ -1218,7 +1218,7 @@ def status_run(run: RunRecord) -> str:
         f"Repository  {run.repo}",
         f"Run         {state.get('run_id')}",
         f"Thread      {thread_label}",
-        f"Generation  {state.get('generation')} · recoveries {state.get('recoveries', 0)}",
+        f"Generation  {state.get('generation')} · quota cycles {state.get('quota_cycles', 0)} · recovery failures {state.get('recovery_failures', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Account     {_account_line(state)}",
         f"Quota       {_quota_line(state)} · authority {state.get('quota_source') or '(none)'}",
@@ -1271,6 +1271,7 @@ def recap_run(run: RunRecord) -> str:
         f"Model        {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Runtime      {state.get('created_at')} → {state.get('updated_at')}",
         f"Recoveries   {state.get('recoveries', 0)}",
+        f"Quota cycles {state.get('quota_cycles', 0)} · recovery failures {state.get('recovery_failures', 0)}",
         f"Milestones   {progress['verified_count']}/{progress['total_count']} verified",
         "Checks       trusted verification policy:",
     ]
@@ -1337,6 +1338,7 @@ def _thread(run: RunRecord) -> str:
         f"Thread      {run.thread_id or '(not captured)'}",
         f"Generation  {run.state.get('generation')}",
         f"Recoveries  {run.state.get('recoveries', 0)}",
+        f"Quota cycles {run.state.get('quota_cycles', 0)} · recovery failures {run.state.get('recovery_failures', 0)}",
         "Provider turns:",
     ]
     lines.extend(f"  {generation}: {action}" for generation, action in provider_commands)

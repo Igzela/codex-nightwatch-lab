@@ -34,8 +34,11 @@ from .testing import crash_hook
 
 MAX_TRANSIENT_RETRIES = 3
 MAX_CRASH_RETRIES = 3
+# CURRENT_ONLY keeps its historical defensive recovery budget. AUTO_POOL
+# quota rotation is normal operation and uses quota_cycles instead; only
+# abnormal recovery failures consume MAX_RECOVERY_FAILURES.
 MAX_QUOTA_RECOVERIES = 20
-MAX_QUOTA_REVALIDATION_FAILURES = 3
+MAX_RECOVERY_FAILURES = 3
 QUOTA_POLL_SECONDS = 30
 QUOTA_BUFFER_SECONDS = 60
 TRANSIENT_BACKOFF_SECONDS = (2, 5, 15)
@@ -780,6 +783,7 @@ class Supervisor:
                 "quota": selected.quota.to_dict() if selected and selected.quota else item.get("quota"),
                 "quota_source": selected.quota.source if selected and selected.quota else item.get("quota_source"),
                 "pool_probe_failures": 0,
+                "recovery_failures": 0,
             },
         )
 
@@ -844,6 +848,7 @@ class Supervisor:
                 excluded=set((state.get("account_errors") or {}).keys()),
             )
         except AccountBrokerError as exc:
+            self._count_pool_recovery_failure(f"AUTO_POOL account discovery/probe failed: {type(exc).__name__}")
             self._fail_closed(f"AUTO_POOL account discovery/probe failed: {type(exc).__name__}", ErrorKind.AUTH)
             return False
         if self._persist_pool_selection(decision, "highest usable account capacity selected"):
@@ -905,8 +910,6 @@ class Supervisor:
 
     def _rotate_pool_after_quota(self, result: ProviderResult) -> dict[str, Any]:
         state = self.store.load_state()
-        if state["recoveries"] >= MAX_QUOTA_RECOVERIES:
-            return self._fail_closed("account-pool quota recovery circuit breaker reached", ErrorKind.QUOTA_5H)
         windows = result.quota_windows or [QuotaWindow("weekly" if result.error_kind == ErrorKind.QUOTA_WEEKLY else "5h", 100, 10080 if result.error_kind == ErrorKind.QUOTA_WEEKLY else 300, result.reset_at)]
         return self.store.transition(
             State.RECOVERING,
@@ -914,7 +917,7 @@ class Supervisor:
             result.error_detail or result.error_kind.value,
             {
                 "generation": state["generation"] + 1,
-                "recoveries": state["recoveries"] + 1,
+                "quota_cycles": int(state.get("quota_cycles", 0)) + 1,
                 "current_account_key": None,
                 "current_account_fingerprint": None,
                 "account_reselect": True,
@@ -982,7 +985,7 @@ class Supervisor:
 
     def _enter_quota_wait(self, result: ProviderResult) -> dict[str, Any]:
         state = self.store.load_state()
-        if state["recoveries"] >= MAX_QUOTA_RECOVERIES:
+        if state.get("recoveries", 0) >= MAX_QUOTA_RECOVERIES:
             return self._fail_closed("quota recovery circuit breaker reached", ErrorKind.QUOTA_5H)
         windows = result.quota_windows or [QuotaWindow("weekly" if result.error_kind == ErrorKind.QUOTA_WEEKLY else "5h", 100, 10080 if result.error_kind == ErrorKind.QUOTA_WEEKLY else 300, result.reset_at)]
         reset = result.reset_at or max((window.resets_at or 0 for window in windows), default=0)
@@ -1001,7 +1004,7 @@ class Supervisor:
             "resume_claim": None,
             "retry_attempt": 0,
             "crash_attempt": 0,
-            "recoveries": state["recoveries"] + 1,
+            "recoveries": state.get("recoveries", 0) + 1,
             "last_error": result.error_detail,
             "error_kind": result.error_kind.value,
         })
@@ -1064,16 +1067,28 @@ class Supervisor:
             self._enter_pool_wait(decision, "account pool remains exhausted or busy")
             return True
         except AccountBrokerError as exc:
-            failures = int(state.get("pool_probe_failures", 0)) + 1
-            if failures >= MAX_QUOTA_REVALIDATION_FAILURES:
-                self._fail_closed("account-pool authoritative revalidation failed repeatedly", ErrorKind.STATE)
+            failures = int(state.get("recovery_failures", state.get("pool_probe_failures", 0))) + 1
+            detail = f"account-pool revalidation failed: {type(exc).__name__}"
+            if failures >= MAX_RECOVERY_FAILURES:
+                self.store.transition(
+                    State.BLOCKED,
+                    "account_pool_recovery_budget_exhausted",
+                    "account-pool authoritative revalidation failed repeatedly",
+                    {
+                        "recovery_failures": failures,
+                        "pool_probe_failures": failures,
+                        "last_error": detail,
+                        "error_kind": ErrorKind.STATE.value,
+                        "resume_claim": None,
+                    },
+                )
                 return False
             retry = int(time.time()) + QUOTA_POLL_SECONDS * failures
             self.store.transition(
                 State.WAIT_QUOTA,
                 "account_pool_probe_failed",
-                f"account-pool revalidation failed: {type(exc).__name__}",
-                {"next_resume_at": datetime.fromtimestamp(retry, timezone.utc).isoformat().replace("+00:00", "Z"), "pool_probe_failures": failures, "last_error": f"account-pool revalidation failed: {type(exc).__name__}"},
+                detail,
+                {"next_resume_at": datetime.fromtimestamp(retry, timezone.utc).isoformat().replace("+00:00", "Z"), "pool_probe_failures": failures, "recovery_failures": failures, "last_error": detail},
             )
             return True
 
@@ -1185,6 +1200,13 @@ class Supervisor:
         target = State.BLOCKED if kind in {ErrorKind.STATE, ErrorKind.GIT, ErrorKind.MALFORMED, ErrorKind.BLOCKER} else State.FAILED
         return self.store.transition(target, "fail_closed", reason, {"last_error": reason, "error_kind": kind.value, "blocker": reason if target == State.BLOCKED else current.get("blocker")})
 
+    def _count_pool_recovery_failure(self, detail: str) -> None:
+        self.store.mutate(
+            "account_pool_recovery_failure",
+            detail,
+            lambda item: {**item, "recovery_failures": int(item.get("recovery_failures", 0)) + 1},
+        )
+
     def _write_done_report(self, verification: dict[str, Any]) -> dict[str, Any]:
         crash_hook("BEFORE_DONE_WRITE")
         state = self.store.transition(State.DONE, "done_guard_passed", "all required milestones and final verification passed", {"final_verification_passed": True, "last_verified_commit": verification["git"].get("head")})
@@ -1222,6 +1244,8 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         f"- REASONING: {state.get('reasoning_effort') or '(Codex default)'}",
         f"- QUOTA SOURCE: {state.get('quota_source') or '(none)'}",
         f"- RECOVERIES: {state.get('recoveries', 0)}",
+        f"- QUOTA CYCLES: {state.get('quota_cycles', 0)}",
+        f"- RECOVERY FAILURES: {state.get('recovery_failures', 0)}",
         f"- FINAL HEAD: {state.get('last_verified_commit') or state.get('last_git_head') or '(unknown)'}",
         "",
         "## QUOTA WINDOWS",
