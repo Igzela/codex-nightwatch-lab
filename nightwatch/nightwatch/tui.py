@@ -22,6 +22,7 @@ from .operations import (
     create_worktree,
     doctor_snapshot,
     list_models,
+    list_account_choices,
     queue_steer,
     resume_service,
     start_run,
@@ -196,6 +197,7 @@ class TuiHooks:
     stop: Callable[..., ActionResult] | None = None
     run_exists: Callable[..., bool] | None = None
     list_models: Callable[..., list[dict[str, Any]]] | None = None
+    list_accounts: Callable[..., list[Any]] | None = None
     doctor: Callable[..., dict[str, Any]] | None = None
     write_report: Callable[..., Path] | None = None
 
@@ -304,6 +306,8 @@ class TuiController:
             window = overlay.items[start : start + limit]
             for index, item in enumerate(window, start=start):
                 mark = "▶" if index == overlay.selected else " "
+                if overlay.kind == "accounts":
+                    mark = "[x]" if item.payload.get("selected") else "[ ]"
                 detail = f"  {item.detail}" if item.detail else ""
                 out.append(f"{mark} {item.key:<12} {item.title}{detail}"[: width - 1])
         return out
@@ -316,6 +320,8 @@ class TuiController:
             return "↑/↓ select · Enter runs · Esc closes the menu"
         if overlay.kind == "picker":
             return "↑/↓ select a session · Enter continues · Esc cancels"
+        if overlay.kind == "accounts":
+            return "↑/↓ move · Space toggle · Enter confirms pool · c current-only · Esc cancels"
         if overlay.kind == "confirm":
             if overlay.mode == "worktree":
                 return "Type a worktree label · Enter continues · Esc cancels"
@@ -421,6 +427,43 @@ class TuiController:
             if len(key) == 1 and key.isprintable() and len(self.composer) < MAX_GOAL_CHARS:
                 self.composer += key
             return
+        if overlay.kind == "accounts":
+            if key == "esc":
+                self.overlay = None
+                self.composer = ""
+                return
+            if key == "up":
+                overlay.selected = max(0, overlay.selected - 1)
+                return
+            if key == "down":
+                overlay.selected = min(max(0, len(overlay.items) - 1), overlay.selected + 1)
+                return
+            if key == "space":
+                if overlay.items:
+                    item = overlay.items[overlay.selected]
+                    item.payload["selected"] = not bool(item.payload.get("selected"))
+                return
+            if key == "enter":
+                selected = [item.payload["account_key"] for item in overlay.items if item.payload.get("selected")]
+                if not selected:
+                    self.message = "Select at least one account, or Esc for current account only."
+                    return
+                if self.pending is not None:
+                    self.pending["account_mode"] = "auto-pool"
+                    self.pending["account_selectors"] = tuple(selected)
+                self.overlay = None
+                self.composer = ""
+                self._refresh_confirm_body()
+                return
+            if key == "c":
+                if self.pending is not None:
+                    self.pending["account_mode"] = "current-only"
+                    self.pending["account_selectors"] = ()
+                self.overlay = None
+                self.composer = ""
+                self._refresh_confirm_body()
+                return
+            return
         if overlay.kind == "confirm":
             if key == "esc":
                 self.overlay = None
@@ -449,6 +492,9 @@ class TuiController:
                     self._refresh_confirm_body()
                     return
                 self._commit_confirm()
+                return
+            if overlay.mode == "run" and key == "a" and not self.composer:
+                self._open_account_picker()
                 return
             if key == "backspace":
                 self.composer = self.composer[:-1]
@@ -615,6 +661,7 @@ class TuiController:
             f"Nightwatch doctor: {report['status']}",
             f"Codex: {report.get('codex_version') or '(missing)'}",
             f"Auth: {report['auth']['status']}",
+            f"Account pool: {report.get('account_pool', {}).get('status', 'optional unavailable')} ({report.get('account_pool', {}).get('count', 0)} stored)",
             f"Quota authority: {report['quota'].get('authority', 'unavailable')} ({report['quota'].get('source', 'none')})",
         ]
         if report["quota"].get("primary"):
@@ -634,7 +681,7 @@ class TuiController:
                 exists = False
         else:
             exists = bool(exists_fn(repo))
-        self.pending = {"kind": "run", "goal": goal, "repo": repo, "verify": [], "model": None, "effort": None, "worktree": None}
+        self.pending = {"kind": "run", "goal": goal, "repo": repo, "verify": [], "model": None, "effort": None, "worktree": None, "account_mode": "current-only", "account_selectors": ()}
         self.composer = ""
         if exists:
             self.overlay = Overlay(
@@ -653,6 +700,9 @@ class TuiController:
         target = repo.parent / ".worktrees" / repo.name / label if label else repo
         checks = pending.get("verify") or []
         verify_text = "\n             ".join(checks) if checks else "none (cannot reach trusted DONE)"
+        account_mode = pending.get("account_mode", "current-only")
+        account_selectors = pending.get("account_selectors") or ()
+        account_text = f"AUTO_POOL · {len(account_selectors)} explicitly selected" if account_mode == "auto-pool" else "CURRENT_ONLY · current account"
         self.overlay = Overlay(
             kind="confirm",
             mode="run",
@@ -665,10 +715,41 @@ class TuiController:
                 "Model       Codex default",
                 "Reasoning   Codex default",
                 f"Verification {verify_text}",
+                f"Accounts    {account_text}",
+                "Authority   Codex App Server · Policy max usable capacity" if account_mode == "auto-pool" else "Authority   Codex App Server",
                 "Service      repo-specific systemd user unit",
-                "Type a verify command and Enter to add it; empty Enter confirms.",
+                "Press `a` to select an explicit account pool; type a verify command and Enter to add it; empty Enter confirms.",
             ]),
         )
+
+    def _open_account_picker(self) -> None:
+        if not self.pending or self.pending.get("kind") != "run":
+            return
+        try:
+            accounts = self.hooks.list_accounts() if self.hooks.list_accounts else list_account_choices()
+        except Exception as exc:
+            self.message = f"Account pool unavailable; current account only ({type(exc).__name__})"
+            return
+        selected = set(self.pending.get("account_selectors") or ())
+        items = [
+            OverlayItem(
+                item.fingerprint,
+                item.display_name,
+                item.plan or item.auth_mode or "stored account",
+                {"account_key": item.account_key, "selected": item.account_key in selected},
+            )
+            for item in accounts
+        ]
+        if not items:
+            self.message = "No stored accounts are available; current account only."
+            return
+        self.overlay = Overlay(
+            kind="accounts",
+            title="SELECT ACCOUNT POOL",
+            body="Space toggles an account · Enter confirms AUTO_POOL · c keeps CURRENT_ONLY · Esc cancels",
+            items=items,
+        )
+        self.composer = ""
 
     def _open_adopt_picker(self) -> None:
         repo = Path(self.repo or Path.cwd())
@@ -834,6 +915,8 @@ class TuiController:
                 pending.get("effort"),
                 tuple(pending.get("verify") or ()),
                 service=True,
+                account_mode=pending.get("account_mode", "current-only"),
+                account_selectors=tuple(pending.get("account_selectors") or ()),
             )
             start = self.hooks.start_run or start_run
             result = start(spec, run_in_service=True)
@@ -963,8 +1046,23 @@ def _quota_line(state: dict[str, Any]) -> str:
     return " · ".join(values) or "not sampled"
 
 
+def _account_line(state: dict[str, Any]) -> str:
+    mode = state.get("account_mode", "CURRENT_ONLY")
+    if mode != "AUTO_POOL":
+        return "CURRENT_ONLY · current account"
+    total = len(state.get("authorized_accounts") or [])
+    current = state.get("current_account_fingerprint") or "none selected"
+    if state.get("state") == State.WAIT_QUOTA.value:
+        reason = state.get("pool_wait_reason") or "re-probe pending"
+        return f"AUTO_POOL · {total} authorized · {reason} · next {state.get('next_resume_at') or 'unknown'}"
+    lease = "lease owned" if state.get("account_lease") else "lease not held"
+    return f"AUTO_POOL · {total} authorized · {current} · {lease}"
+
+
 def _next_action(state: dict[str, Any]) -> str:
     if state.get("state") == State.WAIT_QUOTA.value:
+        if state.get("account_mode", "CURRENT_ONLY") == "AUTO_POOL":
+            return "re-probe account pool at the earliest relevant reset"
         if not state.get("thread_id"):
             return "revalidate quota at reset, then start first thread"
         return "revalidate quota at reset, then resume exact thread"
@@ -1097,6 +1195,7 @@ def render_dashboard(runs: list[RunRecord], selected: int = 0, width: int = 100,
             f"Goal       {str(state.get('goal') or '')[: max(10, width - 12)]}",
             f"Repository {run.repo}",
             f"Thread     {thread_label} · generation {state.get('generation')}",
+            f"Account    {_account_line(state)}",
             f"Agent      {_agent_summary(state)}",
             f"Current    {(current or {}).get('id', 'complete')} · {(current or {}).get('title', 'all trusted milestones verified')}",
             f"Last       {state.get('last_event') or '(none)'}",
@@ -1121,6 +1220,7 @@ def status_run(run: RunRecord) -> str:
         f"Thread      {thread_label}",
         f"Generation  {state.get('generation')} · recoveries {state.get('recoveries', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
+        f"Account     {_account_line(state)}",
         f"Quota       {_quota_line(state)} · authority {state.get('quota_source') or '(none)'}",
         f"Progress    {_bar(progress['verified_percent'], 24)} {progress['verified_percent']}% trusted verified",
         f"Milestones  {progress['implemented_count']}/{progress['total_count']} implemented · {progress['verified_count']}/{progress['total_count']} verified",
@@ -1308,6 +1408,8 @@ class _CursesApp:
             return "pagedown"
         if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
             return "backspace"
+        if key == " ":
+            return "space"
         if key in ("\n", "\r"):
             return "enter"
         if key == "\x1b":

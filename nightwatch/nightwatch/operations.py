@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .git import GitError, repo_root, snapshot
+from .account_broker import AccountBrokerError, AccountRecord, CodexAuthAdapter
 from .models import (
     State,
     TERMINAL_STATES,
@@ -62,6 +63,8 @@ class RunSpec:
     verify_commands: tuple[str, ...] = ()
     thread_id: str | None = None
     service: bool = True
+    account_mode: str = "current-only"
+    account_selectors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repo", Path(self.repo).expanduser().resolve())
@@ -77,6 +80,18 @@ class RunSpec:
             if "\n" in thread or "\t" in thread:
                 raise ValueError("thread ID must be a single line")
             object.__setattr__(self, "thread_id", thread)
+        mode = self.account_mode.replace("-", "_").upper()
+        if mode not in {"CURRENT_ONLY", "AUTO_POOL"}:
+            raise ValueError("account mode must be current-only or auto-pool")
+        if mode == "AUTO_POOL" and not self.account_selectors:
+            raise ValueError("auto-pool requires at least one explicitly selected account")
+        if mode == "CURRENT_ONLY" and self.account_selectors:
+            raise ValueError("--account selectors require --account-mode auto-pool")
+        object.__setattr__(self, "account_mode", mode)
+        selectors = tuple(validate_human_text(item, "account selector", 512) for item in self.account_selectors)
+        if len(selectors) != len(set(selectors)):
+            raise ValueError("account selectors must be unique")
+        object.__setattr__(self, "account_selectors", selectors)
 
 
 def service_name(service_root: Path) -> str:
@@ -228,6 +243,8 @@ def adopt_run(spec: RunSpec) -> ActionResult:
         spec.verify_commands,
         spec.thread_id,
         service=False,
+        account_mode=spec.account_mode,
+        account_selectors=spec.account_selectors,
     )
     result = start_run(bound, run_in_service=False)
     if not result.ok:
@@ -339,6 +356,11 @@ def start_run(spec: RunSpec, run_in_service: bool = True) -> ActionResult:
             return ActionResult(False, f"Refusing to overwrite invalid durable state: {exc}")
         return ActionResult(False, f"A run already exists in {root} (state={state['state']}); use /resume")
 
+    try:
+        authorized = resolve_authorized_accounts(spec, root)
+    except (AccountBrokerError, ValueError) as exc:
+        return ActionResult(False, f"Account configuration rejected: {exc}")
+
     state = store.initialize(
         make_run_id(str(root)),
         spec.goal,
@@ -347,6 +369,8 @@ def start_run(spec: RunSpec, run_in_service: bool = True) -> ActionResult:
         thread_id=spec.thread_id,
         model=spec.model,
         reasoning_effort=spec.reasoning_effort,
+        account_mode=spec.account_mode,
+        authorized_accounts=authorized,
     )
     if run_in_service:
         try:
@@ -360,6 +384,34 @@ def start_run(spec: RunSpec, run_in_service: bool = True) -> ActionResult:
                 f"Goal saved as NEW, but user service could not be started; run `nightwatch resume --repo {root}`: {exc}",
             )
     return ActionResult(True, f"Nightwatch goal initialized: run_id={state['run_id']}")
+
+
+def resolve_authorized_accounts(spec: RunSpec, root: Path) -> list[str]:
+    """Resolve explicit human selectors to stable codex-auth account keys."""
+    if spec.account_mode == "CURRENT_ONLY":
+        return []
+    adapter = CodexAuthAdapter()
+    accounts = adapter.list_accounts()
+    selected: list[str] = []
+    for selector in spec.account_selectors:
+        exact = [item for item in accounts if item.account_key == selector]
+        matches = exact or [
+            item for item in accounts
+            if selector.casefold() in {value.casefold() for value in (item.alias, item.account_name) if value}
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"account selector {selector!r} did not resolve to exactly one stored account")
+        key = matches[0].account_key
+        if key not in selected:
+            selected.append(key)
+    if not selected:
+        raise ValueError("auto-pool requires at least one explicitly selected account")
+    return selected
+
+
+def list_account_choices() -> list[AccountRecord]:
+    """Return local account choices for human confirmation surfaces."""
+    return CodexAuthAdapter().list_accounts()
 
 
 def list_models() -> list[dict[str, Any]]:
@@ -448,7 +500,13 @@ def doctor_snapshot(repo: Path | None = None) -> dict[str, Any]:
         "systemd_inhibit": inhibit_ok,
         "auth": {"status": "unknown"},
         "quota": {"status": "unknown"},
+        "account_pool": {"status": "optional_unavailable", "count": 0},
     }
+    try:
+        accounts = CodexAuthAdapter().list_accounts()
+        report["account_pool"] = {"status": "available", "count": len(accounts), "fingerprints": [item.fingerprint for item in accounts]}
+    except AccountBrokerError as exc:
+        report["account_pool"] = {"status": "optional_unavailable", "count": 0, "error": type(exc).__name__}
     try:
         result = subprocess.run(
             [binary, "--version"],

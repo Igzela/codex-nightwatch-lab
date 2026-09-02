@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .codex import run_codex
+from .account_broker import (
+    AccountBrokerError,
+    AccountBusy,
+    AccountLeaseBroker,
+    AccountPoolCoordinator,
+    AccountSchemaError,
+    CodexAuthAdapter,
+    PoolDecision,
+    account_fingerprint,
+)
 from .git import GitError, GitSnapshot, is_ancestor, repo_root, snapshot
 from .milestones import adopt_proposed_plan, current_milestone, ingest_progress, verify_milestones
 from .models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State, TERMINAL_STATES
@@ -351,10 +361,38 @@ Determine which milestones are actually verified from available repository evide
 Repair unfinished work until those exact commands pass; do not edit policy or claim verification authority. If blocked, write `.nightwatch-agent/blocker.json` and explain the missing human decision or external prerequisite."""
 
 
+def handoff_prompt(store: NightwatchStore, state: dict[str, Any], packet: dict[str, Any]) -> str:
+    verification = "\n".join(f"- {command}" for command in packet["verification_commands"]) or "- No trusted automatic verification is configured."
+    return f"""Continue the same Nightwatch mission through a controlled account handoff.
+
+This is a NEW Codex conversation, not an exact resume of the prior conversation.
+Nightwatch has not proven cross-account exact-thread portability for this Codex
+version. Use only the trusted facts below; model narrative from the prior
+conversation is not authority.
+
+Original goal:
+{packet['goal']}
+
+Repository/worktree: {packet['repo']}
+Trusted Git HEAD: {packet['git_head']}
+Prior thread ID (audit only): {packet['prior_thread_id']}
+Account handoff generation: {packet['generation']}
+Verified milestones: {', '.join(packet['verified_milestones']) or '(none)'}
+Remaining milestones: {', '.join(packet['remaining_milestones']) or '(none)'}
+Durable blocker: {packet['blocker'] or '(none)'}
+Frozen verification commands:
+{verification}
+
+Before changing files, create `.nightwatch-agent/proposed-plan.json` bound to
+the Nightwatch goal hash. Continue the same mission and preserve the frozen
+verification policy; do not claim that this is the same Codex conversation."""
+
+
 class Supervisor:
-    def __init__(self, store: NightwatchStore, quota_provider=None):
+    def __init__(self, store: NightwatchStore, quota_provider=None, account_pool=None):
         self.store = store
         self.quota_provider = quota_provider or make_quota_provider()
+        self.account_pool = account_pool
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -369,6 +407,34 @@ class Supervisor:
                 os.kill(active["pid"], signal.SIGINT)
             except OSError:
                 pass
+
+    def _pool_coordinator(self) -> AccountPoolCoordinator:
+        if self.account_pool is None:
+            self.account_pool = AccountPoolCoordinator(CodexAuthAdapter(), AccountLeaseBroker())
+        return self.account_pool
+
+    def _is_auto_pool(self, state: dict[str, Any] | None = None) -> bool:
+        state = state or self.store.load_state()
+        return state.get("account_mode", "CURRENT_ONLY") == "AUTO_POOL"
+
+    def _reconcile_pool_authority(self, state: dict[str, Any]) -> bool:
+        """Re-read active-account identity after restart without switching it."""
+        try:
+            active = self._pool_coordinator().active_account()
+        except AccountBrokerError as exc:
+            self._fail_closed(f"AUTO_POOL active-account reconciliation failed: {type(exc).__name__}", ErrorKind.STATE)
+            return False
+        if active is None:
+            return True
+        if active.account_key not in set(state.get("authorized_accounts") or []):
+            self._fail_closed("codex-auth active account is outside the explicitly authorized pool", ErrorKind.STATE)
+            return False
+        self.store.mutate(
+            "account_authority_reconciled",
+            "active account identity re-read after supervisor restart",
+            lambda item: {**item, "active_account_fingerprint": active.fingerprint},
+        )
+        return True
 
     def execute(self, start: bool = False) -> dict[str, Any]:
         try:
@@ -453,6 +519,7 @@ class Supervisor:
             if git.conflicts:
                 self._fail_closed("repository has unresolved merge conflicts", ErrorKind.GIT)
                 return False
+            self.store.mutate("git_preflight_observed", "Git HEAD captured before account-pool/provider work", lambda item: {**item, "last_git_head": git.head})
         except GitError:
             self._fail_closed("Git preflight failed", ErrorKind.GIT)
             return False
@@ -477,6 +544,8 @@ class Supervisor:
         if not auth_ok:
             self._fail_closed("Codex authentication sanity check failed", ErrorKind.AUTH)
             return False
+        if self._is_auto_pool(state):
+            return self._prepare_pool_account(reselect=True) or self.store.load_state()["state"] == State.WAIT_QUOTA.value
         try:
             quota = self.quota_provider.read()
             self.store.mutate("quota_sanity_ok", "quota provider returned a validated snapshot", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
@@ -519,9 +588,17 @@ class Supervisor:
             if state.get("resume_claim"):
                 self._fail_closed("prior exact-thread resume result is ambiguous after supervisor restart", ErrorKind.STATE)
                 return False
+            if self._is_auto_pool(state):
+                if not self._reconcile_pool_authority(state):
+                    return False
+                self.store.mutate("account_reselection_required", "supervisor restart requires fresh account authority reconciliation", lambda item: {**item, "account_reselect": True, "account_lease": None})
             return True
         if state["state"] == State.RUNNING.value and state.get("thread_id"):
             self.store.transition(State.RECOVERING, "supervisor_restart_recovery", "running state with exact thread recovered from disk")
+        if self._is_auto_pool(state):
+            if not self._reconcile_pool_authority(state):
+                return False
+            self.store.mutate("account_reselection_required", "supervisor restart requires fresh account authority reconciliation", lambda item: {**item, "account_reselect": True, "account_lease": None})
         if state.get("resume_claim"):
             claim = state["resume_claim"]
             if claim.get("phase") == "claimed":
@@ -536,11 +613,31 @@ class Supervisor:
         thread = state.get("thread_id")
         if state["state"] in {State.PREFLIGHT.value, State.RECOVERING.value}:
             state = self.store.transition(State.RUNNING, "provider_launch_ready", "preflight passed" if state["state"] == State.PREFLIGHT.value else "quota recovered; ready for provider launch")
-        if not thread:
+        if self._is_auto_pool(state):
+            key = state.get("current_account_key")
+            if not isinstance(key, str) or not key:
+                if not self._prepare_pool_account():
+                    return self.store.load_state()
+                state = self.store.load_state()
+            thread = state.get("thread_id")
+        handoff = state.get("thread_handoff")
+        handoff_active = (
+            self._is_auto_pool(state)
+            and isinstance(handoff, dict)
+            and handoff.get("generation") == state.get("generation")
+            and handoff.get("status") == "prepared"
+            and isinstance(handoff.get("packet"), dict)
+        )
+        provider_thread = None if handoff_active else thread
+        if handoff_active:
+            action = "starting controlled account-handoff thread"
+            prompt = handoff_prompt(self.store, state, handoff["packet"])
+        elif not provider_thread:
             action = "starting new exact-thread goal"
+            prompt = start_prompt(self.store, state["goal"])
         else:
             action = "resuming exact thread"
-        prompt = start_prompt(self.store, state["goal"]) if not thread else resume_prompt(self.store, state)
+            prompt = resume_prompt(self.store, state)
         self.store.mutate("provider_launch_prepared", action, lambda item: {**item, "resume_claim": ({**item["resume_claim"], "phase": "spawn_prepared"} if item.get("resume_claim") else None), "last_error": None})
 
         def on_spawn(pid: int, child_action: str) -> None:
@@ -551,11 +648,89 @@ class Supervisor:
             crash_hook("AFTER_PROVIDER_SPAWN")
 
         def on_thread(candidate: str) -> None:
-            self.store.mutate("thread_started", "exact thread ID captured from Codex JSONL", lambda item: {**item, "thread_id": candidate})
+            def capture(item: dict[str, Any]) -> dict[str, Any]:
+                handoff_state = item.get("thread_handoff")
+                updated_handoff = handoff_state
+                if isinstance(handoff_state, dict) and handoff_state.get("status") == "prepared" and handoff_state.get("generation") == item.get("generation"):
+                    updated_handoff = {**handoff_state, "status": "captured", "new_thread_id": candidate}
+                return {**item, "thread_id": candidate, "thread_handoff": updated_handoff}
+
+            self.store.mutate("thread_started", "thread ID captured from Codex JSONL", capture)
             crash_hook("AFTER_THREAD_CAPTURE")
 
         crash_hook("BEFORE_PROVIDER_SPAWN")
-        result = run_codex(self.store, state["generation"], prompt, thread, on_spawn, on_thread)
+        result: ProviderResult
+        if self._is_auto_pool(state):
+            key = state.get("current_account_key")
+            if not isinstance(key, str) or not key:
+                if not self._prepare_pool_account():
+                    return self.store.load_state()
+                state = self.store.load_state()
+                key = state.get("current_account_key")
+            if not isinstance(key, str) or not key:
+                return self._fail_closed("AUTO_POOL has no selected account", ErrorKind.STATE)
+            coordinator = self._pool_coordinator()
+            try:
+                self.store.mutate(
+                    "account_switch_prepared",
+                    "account lease acquired before capsule activation",
+                    lambda item: {
+                        **item,
+                        "account_claim": {
+                            **(item.get("account_claim") or {}),
+                            "generation": item.get("generation"),
+                            "to": account_fingerprint(key),
+                            "phase": "switch_prepared",
+                        },
+                    },
+                )
+                with coordinator.session(key, state["run_id"], self.store.repo, state["generation"]) as runtime:
+                    if runtime.lease is None or runtime.codex_home is None:
+                        raise AccountSchemaError("account session did not provide a lease and CODEX_HOME")
+                    self.store.mutate(
+                        "account_switched",
+                        "selected account capsule activated before provider launch",
+                        lambda item: {
+                            **item,
+                            "account_claim": {
+                                **(item.get("account_claim") or {}),
+                                "phase": "switched",
+                            },
+                        },
+                    )
+                    self.store.mutate(
+                        "account_lease_owned",
+                        "selected account lease held for provider boundary",
+                        lambda item: {**item, "account_lease": {"fingerprint": account_fingerprint(key), "run_id": state["run_id"], "phase": "provider"}},
+                    )
+                    result = run_codex(
+                        self.store,
+                        state["generation"],
+                        prompt,
+                        provider_thread,
+                        on_spawn,
+                        on_thread,
+                        codex_home=runtime.codex_home,
+                        lease_fd=runtime.lease.fd,
+                        account_fingerprint=account_fingerprint(key),
+                    )
+            except AccountBrokerError as exc:
+                self.store.mutate("account_lease_released", "account session failed or could not synchronize safely", lambda item: {**item, "active_process": None, "account_lease": None, "last_error": f"account session failed: {type(exc).__name__}"})
+                return self._fail_closed(f"account session failed safely: {type(exc).__name__}", ErrorKind.AUTH)
+            self.store.mutate(
+                "account_lease_released",
+                "provider child exited before account lease release",
+                lambda item: {
+                    **item,
+                    "account_lease": None,
+                    "account_claim": {
+                        **(item.get("account_claim") or {}),
+                        "phase": "provider_exited",
+                    },
+                },
+            )
+        else:
+            result = run_codex(self.store, state["generation"], prompt, provider_thread, on_spawn, on_thread)
         self.store.mutate("provider_finished", "Codex child process finished", lambda item: {**item, "active_process": None, "last_provider_exit": result.exit_code, "last_provider_signal": result.signal})
         crash_hook("AFTER_PROVIDER_EXIT")
         self.store.append_event("provider_result", "classified Codex result", {"error_kind": result.error_kind.value if result.error_kind else None, "exit_code": result.exit_code, "signal": result.signal, "event_count": result.event_count, "malformed_count": result.malformed_count})
@@ -564,6 +739,10 @@ class Supervisor:
     def _handle_result(self, result: ProviderResult) -> dict[str, Any]:
         if result.aborted or self._stop_requested:
             return self.store.transition(State.STOPPED, "provider_interrupted", "provider interrupted by user; state preserved", {"last_error": result.error_detail, "resume_claim": None})
+        if self._is_auto_pool() and result.error_kind in {ErrorKind.QUOTA_5H, ErrorKind.QUOTA_WEEKLY}:
+            return self._rotate_pool_after_quota(result)
+        if self._is_auto_pool() and result.error_kind == ErrorKind.AUTH:
+            return self._rotate_pool_after_auth(result)
         if result.error_kind in {ErrorKind.QUOTA_5H, ErrorKind.QUOTA_WEEKLY}:
             return self._enter_quota_wait(result)
         if result.error_kind in {ErrorKind.TEMPORARY_429, ErrorKind.CAPACITY, ErrorKind.NETWORK}:
@@ -578,6 +757,204 @@ class Supervisor:
             target = State.BLOCKED if result.error_kind in {ErrorKind.STATE, ErrorKind.GIT, ErrorKind.MALFORMED} else State.FAILED
             return self.store.transition(target, "provider_failed", result.error_detail or result.error_kind.value, {"last_error": result.error_detail, "error_kind": result.error_kind.value, "resume_claim": None})
         return self._after_success()
+
+    def _record_pool_decision(self, decision: PoolDecision) -> None:
+        snapshots = {
+            candidate.fingerprint: candidate.quota.to_dict()
+            for candidate in decision.candidates
+            if candidate.quota is not None
+        }
+        resets = {
+            candidate.fingerprint: [window.resets_at for window in candidate.quota.windows() if window.resets_at is not None]
+            for candidate in decision.candidates
+            if candidate.quota is not None
+        }
+        selected = decision.selected
+        self.store.mutate(
+            "account_pool_probed",
+            "authorized accounts reconciled through fresh App Server quota sessions",
+            lambda item: {
+                **item,
+                "account_snapshots": {**(item.get("account_snapshots") or {}), **snapshots},
+                "account_reset_times": {**(item.get("account_reset_times") or {}), **resets},
+                "quota": selected.quota.to_dict() if selected and selected.quota else item.get("quota"),
+                "quota_source": selected.quota.source if selected and selected.quota else item.get("quota_source"),
+                "pool_probe_failures": 0,
+            },
+        )
+
+    def _persist_pool_selection(self, decision: PoolDecision, reason: str) -> bool:
+        selected = decision.selected
+        if selected is None:
+            return False
+        state = self.store.load_state()
+        previous = state.get("current_account_fingerprint") or (state.get("account_claim") or {}).get("from")
+        handoff_packet = None
+        if previous and previous != selected.fingerprint and state.get("thread_id") and state.get("cross_account_thread_mode", "INCONCLUSIVE") != "PROVEN":
+            plan = self.store.load_plan()
+            handoff_packet = {
+                "goal": state["goal"],
+                "verification_commands": list(self.store.load_policy()["final_commands"]),
+                "repo": state["repo"],
+                "git_head": state.get("last_git_head"),
+                "prior_thread_id": state["thread_id"],
+                "generation": state["generation"],
+                "verified_milestones": [item["id"] for item in plan["milestones"] if item.get("status") == "verified"],
+                "remaining_milestones": [item["id"] for item in plan["milestones"] if item.get("status") != "verified"],
+                "blocker": state.get("blocker"),
+            }
+        self._record_pool_decision(decision)
+        self.store.mutate(
+            "account_selected",
+            reason,
+            lambda item: {
+                **item,
+                "current_account_key": selected.account_key,
+                "current_account_fingerprint": selected.fingerprint,
+                "account_generation": int(item.get("account_generation", 0)) + 1,
+                "account_reselect": False,
+                "last_switch_reason": reason,
+                "thread_handoff": {"mode": "CONTROLLED_THREAD_HANDOFF", "status": "prepared", "generation": item.get("generation"), "from": previous, "to": selected.fingerprint, "packet": handoff_packet} if handoff_packet else item.get("thread_handoff"),
+                "account_claim": {
+                    "generation": item.get("generation"),
+                    "from": previous,
+                    "to": selected.fingerprint,
+                    "phase": "selected",
+                },
+            },
+        )
+        return True
+
+    def _prepare_pool_account(self, reselect: bool = False) -> bool:
+        state = self.store.load_state()
+        if not self._is_auto_pool(state):
+            return True
+        if not reselect and not state.get("account_reselect") and isinstance(state.get("current_account_key"), str):
+            return True
+        keys = state.get("authorized_accounts")
+        if not isinstance(keys, list) or not keys:
+            self._fail_closed("AUTO_POOL has no explicitly authorized accounts", ErrorKind.STATE)
+            return False
+        try:
+            decision = self._pool_coordinator().probe(
+                keys,
+                state["run_id"],
+                self.store.repo,
+                state["generation"],
+                excluded=set((state.get("account_errors") or {}).keys()),
+            )
+        except AccountBrokerError as exc:
+            self._fail_closed(f"AUTO_POOL account discovery/probe failed: {type(exc).__name__}", ErrorKind.AUTH)
+            return False
+        if self._persist_pool_selection(decision, "highest usable account capacity selected"):
+            return True
+        candidates = decision.candidates
+        if candidates and all(candidate.auth_error for candidate in candidates):
+            self.store.transition(
+                State.BLOCKED,
+                "account_pool_auth_failed",
+                "all explicitly authorized accounts have authentication errors",
+                {"last_error": "all explicitly authorized accounts have authentication errors", "error_kind": ErrorKind.AUTH.value},
+            )
+            return False
+        if candidates and all(
+            candidate.leased
+            or candidate.auth_error
+            or (
+                candidate.quota is not None
+                and candidate.quota.source in {"live_app_server", "fake_file"}
+                and not candidate.quota.error
+                and candidate.quota.primary is not None
+                and candidate.quota.secondary is not None
+                and candidate.quota.primary.used_percent is not None
+                and candidate.quota.secondary.used_percent is not None
+            )
+            for candidate in candidates
+        ):
+            self._enter_pool_wait(decision, "all authorized accounts are exhausted or busy")
+            return False
+        self._fail_closed("AUTO_POOL could not obtain authoritative quota for an eligible account", ErrorKind.STATE)
+        return False
+
+    def _enter_pool_wait(self, decision: PoolDecision, reason: str) -> bool:
+        state = self.store.load_state()
+        if state.get("state") in {item.value for item in TERMINAL_STATES}:
+            return False
+        busy = any(candidate.leased for candidate in decision.candidates)
+        target = decision.earliest_reset
+        if target is None or busy:
+            target = int(time.time()) + (int(os.environ.get("NIGHTWATCH_WAIT_POLL_SECONDS", QUOTA_POLL_SECONDS)) if busy else 5 * 3600)
+        buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
+        target += max(0, buffer_seconds) if not busy else 0
+        self.store.transition(
+            State.WAIT_QUOTA,
+            "account_pool_wait" if not busy else "account_pool_busy_wait",
+            reason,
+            {
+                "current_account_key": None,
+                "current_account_fingerprint": None,
+                "account_reselect": True,
+                "account_lease": None,
+                "next_resume_at": datetime.fromtimestamp(target, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "pool_wait_reason": "busy" if busy else "exhausted",
+                "last_error": reason,
+                "resume_claim": None,
+            },
+        )
+        return True
+
+    def _rotate_pool_after_quota(self, result: ProviderResult) -> dict[str, Any]:
+        state = self.store.load_state()
+        if state["recoveries"] >= MAX_QUOTA_RECOVERIES:
+            return self._fail_closed("account-pool quota recovery circuit breaker reached", ErrorKind.QUOTA_5H)
+        windows = result.quota_windows or [QuotaWindow("weekly" if result.error_kind == ErrorKind.QUOTA_WEEKLY else "5h", 100, 10080 if result.error_kind == ErrorKind.QUOTA_WEEKLY else 300, result.reset_at)]
+        return self.store.transition(
+            State.RECOVERING,
+            "account_quota_exhausted",
+            result.error_detail or result.error_kind.value,
+            {
+                "generation": state["generation"] + 1,
+                "recoveries": state["recoveries"] + 1,
+                "current_account_key": None,
+                "current_account_fingerprint": None,
+                "account_reselect": True,
+                "account_lease": None,
+                "account_claim": {"generation": state["generation"] + 1, "from": state.get("current_account_fingerprint"), "to": None, "phase": "provider_exited"},
+                "quota": state.get("quota"),
+                "quota_windows": [window.to_dict() for window in windows],
+                "last_error": result.error_detail,
+                "error_kind": result.error_kind.value,
+                "retry_attempt": 0,
+                "crash_attempt": 0,
+            },
+        )
+
+    def _rotate_pool_after_auth(self, result: ProviderResult) -> dict[str, Any]:
+        state = self.store.load_state()
+        key = state.get("current_account_key")
+        errors = dict(state.get("account_errors") or {})
+        if isinstance(key, str) and key:
+            errors[key] = {"fingerprint": account_fingerprint(key), "error_kind": ErrorKind.AUTH.value, "at": now_iso()}
+        return self.store.transition(
+            State.RECOVERING,
+            "account_auth_error",
+            result.error_detail or "selected account authentication failed",
+            {
+                "current_account_key": None,
+                "current_account_fingerprint": None,
+                "account_reselect": True,
+                "account_lease": None,
+                "account_claim": {
+                    "generation": state["generation"],
+                    "from": account_fingerprint(key) if isinstance(key, str) and key else state.get("current_account_fingerprint"),
+                    "to": None,
+                    "phase": "provider_exited",
+                },
+                "account_errors": errors,
+                "last_error": result.error_detail,
+                "error_kind": ErrorKind.AUTH.value,
+            },
+        )
 
     def _enter_initial_quota_wait(self, quota: QuotaSnapshot) -> dict[str, Any]:
         windows = quota.windows()
@@ -632,6 +1009,8 @@ class Supervisor:
         return waiting
 
     def _wait_and_revalidate_quota(self) -> bool:
+        if self._is_auto_pool():
+            return self._wait_and_revalidate_pool()
         state = self.store.load_state()
         target = _dt(state.get("next_resume_at"))
         if target is None:
@@ -658,6 +1037,45 @@ class Supervisor:
         except Exception as exc:
             self.store.mutate("quota_revalidation_failed", "live quota authority unavailable after reset", lambda item: {**item, "last_error": f"quota authority unavailable: {type(exc).__name__}", "quota_source": "unavailable"})
             return self._guarded_quota_probe("live quota authority unavailable after provider-declared reset")
+
+    def _wait_and_revalidate_pool(self) -> bool:
+        state = self.store.load_state()
+        target = _dt(state.get("next_resume_at"))
+        if target is None:
+            self._fail_closed("AUTO_POOL wait has no valid next_resume_at", ErrorKind.STATE)
+            return False
+        _sleep_until(int(target.timestamp()), float(os.environ.get("NIGHTWATCH_WAIT_POLL_SECONDS", QUOTA_POLL_SECONDS)))
+        if self._stop_requested:
+            self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested during account-pool wait")
+            return False
+        try:
+            decision = self._pool_coordinator().probe(
+                list(state.get("authorized_accounts") or []),
+                state["run_id"],
+                self.store.repo,
+                state["generation"],
+                excluded=set((state.get("account_errors") or {}).keys()),
+            )
+            if decision.selected is not None:
+                self._persist_pool_selection(decision, "account pool re-probed after wait; greatest usable capacity selected")
+                self.store.transition(State.RECOVERING, "account_pool_recovered", "authoritative account pool revalidation found usable quota", {"pool_wait_reason": None, "last_error": None})
+                return True
+            self._record_pool_decision(decision)
+            self._enter_pool_wait(decision, "account pool remains exhausted or busy")
+            return True
+        except AccountBrokerError as exc:
+            failures = int(state.get("pool_probe_failures", 0)) + 1
+            if failures >= MAX_QUOTA_REVALIDATION_FAILURES:
+                self._fail_closed("account-pool authoritative revalidation failed repeatedly", ErrorKind.STATE)
+                return False
+            retry = int(time.time()) + QUOTA_POLL_SECONDS * failures
+            self.store.transition(
+                State.WAIT_QUOTA,
+                "account_pool_probe_failed",
+                f"account-pool revalidation failed: {type(exc).__name__}",
+                {"next_resume_at": datetime.fromtimestamp(retry, timezone.utc).isoformat().replace("+00:00", "Z"), "pool_probe_failures": failures, "last_error": f"account-pool revalidation failed: {type(exc).__name__}"},
+            )
+            return True
 
     def _start_quota_recovery(self, reason: str) -> bool:
         if not self._claim_resume():

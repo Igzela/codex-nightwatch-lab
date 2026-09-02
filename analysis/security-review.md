@@ -57,3 +57,18 @@ it.
 - `recover --ack-ambiguous` is deliberately a documented human override.
 - User-service persistence after logout depends on the host's user-manager
   linger policy; Nightwatch does not alter it.
+
+## 0.4 account-pool security boundary
+
+- `codex-auth` is optional. Nightwatch consumes only its schema-v1 local JSON
+  discovery contract and never uses its remote usage API.
+- Account credentials remain outside Git in 0700 capsule directories and
+  restricted files. Capsule synchronization is required before cleanup; an
+  uncertain refresh state is retained for recovery rather than discarded.
+- Per-account lock files are held for the complete App Server/provider
+  lifetime. Symlinked roots/paths, corrupt metadata, stale PID reuse, and
+  changed ownership fail closed without deleting another owner's record.
+- AUTO_POOL selection is explicitly scoped to the run's authorized subset and
+  requires authoritative 5h plus weekly quota. Cross-account exact-thread
+  continuity is not advertised; the tested fallback is an audited controlled
+  mission handoff.

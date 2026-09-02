@@ -288,6 +288,9 @@ def run_codex(
     on_thread: Callable[[str], None] | None = None,
     stop_event: threading.Event | None = None,
     timeout: float | None = None,
+    codex_home: str | Path | None = None,
+    lease_fd: int | None = None,
+    account_fingerprint: str | None = None,
 ) -> ProviderResult:
     state = store.load_state()
     args, action = build_command(
@@ -302,6 +305,12 @@ def run_codex(
     store.write_run_event(generation, {"type": "provider_command", "action": action, "argv": [item for item in args if item != prompt]})
     start = time.monotonic()
     try:
+        environment = trusted_environment()
+        if codex_home is not None:
+            environment["CODEX_HOME"] = str(Path(codex_home).expanduser().resolve())
+        if account_fingerprint is not None:
+            environment["NIGHTWATCH_ACCOUNT_FINGERPRINT"] = account_fingerprint
+        pass_fds = (lease_fd,) if isinstance(lease_fd, int) and lease_fd >= 0 else ()
         process = subprocess.Popen(
             args,
             cwd=str(store.repo),
@@ -310,7 +319,8 @@ def run_codex(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
-        env=trusted_environment(),
+            env=environment,
+            pass_fds=pass_fds,
         )
     except OSError as exc:
         return ProviderResult(None, None, thread_id, 0, 0, error_kind=ErrorKind.UNKNOWN, error_detail=f"Codex spawn failed: {type(exc).__name__}", run_log=str(run_log))

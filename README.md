@@ -8,8 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#validation)
-[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+[![Tests: 168 Passing](https://img.shields.io/badge/Tests-168%20Passing-success.svg)](#validation)
+[![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
 
@@ -46,7 +46,7 @@ You give your AI coding agent a complex milestone before going to sleep. You wak
                            ▼                                ▼
                ┌────────────────────────────────────────────────────────┐
                │               Automatic Quota Revalidation             │
-               │       Resumes exact same thread on reset window        │
+               │        Re-probes account pool at reset boundary         │
                │        Runs frozen user-defined verify commands        │
                └────────────────────────────────────────────────────────┘
 ```
@@ -56,7 +56,8 @@ You give your AI coding agent a complex milestone before going to sleep. You wak
 ## ✨ Key Features
 
 - 🔄 **Authoritative Quota Recovery**: Communicates directly with the official Codex App Server over JSON-RPC 2.0 stdio (`account/rateLimits/read`). No brittle regex scraping or ANSI parsing.
-- 🧵 **Exact-Thread Continuation**: Resumes the *exact* session thread (`codex exec --json resume <thread_id> -`) across quota windows and crashes. Never uses `--last` guesswork.
+- 🧵 **Exact-Thread Continuation**: Resumes the *exact* session thread (`codex exec --json resume <thread_id> -`) across quota windows and crashes when that route is proven. Never uses `--last` guesswork.
+- 👥 **Opt-in Account Pool**: An explicitly selected pool can rotate only after a provider exits. Each account is leased globally, checked by a fresh App Server quota session, and evaluated against both 5h and weekly limits.
 - 🔒 **Tamper-Proof Trust Boundary**: State lives outside the Git workspace in `~/.local/state/codex-nightwatch/` (0700 permissions). Model-proposed verification scripts are strictly rejected.
 - 🧪 **Frozen Verification Gate**: Goal completion (`DONE`) strictly requires your frozen `--verify` commands (e.g. `pytest`, `cargo test`, `git diff --check`) to exit `0`.
 - 🛡️ **Zero-Interruption Live Watching (`nightwatch watch`)**: Passively monitors existing interactive terminal sessions without collision or interruption. With `--auto-takeover`, seamlessly takes over overnight when quota runs out.
@@ -86,7 +87,7 @@ nightwatch doctor
 ```
 ```text
 Nightwatch doctor: ok
-Codex: codex-cli 0.150.1
+Codex: codex-cli 0.152.1
 Auth: ok
 Quota authority: LIVE_APP_SERVER (live_app_server)
 5h: 7.0% used, reset=1787866896
@@ -110,7 +111,7 @@ nightwatch
 Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed.
 
 ```text
-Nightwatch 0.3.1 · MULTI-THREAD CONTROL
+Nightwatch 0.4.0 · MULTI-THREAD CONTROL
 Runs 2 · ↑/↓ select · / commands · Esc quit
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
@@ -152,6 +153,25 @@ nightwatch run \
 ```
 
 If either option is omitted, Codex's configured default remains authoritative. The installed Codex CLI performs the final model/level compatibility check.
+
+### Optional Account Pool
+
+Runs default to `CURRENT_ONLY`; they never discover or enroll every stored account. With the separately installed `codex-auth` capability, explicitly select a subset:
+
+```bash
+nightwatch run \
+  --account-mode auto-pool \
+  --account personal \
+  --account backup \
+  --verify "pytest -q" \
+  "Implement the feature and pass the tests"
+```
+
+Nightwatch uses `codex-auth list --skip-api --json` only for stable account discovery and `switch <account_key> --json` inside an external 0700 capsule. It never uses codex-auth's remote usage API. Actual selection comes from a fresh official Codex App Server `account/rateLimits/read` response. An account is usable only when both 5h and weekly windows are known and not exhausted; the deterministic policy maximizes the smaller remaining capacity, then the 5h/weekly remainder, reset time, and fingerprint.
+
+Before each App Server probe or provider turn, a global external lease prevents another Nightwatch run from using the same account. The lease is held through the child process and released only after that process exits and refreshed auth state is synchronized. If all selected accounts are unavailable, the run enters `WAIT_QUOTA`, sleeps to the earliest relevant reset, and re-probes the whole pool.
+
+Cross-account exact-thread portability is not assumed. Until a safe experiment proves it for the installed Codex version, AUTO_POOL uses `CONTROLLED_THREAD_HANDOFF`: a new provider conversation receives a trusted packet containing the goal, frozen verification policy, repository/Git HEAD, milestone state, and prior thread for audit. The mission continues, but the new conversation is not reported as the old exact thread. Missing or incompatible codex-auth disables AUTO_POOL while preserving CURRENT_ONLY.
 
 ### Mode A: Unattended Overnight Run (Full Autonomous Supervisor)
 
@@ -244,11 +264,12 @@ The TUI is an adapter over the same durable interfaces. Every operation remains 
 | :--- | :--- |
 | `nightwatch` / `nightwatch ui` | Open the interactive multi-thread dashboard and `/` command palette |
 | `nightwatch models [--json]` | Show the installed Codex model catalog and supported reasoning levels |
-| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | Initialize and run a new supervised goal |
+| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | Initialize and run a new supervised goal (defaults to `CURRENT_ONLY`) |
+| `nightwatch run "<goal>" --account-mode auto-pool --account <key-or-alias> [--account <key-or-alias> ...]` | Run with an explicitly authorized account subset |
 | `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | Passively monitor active interactive Codex sessions; model options apply to takeover |
 | `nightwatch adopt --thread <id> [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>]` | Adopt an existing thread into Nightwatch |
 | `nightwatch resume` | Resume the current repo's exact-thread goal |
-| `nightwatch status [--watch] [--interval <seconds>] [--json]` | Show or continuously watch agent state, quota and trusted milestone progress |
+| `nightwatch status [--watch] [--interval <seconds>] [--json]` | Show or continuously watch agent state, account-pool state, quota and trusted milestone progress |
 | `nightwatch log [--tail N]` | Show human-readable supervisor audit log |
 | `nightwatch report` | Output/generate the structured acceptance report |
 | `nightwatch stop` | Gracefully halt automatic supervision (state preserved) |
@@ -281,10 +302,12 @@ Authoritative state is strictly isolated outside the Git workspace:
 ├── acceptance.json            # Acceptance criteria & goal binding
 ├── events.jsonl               # Append-only sequence-validated audit trail
 ├── supervisor.lock            # Process lifetime lease (PID reuse safe)
+├── account-leases/            # Global per-account lifetime locks (0700/0600)
+├── account-capsules/          # Ephemeral external CODEX_HOME capsules
 └── runs/                      # Per-generation sanitized stdout & stderr logs
 ```
 
-The repository workspace contains only the untrusted agent mailbox (`.nightwatch-agent/`), preventing untrusted LLM outputs from tampering with acceptance authority.
+The repository workspace contains only the untrusted agent mailbox (`.nightwatch-agent/`), preventing untrusted LLM outputs from tampering with acceptance authority. Account credentials and refreshable auth files never enter the repository; capsule cleanup is deferred if synchronization cannot be proven safe.
 
 ---
 
@@ -296,11 +319,11 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 109 tests
+Ran 168 tests
 OK
 ```
 
-- ✅ Real Codex 0.150.1 App Server rate-limit RPC handshake validation
+- ✅ Codex App Server rate-limit RPC handshake validation
 - ✅ Real process collision and race-condition prevention
 - ✅ Real Linux PID identity & state integrity under SIGKILL crash restarts
 - ✅ Symlink escape and mailbox injection attack prevention

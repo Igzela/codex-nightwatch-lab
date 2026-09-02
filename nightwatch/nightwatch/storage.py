@@ -174,6 +174,8 @@ class NightwatchStore:
         thread_id: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        account_mode: str = "CURRENT_ONLY",
+        authorized_accounts: list[str] | None = None,
     ) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
@@ -190,6 +192,10 @@ class NightwatchStore:
             reasoning_effort=reasoning_effort,
         )
         state["acceptance_ready"] = sufficient_verification_policy(commands)
+        if account_mode not in {"CURRENT_ONLY", "AUTO_POOL"}:
+            raise StateIntegrityError(f"unsupported account mode: {account_mode}")
+        state["account_mode"] = account_mode
+        state["authorized_accounts"] = list(authorized_accounts or [])
         if thread_id:
             state["thread_id"] = thread_id
         profile = "default" if commands else "none"

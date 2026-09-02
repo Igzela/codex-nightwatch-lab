@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#测试验证)
+[![Tests: 168 Passing](https://img.shields.io/badge/Tests-168%20Passing-success.svg)](#测试验证)
 [![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -110,7 +110,7 @@ nightwatch
 未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
 
 ```text
-Nightwatch 0.3.1 · MULTI-THREAD CONTROL
+Nightwatch 0.4.0 · MULTI-THREAD CONTROL
 Runs 2 · ↑/↓ select · / commands · Esc quit
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
@@ -152,6 +152,23 @@ nightwatch run \
 ```
 
 不指定某一项时，继续使用 Codex 自身配置的默认值；模型与挡位是否兼容最终由本机 Codex CLI 校验。
+
+### 可选账号池（AUTO_POOL）
+
+任务默认是 `CURRENT_ONLY`，不会自动发现或加入所有本机账号。安装并配置独立的 `codex-auth` 后，必须在启动时明确选择账号子集：
+
+```bash
+nightwatch run \
+  --account-mode auto-pool \
+  --account personal \
+  --account backup \
+  --verify "pytest -q" \
+  "实现功能并通过测试"
+```
+
+Nightwatch 只使用 `codex-auth list --skip-api --json` 获取稳定 `account_key` 和显示信息，并在工作区外的 0700 capsule 中使用账号；不会使用 codex-auth 的远程用量 API。真实可用配额始终来自每个账号上下文中新建的官方 Codex App Server `account/rateLimits/read`。5 小时与 weekly 两个窗口都必须存在且未耗尽，选择策略按较小剩余容量、5 小时剩余、weekly 剩余、reset 时间和短指纹确定性排序。
+
+每次 App Server 探测或 Codex provider 执行前都会持有工作区外的全局账号 lease；子进程退出且刷新后的认证状态同步完成后才释放。所有账号不可用时进入 `WAIT_QUOTA`，等待最早相关 reset 后重新探测整个账号池。跨账号 exact-thread 能否保持尚未假定；在本机 Codex 版本完成安全实测前，状态会明确显示 `CONTROLLED_THREAD_HANDOFF`，使用受信任的目标、冻结验证策略、仓库/Git HEAD、里程碑和旧 Thread 审计包创建新对话，不会冒充原 Thread。缺少兼容 codex-auth 时 AUTO_POOL 安全不可用，但 CURRENT_ONLY 保持兼容。
 
 ### 模式一：夜间全自主无人值守模式
 
@@ -244,11 +261,12 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 | :--- | :--- |
 | `nightwatch` / `nightwatch ui` | 打开多线程交互式 Dashboard 和 `/` 命令面板 |
 | `nightwatch models [--json]` | 显示本机 Codex 实时模型目录及支持的推理挡位 |
-| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
+| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务（默认 `CURRENT_ONLY`） |
+| `nightwatch run "<goal>" --account-mode auto-pool --account <key-or-alias> [--account <key-or-alias> ...]` | 使用明确授权的账号子集运行 |
 | `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听活跃交互会话；模型参数用于自动接管 |
 | `nightwatch adopt --thread <id> [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
 | `nightwatch resume` | 恢复并继续当前仓库的精确 Thread 任务 |
-| `nightwatch status [--watch] [--interval <秒>] [--json]` | 单次或持续查看 Agent 状态、配额与可信里程碑进度 |
+| `nightwatch status [--watch] [--interval <秒>] [--json]` | 单次或持续查看 Agent、账号池、配额与可信里程碑进度 |
 | `nightwatch log [--tail N]` | 查看人类可读的审计与执行日志 |
 | `nightwatch report` | 输出/生成结构化验收报告 |
 | `nightwatch stop` | 安全停止自动执行（保留现场与 Thread 状态） |
@@ -280,6 +298,8 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 ├── verification-policy.json   # 用户冻结的哈希绑定验证命令
 ├── acceptance.json            # 目标与真实验收准则
 ├── events.jsonl               # 仅追加的单调自增审计日志
+├── account-leases/            # 全局账号生命周期锁
+├── account-capsules/          # 外部临时 CODEX_HOME（认证文件不进 Git）
 ├── supervisor.lock            # 进程排他锁 (防止 PID 复用漏洞)
 └── runs/                      # 分代脱敏 stdout/stderr 执行记录
 ```
@@ -296,7 +316,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 109 tests
+Ran 168 tests
 OK
 ```
 

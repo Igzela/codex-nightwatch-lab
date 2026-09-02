@@ -19,9 +19,11 @@ class AppServerProtocolError(RuntimeError):
 class AppServerClient:
     """Small JSON-RPC client for the current Codex app-server stdio contract."""
 
-    def __init__(self, binary: str | None = None, timeout: float = 8.0):
+    def __init__(self, binary: str | None = None, timeout: float = 8.0, codex_home: str | Path | None = None, lease_fd: int | None = None):
         self.binary = binary or os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
         self.timeout = timeout
+        self.codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
+        self.lease_fd = lease_fd
         self.trace: list[dict[str, Any]] = []
 
     def rate_limits(self) -> dict[str, Any]:
@@ -46,7 +48,10 @@ class AppServerClient:
 
     def _spawn(self) -> subprocess.Popen[str]:
         try:
-            return subprocess.Popen([self.binary, "app-server", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            environment = dict(os.environ)
+            environment["CODEX_HOME"] = str(self.codex_home)
+            pass_fds = (self.lease_fd,) if isinstance(self.lease_fd, int) and self.lease_fd >= 0 else ()
+            return subprocess.Popen([self.binary, "app-server", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=environment, pass_fds=pass_fds)
         except OSError as exc:
             raise AppServerProtocolError(f"app-server spawn failed: {type(exc).__name__}") from exc
 

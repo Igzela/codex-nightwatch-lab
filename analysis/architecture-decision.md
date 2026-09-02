@@ -46,3 +46,27 @@ crash is ambiguous and blocks until an explicit audited human acknowledgement.
 The systemd unit uses `Restart=on-failure` plus `RestartPreventExitStatus=10
 11 12`, where those exits mean BLOCKED, STOPPED, and expected provider/auth
 failure. Unexpected code 20 is restarted.
+
+## 0.4 account-pool extension
+
+`CURRENT_ONLY` remains the backward-compatible default. `AUTO_POOL` is opt-in
+and accepts only stable account keys resolved from an explicitly selected
+`codex-auth list --skip-api --json` subset. Account selection is localized in
+`account_broker.py`: a fresh official App Server `account/rateLimits/read`
+sample must contain both 5h and weekly windows, and the deterministic policy
+maximizes the smaller remaining capacity before applying the documented tie
+breakers. codex-auth remote usage is never a Nightwatch authority.
+
+Each probe and provider turn obtains a global external filesystem lease for the
+account. A per-run external `CODEX_HOME` capsule contains one selected account;
+its refreshed snapshot is synchronized through codex-auth before the lease is
+released. The lease is held through child lifetime, uses Linux PID birth
+identity, and fails closed on corrupt or ambiguous metadata. Stale capsules are
+reconciled only through an attributable manifest and exact synchronization.
+
+Cross-account exact-thread portability is intentionally `INCONCLUSIVE` until a
+safe version-bound real experiment proves it. The implemented fallback is a
+`CONTROLLED_THREAD_HANDOFF`: Nightwatch starts a new provider conversation from
+trusted goal, policy, repository/Git HEAD, and milestone facts, retaining the
+prior thread only for audit. The fake E2E proves A→B→wait→A rotation and both
+5h/weekly governing behavior without claiming exact-thread continuity.

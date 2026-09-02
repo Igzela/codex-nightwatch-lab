@@ -57,3 +57,21 @@ one lease, and same-thread post-reset success before changing this to PASS.
   and no trusted state was created in the repo.
 - Scenario C, external state home: **PASS**; schema-2 initialization completed
   with trusted state outside the workspace.
+
+## 0.4 account-pool extension
+
+- `python3 -m unittest discover -s nightwatch/tests -v`: **PASS**, 168 tests.
+- `python3.11 -m unittest discover -s nightwatch/tests -q`: **PASS**, 168 tests;
+  compileall also passed.
+- Fake account-pool E2E: **PASS** for A→B quota rotation, all-account wait,
+  reset re-probe, return to A, controlled handoff, weekly governing quota,
+  global leases, crash release, stale PID protection, and opaque auth refresh
+  preservation.
+- Installed `codex-auth 0.2.10` does not expose the required schema-v1 JSON
+  commands on this host (rc=2, empty stdout), so AUTO_POOL is safely
+  unavailable locally; CURRENT_ONLY remains operational. Upstream audited
+  contract is schema v1.
+- Live `nightwatch doctor` on Codex `0.152.1`: **PASS**; App Server authority
+  returned validated 5h and weekly windows. No real two-account rotation was
+  attempted because the installed account tool could not provide the required
+  local machine-readable pool contract.

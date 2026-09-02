@@ -17,6 +17,7 @@ PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
 
 from nightwatch import cli  # noqa: E402
+from nightwatch.account_broker import AccountRecord  # noqa: E402
 from nightwatch.models import State  # noqa: E402
 from nightwatch.storage import NightwatchStore  # noqa: E402
 from nightwatch.supervisor import build_report  # noqa: E402
@@ -706,6 +707,32 @@ class TuiControllerTests(unittest.TestCase):
         self.assertEqual(stopped, [])
         ui.handle_key("enter")
         self.assertEqual(stopped, [Path("/tmp/run")])
+
+    def test_run_confirmation_can_select_an_explicit_account_pool(self):
+        started = []
+        accounts = [AccountRecord("user::personal", alias="personal"), AccountRecord("user::backup", alias="backup")]
+        ui = TuiController(
+            repo=Path("/tmp/run"),
+            hooks=TuiHooks(
+                list_accounts=lambda: accounts,
+                start_run=lambda spec, run_in_service=True: started.append(spec) or ActionResult(True, "started"),
+                run_exists=lambda _repo: False,
+            ),
+        )
+        _type(ui, "/run pool goal")
+        ui.handle_key("enter")
+        self.assertEqual(ui.overlay.kind, "confirm")
+        ui.handle_key("a")
+        self.assertEqual(ui.overlay.kind, "accounts")
+        ui.handle_key("space")
+        ui.handle_key("down")
+        ui.handle_key("space")
+        ui.handle_key("enter")
+        self.assertIn("AUTO_POOL · 2 explicitly selected", ui.overlay.body)
+        ui.handle_key("enter")
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].account_mode, "AUTO_POOL")
+        self.assertEqual(started[0].account_selectors, ("user::personal", "user::backup"))
 
 
 class AdoptAndResumeOperationTests(unittest.TestCase):

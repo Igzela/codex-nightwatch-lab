@@ -8,6 +8,7 @@ from typing import Any
 
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _REASONING_EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+ACCOUNT_MODES = {"CURRENT_ONLY", "AUTO_POOL"}
 
 
 def validate_model_name(value: str) -> str:
@@ -80,6 +81,7 @@ class QuotaSnapshot:
     secondary: QuotaWindow | None = None
     plan_type: str | None = None
     error: str | None = None
+    account_fingerprint: str | None = None
 
     def windows(self) -> list[QuotaWindow]:
         return [window for window in (self.primary, self.secondary) if window]
@@ -101,6 +103,7 @@ class QuotaSnapshot:
             "secondary": self.secondary.to_dict() if self.secondary else None,
             "plan_type": self.plan_type,
             "error": self.error,
+            "account_fingerprint": self.account_fingerprint,
         }
 
 
@@ -171,6 +174,21 @@ def empty_state(
         "last_verification": None,
         "inhibit_requested": False,
         "acceptance_ready": False,
+        "account_mode": "CURRENT_ONLY",
+        "authorized_accounts": [],
+        "current_account_key": None,
+        "current_account_fingerprint": None,
+        "active_account_fingerprint": None,
+        "account_generation": 0,
+        "account_lease": None,
+        "account_claim": None,
+        "account_reselect": False,
+        "account_snapshots": {},
+        "account_reset_times": {},
+        "account_errors": {},
+        "last_switch_reason": None,
+        "cross_account_thread_mode": "INCONCLUSIVE",
+        "thread_handoff": None,
     }
 
 
@@ -195,6 +213,27 @@ def validate_state(state: dict[str, Any]) -> None:
         validate_model_name(state["model"])
     if state.get("reasoning_effort") is not None:
         validate_reasoning_effort(state["reasoning_effort"])
+    if state.get("account_mode", "CURRENT_ONLY") not in ACCOUNT_MODES:
+        raise ValueError("state.account_mode is invalid")
+    authorized = state.get("authorized_accounts", [])
+    if not isinstance(authorized, list) or len(authorized) != len(set(authorized)) or not all(isinstance(item, str) and item.strip() for item in authorized):
+        raise ValueError("state.authorized_accounts must contain unique stable account keys")
+    current_key = state.get("current_account_key")
+    if current_key is not None and (not isinstance(current_key, str) or not current_key.strip()):
+        raise ValueError("state.current_account_key must be a string or null")
+    for field_name in ("current_account_fingerprint", "active_account_fingerprint"):
+        value = state.get(field_name)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"state.{field_name} must be a string or null")
+    capability = state.get("cross_account_thread_mode", "INCONCLUSIVE")
+    if capability not in {"PROVEN", "UNSUPPORTED", "INCONCLUSIVE"}:
+        raise ValueError("state.cross_account_thread_mode is invalid")
+    if state.get("thread_handoff") is not None and not isinstance(state["thread_handoff"], dict):
+        raise ValueError("state.thread_handoff must be an object or null")
+    if state.get("account_lease") is not None and not isinstance(state["account_lease"], dict):
+        raise ValueError("state.account_lease must be an object or null")
+    if state.get("account_claim") is not None and not isinstance(state["account_claim"], dict):
+        raise ValueError("state.account_claim must be an object or null")
     if state.get("resume_claim") is not None:
         claim = state["resume_claim"]
         if not isinstance(claim, dict) or not isinstance(claim.get("generation"), int):

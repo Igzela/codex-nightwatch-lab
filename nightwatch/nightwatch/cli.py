@@ -29,7 +29,10 @@ from .operations import (
     stop_run,
     systemd_quote as _systemd_quote,
     validate_install_targets as _validate_install_targets,
+    RunSpec,
+    resolve_authorized_accounts,
 )
+from .account_broker import AccountBrokerError
 from .quota import AppServerQuotaProvider, QuotaError, make_quota_provider
 from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso, redact, repo_identity
 from .supervisor import PassiveWatcher, Supervisor, build_report, pid_alive, process_matches
@@ -65,6 +68,11 @@ def _add_model_options(parser: argparse.ArgumentParser, *, takeover: bool = Fals
     parser.add_argument("--reasoning-effort", type=_reasoning_arg, default=None, help=f"Codex reasoning level{suffix}, such as low, medium, high, or xhigh")
 
 
+def _add_account_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--account-mode", choices=("current-only", "auto-pool"), default="current-only", help="use only the current account or an explicitly selected account pool")
+    parser.add_argument("--account", dest="accounts", action="append", default=[], metavar="SELECTOR", help="explicit account key or alias (repeat for AUTO_POOL; never enrolls all stored accounts)")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nightwatch", description="Fail-closed multi-thread control plane for OpenAI Codex")
     parser.add_argument("--version", action="version", version=f"nightwatch {__version__}")
@@ -78,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
     _add_model_options(run)
+    _add_account_options(run)
 
     watch = sub.add_parser("watch", help="passively monitor an active Codex session in this repo")
     watch.add_argument("--repo", default=None)
@@ -95,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     adopt.add_argument("--repo", default=None)
     adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
     _add_model_options(adopt)
+    _add_account_options(adopt)
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
@@ -173,6 +183,10 @@ def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
             child_args.extend(["--model", args.model])
         if args.reasoning_effort:
             child_args.extend(["--reasoning-effort", args.reasoning_effort])
+        if getattr(args, "account_mode", "current-only") != "current-only":
+            child_args.extend(["--account-mode", args.account_mode])
+        for selector in getattr(args, "accounts", []):
+            child_args.extend(["--account", selector])
         for command in args.verify:
             child_args.extend(["--verify", command])
     child_args.extend(["--repo", str(root), "--no-inhibit"])
@@ -190,6 +204,21 @@ def _run(args: argparse.Namespace) -> int:
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}); use nightwatch resume")
     if store.legacy_directory.exists():
         print("nightwatch: legacy repo/.nightwatch state is ignored for schema 2; it is preserved for forensic review", file=sys.stderr)
+    try:
+        run_spec = RunSpec(
+            root,
+            args.goal,
+            args.model,
+            args.reasoning_effort,
+            tuple(args.verify),
+            getattr(args, "thread", None),
+            service=bool(args.service),
+            account_mode=args.account_mode,
+            account_selectors=tuple(args.accounts),
+        )
+        authorized = resolve_authorized_accounts(run_spec, root)
+    except (AccountBrokerError, ValueError) as exc:
+        raise SystemExit(f"nightwatch: account configuration rejected: {exc}") from exc
     if args.service:
         _validate_install_targets(root)
     else:
@@ -202,6 +231,8 @@ def _run(args: argparse.Namespace) -> int:
         thread_id=getattr(args, "thread", None),
         model=args.model,
         reasoning_effort=args.reasoning_effort,
+        account_mode=args.account_mode.replace("-", "_").upper(),
+        authorized_accounts=authorized,
     )
     if args.service:
         _install_user_files(root)
@@ -308,7 +339,10 @@ def _agent_runtime(state: dict[str, Any]) -> dict[str, Any]:
     if isinstance(active, dict) and process_matches(active):
         return {"status": "RUNNING", "pid": active["pid"], "action": active.get("action")}
     if state["state"] == State.WAIT_QUOTA.value:
-        status = "WAITING_QUOTA (first launch deferred)" if not state.get("thread_id") else "WAITING_QUOTA"
+        if state.get("account_mode", "CURRENT_ONLY") == "AUTO_POOL":
+            status = "WAITING_ACCOUNT_POOL"
+        else:
+            status = "WAITING_QUOTA (first launch deferred)" if not state.get("thread_id") else "WAITING_QUOTA"
     elif state["state"] in {item.value for item in TERMINAL_STATES}:
         status = state["state"]
     elif owner_alive:
@@ -365,6 +399,12 @@ def _render_status(value: dict[str, Any]) -> None:
     print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
     print(f"RUN_ID         {state['run_id']}")
     print(f"GENERATION     {state['generation']}")
+    account_mode = state.get("account_mode", "CURRENT_ONLY")
+    authorized = state.get("authorized_accounts") or []
+    current_account = state.get("current_account_fingerprint") or "(none selected)"
+    print(f"ACCOUNT MODE   {account_mode}")
+    print(f"ACCOUNT POOL   {len(authorized)} explicitly authorized; current={current_account}")
+    print(f"ACCOUNT LEASE  {'owned by this run' if state.get('account_lease') else '(not held)'}")
     print(f"QUOTA SOURCE   {state.get('quota_source') or '(none)'}")
     quality = "LIVE_APP_SERVER" if state.get("quota_source") == "live_app_server" else "GUARDED_PROBE_ONLY" if state.get("quota_source") in {"rollout_schedule_only", "unavailable"} else "(unknown)"
     print(f"RECOVERY MODE  {quality}")
@@ -571,6 +611,21 @@ def _adopt(args: argparse.Namespace) -> int:
     if store.exists():
         state = store.load_state()
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}, thread={state.get('thread_id')})")
+    try:
+        spec = RunSpec(
+            root,
+            args.goal or "Adopted conversation",
+            args.model,
+            args.reasoning_effort,
+            tuple(args.verify),
+            args.thread,
+            service=False,
+            account_mode=args.account_mode,
+            account_selectors=tuple(args.accounts),
+        )
+        authorized = resolve_authorized_accounts(spec, root)
+    except (AccountBrokerError, ValueError) as exc:
+        raise SystemExit(f"nightwatch: account configuration rejected: {exc}") from exc
     state = store.initialize(
         make_run_id(str(root)),
         args.goal or "Adopted conversation",
@@ -579,6 +634,8 @@ def _adopt(args: argparse.Namespace) -> int:
         thread_id=args.thread,
         model=args.model,
         reasoning_effort=args.reasoning_effort,
+        account_mode=args.account_mode.replace("-", "_").upper(),
+        authorized_accounts=authorized,
     )
     print(f"Nightwatch: adopted thread {args.thread} for repo {root} (run_id={state['run_id']})")
     print("Run `nightwatch resume` to start unattended supervision.")

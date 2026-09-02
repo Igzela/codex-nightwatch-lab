@@ -33,7 +33,7 @@ def _window(raw: Any, name: str) -> QuotaWindow | None:
     return QuotaWindow(name, used_value, duration_value, reset_value)
 
 
-def parse_quota_result(result: Any, source: str = "app_server") -> QuotaSnapshot:
+def parse_quota_result(result: Any, source: str = "app_server", account_fingerprint: str | None = None) -> QuotaSnapshot:
     if not isinstance(result, dict):
         raise QuotaError("quota response result is not an object")
     raw = result.get("rateLimits", result.get("rate_limits", result))
@@ -44,18 +44,21 @@ def parse_quota_result(result: Any, source: str = "app_server") -> QuotaSnapshot
     if primary is None and secondary is None:
         raise QuotaError("quota response has no primary or secondary window")
     plan = raw.get("planType", raw.get("plan_type"))
-    return QuotaSnapshot(source, iso_now(), primary, secondary, str(plan) if plan else None)
+    return QuotaSnapshot(source, iso_now(), primary, secondary, str(plan) if plan else None, None, account_fingerprint)
 
 
 class AppServerQuotaProvider:
-    def __init__(self, binary: str | None = None, timeout: float = 8.0):
+    def __init__(self, binary: str | None = None, timeout: float = 8.0, codex_home: str | Path | None = None, account_fingerprint: str | None = None, lease_fd: int | None = None):
         self.binary = binary or os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
         self.timeout = timeout
+        self.codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
+        self.account_fingerprint = account_fingerprint
+        self.lease_fd = lease_fd
 
     def read(self) -> QuotaSnapshot:
         try:
-            result = AppServerClient(self.binary, self.timeout).rate_limits()
-            return parse_quota_result(result, "live_app_server")
+            result = AppServerClient(self.binary, self.timeout, self.codex_home, self.lease_fd).rate_limits()
+            return parse_quota_result(result, "live_app_server", self.account_fingerprint)
         except AppServerProtocolError as exc:
             raise QuotaError(str(exc)) from exc
 
