@@ -1,6 +1,12 @@
 test-artifacts/*
 !test-artifacts/fake-codex/
 !test-artifacts/fake-codex/**
+!test-artifacts/fake-agy/
+!test-artifacts/fake-agy/**
+*.egg-info/
+*.egg
+build/
+dist/
 **/__pycache__/
 *.pyc
 refs/*/

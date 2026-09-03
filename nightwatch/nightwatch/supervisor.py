@@ -491,8 +491,15 @@ class Supervisor:
             self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested; state preserved")
         return self.store.load_state()
 
+    def _get_quota_snapshot(self) -> QuotaSnapshot:
+        state = self.store.load_state()
+        if state.get("provider") == "agy":
+            from .providers import get_provider_adapter
+            return get_provider_adapter("agy").probe_quota(self.store, self.store.repo)
+        return self.quota_provider.read()
+
     def _preflight(self) -> bool:
-        self.store.transition(State.PREFLIGHT, "preflight_started", "repo, Codex, auth, and quota sanity checks")
+        self.store.transition(State.PREFLIGHT, "preflight_started", "repo, provider, auth, and quota sanity checks")
         return self._preflight_checks()
 
     def _preflight_checks(self) -> bool:
@@ -510,27 +517,38 @@ class Supervisor:
         except GitError:
             self._fail_closed("Git preflight failed", ErrorKind.GIT)
             return False
+        provider_name = state.get("provider", "codex")
+        from .providers import get_provider_adapter
+        provider = get_provider_adapter(provider_name)
         if os.environ.get("NIGHTWATCH_IGNORE_CONCURRENT_CODEX") != "1":
-            running_codex = find_repo_codex_processes(current_root, exclude_pid=os.getpid())
+            if provider_name == "codex":
+                running = find_repo_codex_processes(current_root, exclude_pid=os.getpid())
+            else:
+                running = provider.find_active_processes(current_root, exclude_pid=os.getpid())
             current_active = state.get("active_process")
             if isinstance(current_active, dict) and current_active.get("pid"):
-                running_codex = [p for p in running_codex if p["pid"] != current_active["pid"]]
-            if running_codex:
-                pids = ", ".join(str(p["pid"]) for p in running_codex)
+                running = [p for p in running if p["pid"] != current_active["pid"]]
+            if running:
+                pids = ", ".join(str(p["pid"]) for p in running)
                 self._fail_closed(
-                    f"another Codex process (PID {pids}) is active in this repository; "
+                    f"another {provider_name.capitalize()} process (PID {pids}) is active in this repository; "
                     "use `nightwatch watch` to monitor it passively or wait until it exits",
                     ErrorKind.STATE,
                 )
                 return False
-        binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
-        if not (Path(binary).is_file() and os.access(binary, os.X_OK)) and not shutil.which(binary):
-            self._fail_closed("Codex CLI was not found", ErrorKind.UNKNOWN)
-            return False
-        auth_ok = self._auth_sanity(binary)
-        if not auth_ok:
-            self._fail_closed("Codex authentication sanity check failed", ErrorKind.AUTH)
-            return False
+        if provider_name == "agy":
+            if not provider.auth_sanity():
+                self._fail_closed("AGY authentication sanity check failed", ErrorKind.AUTH)
+                return False
+        else:
+            binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+            if not (Path(binary).is_file() and os.access(binary, os.X_OK)) and not shutil.which(binary):
+                self._fail_closed("Codex CLI was not found", ErrorKind.UNKNOWN)
+                return False
+            auth_ok = self._auth_sanity(binary)
+            if not auth_ok:
+                self._fail_closed("Codex authentication sanity check failed", ErrorKind.AUTH)
+                return False
         if self._is_auto_pool(state):
             codex_ver = installed_codex_version(binary)
             thread_mode = cross_account_thread_mode_for_version(codex_ver)
@@ -549,9 +567,9 @@ class Supervisor:
             )
             return self._prepare_pool_account(reselect=True) or self.store.load_state()["state"] == State.WAIT_QUOTA.value
         try:
-            quota = self.quota_provider.read()
+            quota = self._get_quota_snapshot()
             self.store.mutate("quota_sanity_ok", "quota provider returned a validated snapshot", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
-            if quota.source in {"live_app_server", "fake_file"} and quota.exhausted_windows():
+            if (quota.source in {"live_app_server", "fake_file", "AGY_CLI"}) and quota.exhausted_windows():
                 self._enter_initial_quota_wait(quota)
                 return True
         except Exception as exc:
@@ -612,6 +630,7 @@ class Supervisor:
 
     def _run_turn(self) -> dict[str, Any]:
         state = self.store.load_state()
+        provider_name = state.get("provider", "codex")
         thread = state.get("thread_id")
         if state["state"] in {State.PREFLIGHT.value, State.RECOVERING.value}:
             state = self.store.transition(State.RUNNING, "provider_launch_ready", "preflight passed" if state["state"] == State.PREFLIGHT.value else "quota recovered; ready for provider launch")
@@ -732,11 +751,23 @@ class Supervisor:
                     },
                 },
             )
+        elif provider_name == "agy":
+            from .providers import get_provider_adapter
+            adapter = get_provider_adapter("agy")
+            result = adapter.run_turn(
+                self.store,
+                state["generation"],
+                prompt,
+                provider_thread,
+                on_spawn,
+                on_thread,
+                stop_event=None,
+            )
         else:
             result = run_codex(self.store, state["generation"], prompt, provider_thread, on_spawn, on_thread)
-        self.store.mutate("provider_finished", "Codex child process finished", lambda item: {**item, "active_process": None, "last_provider_exit": result.exit_code, "last_provider_signal": result.signal})
+        self.store.mutate("provider_finished", f"{provider_name.capitalize()} child process finished", lambda item: {**item, "active_process": None, "last_provider_exit": result.exit_code, "last_provider_signal": result.signal})
         crash_hook("AFTER_PROVIDER_EXIT")
-        self.store.append_event("provider_result", "classified Codex result", {"error_kind": result.error_kind.value if result.error_kind else None, "exit_code": result.exit_code, "signal": result.signal, "event_count": result.event_count, "malformed_count": result.malformed_count})
+        self.store.append_event("provider_result", f"classified {provider_name.capitalize()} result", {"error_kind": result.error_kind.value if result.error_kind else None, "exit_code": result.exit_code, "signal": result.signal, "event_count": result.event_count, "malformed_count": result.malformed_count})
         return self._handle_result(result)
 
     def _handle_result(self, result: ProviderResult) -> dict[str, Any]:
@@ -1027,9 +1058,9 @@ class Supervisor:
             self.store.transition(State.STOPPED, "supervisor_stopped", "stop requested during quota wait")
             return False
         try:
-            quota = self.quota_provider.read()
+            quota = self._get_quota_snapshot()
             self.store.mutate("quota_revalidated", "quota authority queried after reset", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
-            if quota.source in {"live_app_server", "fake_file"}:
+            if quota.source in {"live_app_server", "fake_file", "AGY_CLI"}:
                 if not quota_recovered(quota, governing):
                     later = max((window.resets_at or int(time.time()) + QUOTA_POLL_SECONDS for window in quota.windows() if window.name in governing), default=int(time.time()) + QUOTA_POLL_SECONDS)
                     buffer_seconds = int(os.environ.get("NIGHTWATCH_QUOTA_BUFFER_SECONDS", QUOTA_BUFFER_SECONDS))
