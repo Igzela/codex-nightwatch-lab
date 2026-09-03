@@ -349,6 +349,323 @@ class EventStoreTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def _setup_store_with_single_segment(self, root: Path, run_id: str) -> tuple[NightwatchStore, int]:
+        store = NightwatchStore(root)
+        store.initialize(run_id, "goal", str(root))
+        for i in range(5):
+            store.append_event(f"ev_{i}", "setup", {"pad": "x" * 20})
+        manifest = json.loads(store.events_manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest["segments"]), 1)
+        self.assertEqual(manifest["current_segment"], "segment-000001.jsonl")
+        return store, manifest["last_seq"]
+
+    def test_rotation_crash_after_segment_create_recovers(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-create")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            orphan.touch(mode=0o600)
+            self.assertTrue(orphan.exists())
+            self.assertEqual(orphan.stat().st_size, 0)
+
+            store2 = NightwatchStore(root)
+            state = store2.load_state()
+            self.assertEqual(state["run_id"], "run-rot-create")
+            self.assertFalse(orphan.exists(), "empty orphan segment must be safely removed")
+
+            manifest2 = json.loads(store2.events_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest2["last_seq"], last_seq)
+
+            store2.append_event("ev_after_crash", "recovered")
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq + 1)
+            self.assertEqual(events[-1]["seq"], last_seq + 1)
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_crash_after_partial_orphan_write_recovers(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-partial")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            orphan.write_text('{"event": "incomplete_append", "seq": ' + str(last_seq + 1), encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            state = store2.load_state()
+            self.assertEqual(state["run_id"], "run-rot-partial")
+            self.assertFalse(orphan.exists(), "partial uncommitted orphan must be safely discarded")
+
+            manifest2 = json.loads(store2.events_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest2["last_seq"], last_seq)
+
+            store2.append_event("ev_after_partial", "recovered")
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq + 1)
+            self.assertEqual(events[-1]["seq"], last_seq + 1)
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_crash_after_complete_next_event_adopts_event(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-adopt")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            event_item = {
+                "event": "adopted_event",
+                "git_head": None,
+                "reason": "rotation_orphan",
+                "repo": str(root),
+                "run_id": "run-rot-adopt",
+                "seq": last_seq + 1,
+                "state": "RUNNING",
+                "ts": "2026-09-03T12:00:00Z",
+            }
+            orphan.write_text(json.dumps(event_item) + "\n", encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            state = store2.load_state()
+            self.assertEqual(state["run_id"], "run-rot-adopt")
+            self.assertTrue(orphan.exists(), "valid complete orphan must be adopted and preserved")
+
+            manifest2 = json.loads(store2.events_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest2["last_seq"], last_seq + 1)
+            self.assertEqual(manifest2["current_segment"], "segment-000002.jsonl")
+            self.assertEqual(len(manifest2["segments"]), 2)
+            self.assertIsNotNone(manifest2["segments"][0]["sha256"], "previous segment must be sealed")
+            self.assertEqual(manifest2["segments"][1]["name"], "segment-000002.jsonl")
+            self.assertEqual(manifest2["segments"][1]["prev_sha256"], manifest2["segments"][0]["sha256"])
+
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq + 1)
+            self.assertEqual(events[-1]["seq"], last_seq + 1)
+            self.assertEqual(events[-1]["event"], "adopted_event")
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_crash_after_manifest_commit_is_idempotent(self):
+        temporary, root = fixture()
+        try:
+            store, _ = self._setup_store_with_single_segment(root, "run-rot-idempotent")
+            # Force rotation by setting a small segment limit
+            with patch.dict(os.environ, {"NIGHTWATCH_MAX_SEGMENT_BYTES": "200"}, clear=False):
+                store.append_event("trigger_rotation", "setup", {"data": "x" * 100})
+
+            manifest = json.loads(store.events_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["segments"]), 2)
+            last_seq = manifest["last_seq"]
+
+            store2 = NightwatchStore(root)
+            state = store2.load_state()
+            self.assertEqual(state["run_id"], "run-rot-idempotent")
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq)
+            manifest2 = json.loads(store2.events_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest, manifest2)
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_orphan_wrong_seq_fails_closed(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-wrong-seq")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            bad_event = {"event": "skip", "seq": last_seq + 5, "ts": "2026-09-03T12:00:00Z"}
+            orphan.write_text(json.dumps(bad_event) + "\n", encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            with self.assertRaises(StateIntegrityError):
+                store2.load_state()
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_orphan_malformed_complete_record_fails_closed(self):
+        temporary, root = fixture()
+        try:
+            store, _ = self._setup_store_with_single_segment(root, "run-rot-malformed")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            orphan.write_text('{"event": "broken", "malformed": ]\n', encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            with self.assertRaises(StateIntegrityError):
+                store2.load_state()
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_multiple_orphans_fail_closed(self):
+        temporary, root = fixture()
+        try:
+            store, _ = self._setup_store_with_single_segment(root, "run-rot-multi")
+
+            (store.events_dir / "segment-000002.jsonl").touch()
+            (store.events_dir / "segment-000003.jsonl").touch()
+
+            store2 = NightwatchStore(root)
+            with self.assertRaises(StateIntegrityError):
+                store2.load_state()
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_orphan_symlink_fails_closed(self):
+        temporary, root = fixture()
+        try:
+            store, _ = self._setup_store_with_single_segment(root, "run-rot-symlink")
+
+            target = store.directory / "dummy.jsonl"
+            target.write_text('{"event": "dummy", "seq": 12, "ts": "2026-09-03T12:00:00Z"}\n', encoding="utf-8")
+            orphan = store.events_dir / "segment-000002.jsonl"
+            os.symlink(target, orphan)
+
+            store2 = NightwatchStore(root)
+            with self.assertRaises(StateIntegrityError):
+                store2.load_state()
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_recovery_preserves_global_monotonic_sequence(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-mono")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            ev = {
+                "event": "adopted",
+                "git_head": None,
+                "reason": "rot",
+                "repo": str(root),
+                "run_id": "run-rot-mono",
+                "seq": last_seq + 1,
+                "state": "RUNNING",
+                "ts": "2026-09-03T12:00:00Z",
+            }
+            orphan.write_text(json.dumps(ev) + "\n", encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            store2.load_state()
+
+            for i in range(10):
+                store2.append_event(f"post_recover_{i}", "continue", {"pad": "y" * 100})
+
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq + 11)
+            for idx, item in enumerate(events, 1):
+                self.assertEqual(item["seq"], idx)
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_recovery_survives_new_store_instance(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-inst")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            ev = {
+                "event": "adopted",
+                "git_head": None,
+                "reason": "rot",
+                "repo": str(root),
+                "run_id": "run-rot-inst",
+                "seq": last_seq + 1,
+                "state": "RUNNING",
+                "ts": "2026-09-03T12:00:00Z",
+            }
+            orphan.write_text(json.dumps(ev) + "\n", encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            state2 = store2.load_state()
+            events2 = store2.load_events()
+
+            store3 = NightwatchStore(root)
+            state3 = store3.load_state()
+            events3 = store3.load_events()
+
+            self.assertEqual(state2["run_id"], state3["run_id"])
+            self.assertEqual(len(events2), len(events3))
+            self.assertEqual(events2, events3)
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_recovery_then_next_append_succeeds(self):
+        temporary, root = fixture()
+        try:
+            store, last_seq = self._setup_store_with_single_segment(root, "run-rot-next")
+
+            orphan = store.events_dir / "segment-000002.jsonl"
+            ev = {
+                "event": "adopted",
+                "git_head": None,
+                "reason": "rot",
+                "repo": str(root),
+                "run_id": "run-rot-next",
+                "seq": last_seq + 1,
+                "state": "RUNNING",
+                "ts": "2026-09-03T12:00:00Z",
+            }
+            orphan.write_text(json.dumps(ev) + "\n", encoding="utf-8")
+
+            store2 = NightwatchStore(root)
+            store2.load_state()
+
+            store2.append_event("next_append", "reason", {"extra": "val"})
+            events = store2.load_events()
+            self.assertEqual(len(events), last_seq + 2)
+            self.assertEqual(events[-1]["seq"], last_seq + 2)
+            self.assertEqual(events[-1]["event"], "next_append")
+        finally:
+            temporary.cleanup()
+
+    def test_rotation_crash_hooks_deterministic_points(self):
+        points = ("AFTER_SEGMENT_CREATE", "AFTER_EVENT_APPEND", "AFTER_ROTATION_MANIFEST_COMMIT")
+        for point in points:
+            with self.subTest(point=point):
+                temporary, root = fixture()
+                try:
+                    store, _ = self._setup_store_with_single_segment(root, "run-rot-hook-" + point)
+
+                    child_code = (
+                        "import os, sys; "
+                        "from pathlib import Path; "
+                        "from nightwatch.storage import NightwatchStore; "
+                        "os.environ['NIGHTWATCH_MAX_SEGMENT_BYTES'] = '100'; "
+                        "store = NightwatchStore(sys.argv[1]); "
+                        "store.append_event('trigger_rotation', 'trigger', {'data': 'x' * 100}); "
+                    )
+                    environment = dict(os.environ)
+                    environment.update({
+                        "PYTHONPATH": str(PRODUCT),
+                        "NIGHTWATCH_ENABLE_TEST_CRASH_HOOKS": "1",
+                        "NIGHTWATCH_TEST_CRASH_POINT": point,
+                    })
+                    child = subprocess.Popen(
+                        [sys.executable, "-c", child_code, str(root)],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    try:
+                        self.assertEqual(child.wait(timeout=5), -9, point)
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.wait(timeout=5)
+                        if child.stdout is not None:
+                            child.stdout.close()
+                        if child.stderr is not None:
+                            child.stderr.close()
+
+                    store_after = NightwatchStore(root)
+                    state = store_after.load_state()
+                    self.assertIsNotNone(state)
+                    events = store_after.load_events()
+                    self.assertGreater(len(events), 0)
+                finally:
+                    temporary.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
