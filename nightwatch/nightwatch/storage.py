@@ -8,6 +8,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,9 @@ class SupervisorAlreadyRunning(RuntimeError):
 
 
 MAX_EVENT_BYTES = 1_000_000
+DEFAULT_MAX_SEGMENT_BYTES = 500_000
+DEFAULT_MAX_SEGMENT_EVENTS = 2_000
+
 
 
 @dataclass(frozen=True)
@@ -262,7 +266,9 @@ class NightwatchStore:
         self.acceptance_path = self.directory / "acceptance.json"
         self.metadata_path = self.directory / "metadata.json"
         self.checkpoint_path = self.directory / "checkpoint.md"
-        self.events_path = self.directory / "events.jsonl"
+        self.legacy_events_path = self.directory / "events.jsonl"
+        self.events_dir = self.directory / "events"
+        self.events_manifest_path = self.events_dir / "manifest.json"
         self.log_path = self.directory / "supervisor.log"
         self.runs_path = self.directory / "runs"
         self.reports_path = self.directory / "reports"
@@ -272,6 +278,12 @@ class NightwatchStore:
         self.codex_home_path = self.codex_runtime_path / "codex-home"
         self._codex_runtime_identity: tuple[int, int] | None = None
         self._codex_home_identity: tuple[int, int] | None = None
+
+    @property
+    def events_path(self) -> Path:
+        if self._has_legacy_events_only():
+            return self.legacy_events_path
+        return self._active_segment_path()
 
     @property
     def codex_home(self) -> Path:
@@ -295,14 +307,41 @@ class NightwatchStore:
         expected_runtime_id: tuple[int, int] | None = self._codex_runtime_identity
         expected_home_id: tuple[int, int] | None = self._codex_home_identity
         if (expected_runtime_id is None or expected_home_id is None) and self.exists():
-            try:
-                state = self.load_state()
-                if isinstance(state.get("codex_runtime_identity"), list) and len(state["codex_runtime_identity"]) == 2:
-                    expected_runtime_id = (int(state["codex_runtime_identity"][0]), int(state["codex_runtime_identity"][1]))
-                if isinstance(state.get("codex_home_identity"), list) and len(state["codex_home_identity"]) == 2:
-                    expected_home_id = (int(state["codex_home_identity"][0]), int(state["codex_home_identity"][1]))
-            except Exception:
-                pass
+            state = self.load_state()
+            raw_runtime = state.get("codex_runtime_identity")
+            raw_home = state.get("codex_home_identity")
+            if raw_runtime is not None or raw_home is not None:
+                if raw_runtime is None or raw_home is None:
+                    raise StateIntegrityError("both codex_runtime_identity and codex_home_identity must be present in trusted state")
+                if (
+                    not isinstance(raw_runtime, list)
+                    or len(raw_runtime) != 2
+                    or type(raw_runtime[0]) is not int
+                    or type(raw_runtime[1]) is not int
+                    or isinstance(raw_runtime[0], bool)
+                    or isinstance(raw_runtime[1], bool)
+                    or raw_runtime[0] <= 0
+                    or raw_runtime[1] <= 0
+                    or not isinstance(raw_home, list)
+                    or len(raw_home) != 2
+                    or type(raw_home[0]) is not int
+                    or type(raw_home[1]) is not int
+                    or isinstance(raw_home[0], bool)
+                    or isinstance(raw_home[1], bool)
+                    or raw_home[0] <= 0
+                    or raw_home[1] <= 0
+                ):
+                    raise StateIntegrityError("malformed codex home identity in trusted state")
+                expected_runtime_id = (raw_runtime[0], raw_runtime[1])
+                expected_home_id = (raw_home[0], raw_home[1])
+            else:
+                if self.codex_runtime_path.exists() or self.codex_home_path.exists():
+                    if state.get("legacy_pre_identity_migration") is True:
+                        pass
+                    else:
+                        raise StateIntegrityError(
+                            "persistent codex-home exists but durable identity is absent in trusted state; failing closed"
+                        )
         _, runtime_id, home_id = establish_trusted_codex_home(
             self.root,
             self.directory.name,
@@ -320,17 +359,34 @@ class NightwatchStore:
         expected_runtime_id = self._codex_runtime_identity
         expected_home_id = self._codex_home_identity
         if (expected_runtime_id is None or expected_home_id is None) and self.exists():
-            try:
-                state = self.load_state()
-                if isinstance(state.get("codex_runtime_identity"), list) and len(state["codex_runtime_identity"]) == 2:
-                    expected_runtime_id = (int(state["codex_runtime_identity"][0]), int(state["codex_runtime_identity"][1]))
-                if isinstance(state.get("codex_home_identity"), list) and len(state["codex_home_identity"]) == 2:
-                    expected_home_id = (int(state["codex_home_identity"][0]), int(state["codex_home_identity"][1]))
-            except Exception:
-                pass
+            state = self.load_state()
+            raw_runtime = state.get("codex_runtime_identity")
+            raw_home = state.get("codex_home_identity")
+            if raw_runtime is None or raw_home is None:
+                raise StateIntegrityError("cannot verify codex home: missing durable identity in trusted state")
+            if (
+                not isinstance(raw_runtime, list)
+                or len(raw_runtime) != 2
+                or type(raw_runtime[0]) is not int
+                or type(raw_runtime[1]) is not int
+                or isinstance(raw_runtime[0], bool)
+                or isinstance(raw_runtime[1], bool)
+                or raw_runtime[0] <= 0
+                or raw_runtime[1] <= 0
+                or not isinstance(raw_home, list)
+                or len(raw_home) != 2
+                or type(raw_home[0]) is not int
+                or type(raw_home[1]) is not int
+                or isinstance(raw_home[0], bool)
+                or isinstance(raw_home[1], bool)
+                or raw_home[0] <= 0
+                or raw_home[1] <= 0
+            ):
+                raise StateIntegrityError("malformed codex home identity in trusted state")
+            expected_runtime_id = (raw_runtime[0], raw_runtime[1])
+            expected_home_id = (raw_home[0], raw_home[1])
         if expected_runtime_id is None or expected_home_id is None:
-            self.ensure_codex_home()
-            return
+            raise StateIntegrityError("cannot verify codex home without established identities")
         verify_trusted_codex_home_chain(
             self.root,
             self.directory.name,
@@ -424,11 +480,14 @@ class NightwatchStore:
             try:
                 self.runs_path.mkdir(mode=0o700)
                 self.reports_path.mkdir(mode=0o700)
+                self.events_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 self.ensure_codex_home()
                 if self._codex_runtime_identity is not None:
                     state["codex_runtime_identity"] = list(self._codex_runtime_identity)
                 if self._codex_home_identity is not None:
                     state["codex_home_identity"] = list(self._codex_home_identity)
+                state["initialized"] = True
+                validate_state(state)
                 self._clear_mailbox_run_outputs_at(mailbox_fd)
                 self._write_json_at(mailbox_fd, "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
             finally:
@@ -450,7 +509,7 @@ class NightwatchStore:
             validate_state(state)
             if state.get("repo") != str(self.repo) or state.get("repo_id") != self.repo_id:
                 raise StateIntegrityError("trusted state does not belong to this repository identity")
-            self._validate_event_sequence()
+            self._validate_event_frontier()
             return state
         except FileNotFoundError as exc:
             raise StateIntegrityError("trusted state.json is missing") from exc
@@ -542,7 +601,27 @@ class NightwatchStore:
 
     def load_events(self) -> list[dict[str, Any]]:
         """Return the sequence-validated trusted lifecycle timeline."""
-        events = self._event_items()
+        self._validate_event_frontier()
+        if self._has_legacy_events_only():
+            return self._legacy_event_items()
+        if not self.events_manifest_path.exists():
+            return []
+        manifest = self._read_json_regular(self.events_manifest_path)
+        events: list[dict[str, Any]] = []
+        for seg in manifest.get("segments", []):
+            path = self.legacy_events_path if seg.get("is_legacy_root") else self.events_dir / seg["name"]
+            raw = self._read_segment_body(path)
+            if seg.get("sha256") is not None:
+                digest = hashlib.sha256(raw).hexdigest()
+                if digest != seg["sha256"]:
+                    raise StateIntegrityError(f"trusted event segment {seg['name']} digest mismatch")
+            for line in raw.decode("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise StateIntegrityError(f"trusted event segment {seg['name']} is corrupt") from exc
         previous = 0
         for item in events:
             seq = item.get("seq") if isinstance(item, dict) else None
@@ -702,35 +781,343 @@ class NightwatchStore:
             except FileNotFoundError:
                 pass
 
+    def _has_legacy_events_only(self) -> bool:
+        return self.legacy_events_path.exists() and not self.events_manifest_path.exists()
+
+    def _active_segment_name(self) -> str:
+        if self.events_manifest_path.exists():
+            try:
+                manifest = self._read_json_regular(self.events_manifest_path)
+                curr = manifest.get("current_segment")
+                if isinstance(curr, str) and curr:
+                    return curr
+            except Exception:
+                pass
+        return "segment-000001.jsonl"
+
+    def _active_segment_path(self) -> Path:
+        return self.events_dir / self._active_segment_name()
+
+    def _max_segment_bytes(self) -> int:
+        return int(os.environ.get("NIGHTWATCH_MAX_SEGMENT_BYTES", DEFAULT_MAX_SEGMENT_BYTES))
+
+    def _read_segment_body(self, path: Path) -> bytes:
+        return path.read_bytes()
+
+    @staticmethod
+    def _read_last_json_line(path: Path, file_size: int) -> dict[str, Any] | None:
+        read_size = min(file_size, 4096)
+        with open(path, "rb") as f:
+            f.seek(file_size - read_size)
+            chunk = f.read(read_size)
+        lines = chunk.splitlines()
+        for line in reversed(lines):
+            line_str = line.strip().decode("utf-8", errors="replace")
+            if line_str:
+                try:
+                    return json.loads(line_str)
+                except json.JSONDecodeError as exc:
+                    raise StateIntegrityError("active segment tail is malformed JSON") from exc
+        return None
+
+    def _get_or_init_manifest_unlocked(self) -> dict[str, Any]:
+        if self.events_manifest_path.exists():
+            return self._read_json_regular(self.events_manifest_path)
+        return {
+            "schema_version": 1,
+            "last_seq": 0,
+            "current_segment": "segment-000001.jsonl",
+            "segments": [],
+        }
+
+    def _migrate_legacy_events_unlocked(self) -> None:
+        stat_res = os.lstat(self.legacy_events_path)
+        if not stat.S_ISREG(stat_res.st_mode) or stat.S_ISLNK(stat_res.st_mode):
+            raise StateIntegrityError("legacy events.jsonl is not a regular file")
+        if stat_res.st_size > MAX_EVENT_BYTES:
+            raise StateIntegrityError("legacy events.jsonl exceeds maximum allowed size")
+        events = []
+        with self.legacy_events_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    events.append(json.loads(line))
+        previous = 0
+        for item in events:
+            seq = item.get("seq") if isinstance(item, dict) else None
+            if not isinstance(seq, int) or seq != previous + 1:
+                raise StateIntegrityError("legacy events.jsonl sequence is corrupt")
+            previous = seq
+        k = len(events)
+        legacy_bytes = self._read_segment_body(self.legacy_events_path)
+        legacy_sha = hashlib.sha256(legacy_bytes).hexdigest()
+        self.events_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        legacy_seg = {
+            "name": "events.jsonl",
+            "is_legacy_root": True,
+            "seq_start": 1,
+            "seq_end": k,
+            "event_count": k,
+            "byte_size": stat_res.st_size,
+            "sha256": legacy_sha,
+            "prev_sha256": None,
+        }
+        manifest = {
+            "schema_version": 1,
+            "last_seq": k,
+            "current_segment": "events.jsonl",
+            "segments": [legacy_seg],
+        }
+        self._write_json(self.events_manifest_path, manifest)
+
     def _append_event_unlocked(self, state: dict[str, Any], event: str, reason: str, metadata: dict[str, Any] | None = None) -> None:
-        item = {"seq": self._next_event_seq(), "ts": state["updated_at"], "event": event, "reason": reason, "run_id": state["run_id"], "state": state["state"], "generation": state.get("generation"), "thread_id": state.get("thread_id"), "repo": state.get("repo"), "git_head": state.get("last_git_head")}
+        self.events_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self._has_legacy_events_only():
+            self._migrate_legacy_events_unlocked()
+
+        manifest = self._get_or_init_manifest_unlocked()
+        next_seq = manifest["last_seq"] + 1
+
+        item = {
+            "seq": next_seq,
+            "ts": state["updated_at"],
+            "event": event,
+            "reason": reason,
+            "run_id": state["run_id"],
+            "state": state["state"],
+            "generation": state.get("generation"),
+            "thread_id": state.get("thread_id"),
+            "repo": state.get("repo"),
+            "git_head": state.get("last_git_head"),
+        }
         if metadata:
             item["metadata"] = metadata
-        self._append_file(self.events_path, json.dumps(redact(item), sort_keys=True, ensure_ascii=False) + "\n")
+        line_text = json.dumps(redact(item), sort_keys=True, ensure_ascii=False) + "\n"
+        line_bytes = line_text.encode("utf-8")
 
-    def _next_event_seq(self) -> int:
-        events = self._event_items()
-        return int(events[-1]["seq"]) + 1 if events else 1
+        segments = manifest["segments"]
+        active_seg = segments[-1] if segments else None
+        need_rotation = False
 
-    def _validate_event_sequence(self) -> None:
+        if active_seg is None or active_seg.get("is_legacy_root"):
+            need_rotation = True
+        else:
+            active_path = self.events_dir / active_seg["name"]
+            curr_size = os.lstat(active_path).st_size if active_path.exists() else 0
+            max_seg_bytes = self._max_segment_bytes()
+            max_seg_events = int(os.environ.get("NIGHTWATCH_MAX_SEGMENT_EVENTS", DEFAULT_MAX_SEGMENT_EVENTS))
+            if curr_size + len(line_bytes) > max_seg_bytes or active_seg.get("event_count", 0) >= max_seg_events:
+                need_rotation = True
+
+        if need_rotation:
+            prev_hash = None
+            if active_seg is not None:
+                if active_seg.get("is_legacy_root"):
+                    prev_hash = active_seg.get("sha256")
+                else:
+                    active_path = self.events_dir / active_seg["name"]
+                    active_bytes = self._read_segment_body(active_path)
+                    prev_hash = hashlib.sha256(active_bytes).hexdigest()
+                    active_seg["sha256"] = prev_hash
+                    active_seg["byte_size"] = os.lstat(active_path).st_size
+
+            seg_num = sum(1 for s in segments if not s.get("is_legacy_root")) + 1
+            new_name = f"segment-{seg_num:06d}.jsonl"
+            new_seg = {
+                "name": new_name,
+                "seq_start": next_seq,
+                "seq_end": next_seq,
+                "event_count": 0,
+                "byte_size": 0,
+                "sha256": None,
+                "prev_sha256": prev_hash,
+            }
+            segments.append(new_seg)
+            manifest["current_segment"] = new_name
+            active_seg = new_seg
+
+        active_path = self.events_dir / active_seg["name"]
+        self._append_file(active_path, line_text)
+        crash_hook("AFTER_EVENT_APPEND")
+
+        active_seg["seq_end"] = next_seq
+        active_seg["event_count"] = active_seg.get("event_count", 0) + 1
+        active_seg["byte_size"] = os.lstat(active_path).st_size
+        manifest["last_seq"] = next_seq
+        self._write_json(self.events_manifest_path, manifest)
+
+    def _validate_event_frontier(self) -> None:
+        if self._has_legacy_events_only():
+            self._validate_legacy_events()
+            return
+        if not self.events_manifest_path.exists():
+            if self.exists():
+                raise StateIntegrityError("trusted event log is missing")
+            return
+
+        try:
+            stat_manifest = os.lstat(self.events_manifest_path)
+            if not stat.S_ISREG(stat_manifest.st_mode) or stat.S_ISLNK(stat_manifest.st_mode):
+                raise StateIntegrityError("manifest.json is unsafe")
+            manifest = self._read_json_regular(self.events_manifest_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateIntegrityError("trusted events manifest is unreadable or corrupt") from exc
+
+        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+            raise StateIntegrityError("unsupported event manifest schema")
+        segments = manifest.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise StateIntegrityError("manifest segments must be a non-empty list")
+        last_seq = manifest.get("last_seq")
+        if not isinstance(last_seq, int) or last_seq < 1:
+            raise StateIntegrityError("invalid manifest last_seq")
+        current_segment = manifest.get("current_segment")
+        if current_segment != segments[-1].get("name"):
+            raise StateIntegrityError("manifest current_segment mismatch")
+
+        expected_seq = 1
+        prev_hash = None
+        for seg in segments:
+            if not isinstance(seg, dict):
+                raise StateIntegrityError("invalid segment entry in manifest")
+            name = seg.get("name")
+            s_start = seg.get("seq_start")
+            s_end = seg.get("seq_end")
+            count = seg.get("event_count")
+            byte_size = seg.get("byte_size")
+            if not isinstance(name, str) or not name:
+                raise StateIntegrityError("invalid segment name in manifest")
+            if not isinstance(s_start, int) or s_start != expected_seq:
+                raise StateIntegrityError("segment seq_start broken")
+            if not isinstance(s_end, int) or s_end < s_start:
+                raise StateIntegrityError("segment seq_end broken")
+            if not isinstance(count, int) or count < 0:
+                raise StateIntegrityError("segment event_count invalid")
+            if not isinstance(byte_size, int) or byte_size < 0:
+                raise StateIntegrityError("segment byte_size invalid")
+            if seg.get("prev_sha256") != prev_hash:
+                raise StateIntegrityError("segment digest chain broken")
+            prev_hash = seg.get("sha256")
+            expected_seq = s_end + 1
+
+        if last_seq != segments[-1]["seq_end"]:
+            raise StateIntegrityError("manifest last_seq does not match last segment seq_end")
+
+        try:
+            entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
+            expected_entries = {"manifest.json"} | {s["name"] for s in segments if not s.get("is_legacy_root")}
+            if entries != expected_entries:
+                # In-flight manifest update or segment rotation may be completing:
+                time.sleep(0.05)
+                try:
+                    manifest = self._read_json_regular(self.events_manifest_path)
+                    segments = manifest.get("segments", [])
+                    expected_entries = {"manifest.json"} | {s["name"] for s in segments if not s.get("is_legacy_root")}
+                    entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
+                except Exception:
+                    pass
+                if entries != expected_entries:
+                    raise StateIntegrityError("events directory entries do not match manifest")
+        except OSError as exc:
+            raise StateIntegrityError("cannot inspect events directory") from exc
+
+        for seg in segments[:-1]:
+            path = self.legacy_events_path if seg.get("is_legacy_root") else self.events_dir / seg["name"]
+            try:
+                st = os.lstat(path)
+            except OSError as exc:
+                raise StateIntegrityError(f"cannot inspect sealed segment {seg['name']}") from exc
+            if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                raise StateIntegrityError(f"sealed segment {seg['name']} must be a regular file")
+            if st.st_size != seg["byte_size"]:
+                raise StateIntegrityError(f"sealed segment {seg['name']} size modified")
+
+        active_seg = segments[-1]
+        active_path = self.legacy_events_path if active_seg.get("is_legacy_root") else self.events_dir / active_seg["name"]
+        try:
+            st = os.lstat(active_path)
+        except OSError as exc:
+            raise StateIntegrityError(f"cannot inspect active segment {active_seg['name']}") from exc
+        if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            raise StateIntegrityError(f"active segment {active_seg['name']} must be a regular file")
+        max_allowed = self._max_segment_bytes() + 65_536
+        if st.st_size > max_allowed:
+            raise StateIntegrityError("active segment exceeds maximum segment limit")
+
+        if st.st_size > active_seg["byte_size"]:
+            trailing_bytes = active_path.read_bytes()[active_seg["byte_size"]:]
+            if trailing_bytes.endswith(b"\n"):
+                try:
+                    trailing_item = json.loads(trailing_bytes.decode("utf-8").strip())
+                except json.JSONDecodeError:
+                    raise StateIntegrityError("trusted event log has corrupt trailing record")
+                if isinstance(trailing_item, dict):
+                    t_seq = trailing_item.get("seq")
+                    if t_seq == last_seq + 1:
+                        active_seg["seq_end"] = t_seq
+                        active_seg["event_count"] = active_seg.get("event_count", 0) + 1
+                        active_seg["byte_size"] = st.st_size
+                        manifest["last_seq"] = t_seq
+                        self._write_json(self.events_manifest_path, manifest)
+                        last_seq = t_seq
+                    else:
+                        raise StateIntegrityError("trusted event log sequence is corrupt")
+                else:
+                    raise StateIntegrityError("trusted event log sequence is corrupt")
+            else:
+                try:
+                    with open(active_path, "r+b") as handle:
+                        handle.truncate(active_seg["byte_size"])
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError as exc:
+                    raise StateIntegrityError("cannot reconcile active segment frontier") from exc
+        elif st.st_size < active_seg["byte_size"]:
+            raise StateIntegrityError("active segment truncated unexpectedly")
+
+        if active_seg["byte_size"] > 0:
+            last_line = self._read_last_json_line(active_path, active_seg["byte_size"])
+            if not isinstance(last_line, dict) or last_line.get("seq") != last_seq:
+                raise StateIntegrityError("active segment frontier tail does not match manifest last_seq")
+
+    def _validate_legacy_events(self) -> None:
+        events = self._legacy_event_items()
         previous = 0
-        for item in self._event_items():
+        for item in events:
             seq = item.get("seq") if isinstance(item, dict) else None
             if not isinstance(seq, int) or seq != previous + 1:
                 raise StateIntegrityError("trusted event log sequence is corrupt")
             previous = seq
 
-    def _event_items(self) -> list[dict[str, Any]]:
+    def _legacy_event_items(self) -> list[dict[str, Any]]:
         try:
-            stat = os.lstat(self.events_path)
-            if not os.path.isfile(self.events_path) or os.path.islink(self.events_path) or stat.st_size > MAX_EVENT_BYTES:
+            stat_res = os.lstat(self.legacy_events_path)
+            if not os.path.isfile(self.legacy_events_path) or os.path.islink(self.legacy_events_path) or stat_res.st_size > MAX_EVENT_BYTES:
                 raise StateIntegrityError("trusted event log is unsafe")
-            with self.events_path.open(encoding="utf-8") as handle:
-                return [json.loads(line) for line in handle]
+            raw = self._read_segment_body(self.legacy_events_path)
+            events = []
+            for line in raw.decode("utf-8").splitlines():
+                if line.strip():
+                    events.append(json.loads(line))
+            return events
         except FileNotFoundError:
             return []
         except (OSError, json.JSONDecodeError) as exc:
             raise StateIntegrityError("trusted event log is unreadable") from exc
+
+    def _event_items(self) -> list[dict[str, Any]]:
+        return self.load_events()
+
+    def _next_event_seq(self) -> int:
+        if self._has_legacy_events_only():
+            events = self._legacy_event_items()
+            return int(events[-1]["seq"]) + 1 if events else 1
+        if self.events_manifest_path.exists():
+            manifest = self._read_json_regular(self.events_manifest_path)
+            return int(manifest.get("last_seq", 0)) + 1
+        return 1
+
+    def _validate_event_sequence(self) -> None:
+        self._validate_event_frontier()
 
     def _log_unlocked(self, message: str) -> None:
         self._append_file(self.log_path, f"{now_iso()} nightwatch/{__version__} {redact(message)}\n")

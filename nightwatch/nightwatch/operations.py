@@ -74,6 +74,8 @@ class RunSpec:
         if self.reasoning_effort is not None:
             object.__setattr__(self, "reasoning_effort", validate_reasoning_effort(self.reasoning_effort))
         commands = tuple(validate_human_text(item, "verification command", MAX_INSTRUCTION_CHARS) for item in self.verify_commands)
+        if len(commands) > MAX_VERIFY_COMMANDS:
+            raise ValueError(f"too many verification commands ({len(commands)} > {MAX_VERIFY_COMMANDS})")
         object.__setattr__(self, "verify_commands", commands)
         if self.thread_id is not None:
             thread = validate_human_text(self.thread_id, "thread ID", 256)

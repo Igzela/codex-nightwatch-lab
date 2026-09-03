@@ -72,45 +72,16 @@ def _sleep_until(target: int, poll_seconds: float = 30.0) -> None:
         time.sleep(min(remaining, poll_seconds))
 
 
-def pid_alive(pid: int | None) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        if sys_platform_linux():
-            try:
-                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-                state = stat.rsplit(")", 1)[-1].strip().split(maxsplit=1)[0]
-                if state == "Z":
-                    return False
-            except OSError:
-                return False
-        return True
-    except OSError:
-        return False
+from .process_identity import (
+    linux_process_identity,
+    pid_alive,
+    process_identity_matches,
+    sys_platform_linux,
+)
 
+process_identity = linux_process_identity
+process_matches = process_identity_matches
 
-def process_identity(pid: int) -> dict[str, Any] | None:
-    """Linux PID identity resistant to PID reuse."""
-    if not sys_platform_linux() or not pid_alive(pid):
-        return None
-    try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        fields = stat_text.rsplit(")", 1)[-1].strip().split()
-        starttime = fields[19]
-        executable = os.readlink(f"/proc/{pid}/exe")
-    except (OSError, IndexError):
-        return None
-    return {"pid": pid, "starttime": starttime, "executable": executable}
-
-
-def process_matches(record: dict[str, Any]) -> bool:
-    observed = process_identity(record.get("pid")) if isinstance(record.get("pid"), int) else None
-    return bool(observed and observed.get("starttime") == record.get("starttime") and observed.get("executable") == record.get("executable"))
-
-
-def sys_platform_linux() -> bool:
-    return sys.platform.startswith("linux")
 
 
 def find_repo_codex_processes(repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
@@ -590,7 +561,7 @@ class Supervisor:
         return True
 
     def _auth_sanity(self, binary: str) -> bool:
-        if os.environ.get("NIGHTWATCH_SKIP_AUTH_CHECK") == "1" or os.environ.get("NIGHTWATCH_CODEX_BIN"):
+        if os.environ.get("NIGHTWATCH_SKIP_AUTH_CHECK") == "1":
             return True
         try:
             result = subprocess.run([binary, "login", "status"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8, check=False)
