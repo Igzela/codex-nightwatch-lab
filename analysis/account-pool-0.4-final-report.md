@@ -1,5 +1,52 @@
 # Nightwatch 0.4.0 Account Pool Final Report
 
+## Final Trusted-Path Closure, Production Revalidation & Guarded Merge — 2026-09-03
+
+This final addendum documents the complete closure of the trusted path identity hardening, descriptor-based directory establishment, inode identity immutability, capability override protection, production two-turn revalidation, full regression testing (215 unit tests), and remote CI matrix completion.
+
+PR: #1 (feat: add opt-in account pool failover)
+MERGE_STATUS: READY_FOR_GUARDED_MERGE
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_TEST_BINARY: /home/charlie/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+
+LOCAL_UNIT_TEST_COUNT: 215 (all 215 PASS)
+CI_MATRIX: Python 3.11, 3.12, 3.13 all PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+DOCTOR: PASS
+PACKAGE_INSTALL: PASS
+
+### Trusted Directory Descriptor & Path Identity Hardening
+1. **Descriptor Verification (`O_NOFOLLOW | O_DIRECTORY`)**:
+   - Chained file descriptors establish persistent run `CODEX_HOME` (`root -> repo_dir -> codex-runtime -> codex-home`).
+   - Creation is relative to parent descriptor (`dir_fd`), preventing path traversal and TOCTOU directory replacement.
+   - Symlinks and non-directories are rejected immediately before any creation or permission mutation occurs (`fstat`, `fchmod`).
+2. **Immutable Inode Identity**:
+   - `TrustedRunHome` encapsulates `(path, runtime_identity, home_identity)`.
+   - On establish and re-verification, descriptor fstat confirms `(st_dev, st_ino)` match expected identity. Directory rename or inode replacement immediately fails closed before credential injection or supervisor turn dispatch.
+3. **AccountCapsule Boundary Protection**:
+   - `AccountCapsule.create` consumes `TrustedRunHome` without unsafe `.resolve()` normalization.
+   - Re-verifies trusted home inode immediately before importing accounts, synchronizing accounts, and scrubbing credentials.
+4. **Capability Override Safety**:
+   - `models.py:cross_account_thread_mode_for_version` enforces that `NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE` can only downgrade capability (`UNSUPPORTED`, `INCONCLUSIVE`), never upgrade an unproven version to `PROVEN`. Added safe test seam `NIGHTWATCH_UNSAFE_FORCE_CROSS_ACCOUNT_PROVEN` for fake test doubles.
+
+### Production Revalidation Results
+- **Gate 14: Real Same-Account Two-Turn Revalidation**: PASS
+  - Run ID: `gate14_same_account_repo-20260903T082259`
+  - Turn 1: Started thread `01a0665d-44ea-7fb1-8fa1-0617421adefa`, intentionally failed milestone verification (`test -f turn2_done.txt`).
+  - Transition: `verification_failed_continue` -> `resuming exact thread`.
+  - Turn 2: Exact resume of `01a0665d-44ea-7fb1-8fa1-0617421adefa`, passed all verification checks.
+  - Final State: DONE. Zero `no rollout found` errors.
+- **Section 16: Credential Scrubbing & Thread Store Durability**: PASS
+  - Residual credentials (`auth.json`, `registry.json`, `accounts/`, `*.auth.json`): Confirmed completely absent.
+  - Thread Store (`sessions/` rollout JSONL, SQLite databases `state_5.sqlite`, `goals_1.sqlite`, `thread_history_1.sqlite`): Fully preserved and intact.
+- **Cross-Account Thread Status**: PROVEN for installed Codex `0.152.1`.
+
+---
+
 ## Durable Thread Store / Ephemeral Auth Hardening & Final Production Acceptance — 2026-09-03
 
 This addendum records the complete resolution of the P1 release blocker, empirical proof
