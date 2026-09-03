@@ -51,3 +51,12 @@ Upstream `syncActiveAccountFromAuth` and activation paths can preserve a
 refreshed active auth snapshot while reconciling the registry. Nightwatch
 therefore synchronizes only after the provider exits and imports only the
 selected account snapshot back into the canonical registry.
+
+## Two-account real acceptance verification (2026-09-03)
+
+- Two distinct authentic accounts, Account A (`acct-4cb1604810cd`) and Account B (`acct-7ce14e017d7b`), verified in canonical registry without altering the active account identity (`acct-4cb1604810cd`).
+- Official Codex runtime creates ephemeral helper symlinks in `$CODEX_HOME/tmp/arg0/...`; `AccountCapsule` safely removes runtime `tmp` before tree hardening and deletion, failing closed if `tmp` itself is symlinked.
+- Explicit account selector resolution in `operations.py` updated to accept account fingerprints (`acct-...`) alongside stable account keys and aliases.
+- Live App Server probes verified authoritative 5h and weekly quota windows for both accounts.
+- Sequential capsule synchronization verified auth-refresh preservation without snapshot regression.
+- PR #1 is ready for review with all real blockers resolved.

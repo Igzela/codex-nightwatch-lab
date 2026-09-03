@@ -4,11 +4,16 @@ Date: 2026-09-02 (Asia/Tokyo)
 
 ## Status
 
-**BLOCKED_PENDING_REAL_TWO_ACCOUNT_ACCEPTANCE**. No quota was burned to force
-a natural exhaustion/recovery cycle. The isolated codex-auth contract smoke
-passed, but one tested non-active account cannot complete an authoritative App
-Server session, so refresh-preservation and cross-account exact-thread gates
-remain inconclusive.
+**0.4.0 PRODUCTION CANDIDATE = READY (AWAITING OWNER MERGE APPROVAL)**.
+All required real two-account gates passed on 2026-09-03:
+- Real Account B logged in under isolated `ACCOUNT_B_LOGIN_HOME`.
+- Verified mode-0700 recovery point created; canonical quiet-window transaction preserved Account A and unrelated state.
+- Real two-account App Server probes: PASS (Account A: 82% 5h, 56% weekly; Account B: 14% 5h, 40% weekly).
+- Real auth-refresh preservation: PASS across sequential capsule probe cycles.
+- Cross-account exact-thread experiment: UNSUPPORTED by upstream Codex rollout backend; production behavior remains CONTROLLED_THREAD_HANDOFF (PASS).
+- Real Nightwatch AUTO_POOL routing smoke: PASS in disposable repository; high-capacity Account B selected, lease held, registry lock released, completed DONE, canonical active account preserved.
+- Local regression: PASS, 198 tests.
+- PR CI: PASS across Python 3.11, 3.12, 3.13.
 
 ## Closed release blockers
 
@@ -89,4 +94,4 @@ remain inconclusive.
   mission handoff.
 - Real two-account Nightwatch routing reached DONE with exactly two authorized
   keys in a disposable repository and preserved the canonical active account,
-  but this does not substitute for the failed second-account App Server gate.
+  completing the final real two-account gate.

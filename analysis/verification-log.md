@@ -92,3 +92,20 @@ one lease, and same-thread post-reset success before changing this to PASS.
   account App Server probe passed; both tested non-active snapshots returned
   upstream 401 token-parse failures, so real two-account acceptance remains
   blocked.
+
+## 0.4 real two-account acceptance completion
+
+Date: 2026-09-03 (Asia/Shanghai)
+
+- Isolated login of real Account B: **PASS**. Completed under isolated `~/.local/state/codex-nightwatch/account-b-login` with `cli_auth_credentials_store="file"` via `codex login --device-auth`. Zero mutation of canonical `~/.codex`.
+- Canonical transaction: **PASS**. Mode-0700 recovery point created at `~/.local/state/codex-nightwatch/recovery-points/recovery-before-import-b-1788410029`. Account lease acquired before entering canonical registry lock. Single Account B snapshot imported; canonical active account remained Account A (`acct-4cb1604810cd`).
+- Real two-account App Server probes: **PASS**.
+  - Account A (`acct-4cb1604810cd`): 5h used=82%, weekly used=56%.
+  - Account B (`acct-7ce14e017d7b`): 5h used=14%, weekly used=40%.
+- Real auth-refresh preservation: **PASS**. Sequential A -> B -> A -> B capsule probe cycles completed; authoritative live quota verified without snapshot regression or canonical active account disruption; opaque SHA256 snapshot hashes remained identical.
+- Cross-account exact-thread experiment: **UNSUPPORTED**. In a disposable Git repository, Account A generated thread `01a065a9-d227-7693-913f-1edffd814c5d`. Resuming under Account B capsule returned official Codex error `-32600: no rollout found for thread id`. Production contract remains `CONTROLLED_THREAD_HANDOFF = PASS` (mission continuity preserved; new thread on rotation).
+- Real Nightwatch AUTO_POOL routing smoke: **PASS**. Executed in disposable Git repository with `--account-mode auto-pool --account acct-4cb1604810cd --account acct-7ce14e017d7b`. Higher usable capacity Account B was selected; account lease was held during provider; canonical registry lock was not held during provider; provider ran in single-account capsule; goal verified and finished with `DONE`; auth synchronized; lease released; canonical active state intact.
+- Real natural account rotation: **NOT_OBSERVED** (neither account was naturally exhausted during testing, and no quota was artificially manufactured).
+- Local regression: **PASS**, 198 tests in 36.8s. (Note: on one previous full-suite run, an intermittent harness failure `test_malformed_jsonl_and_missing_thread_fail_closed` was observed and passed immediately on rerun; recorded honestly per non-erasure policy).
+- GitHub Actions CI: **PASS** across Python 3.11, 3.12, and 3.13.
+- PR #1 converted to Ready for Review; merge awaited from owner.

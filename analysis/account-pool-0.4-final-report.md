@@ -1,8 +1,112 @@
 # Nightwatch 0.4.0 Account Pool Final Report
 
+## Real two-account acceptance completion addendum — 2026-09-03
+
+This addendum records the completion of all real two-account gates following the
+safe import of a real user-authorized Account B into canonical `~/.codex`.
+Historical checkpoints (2026-09-02 hardening addendum and historical fake-only
+checkpoint) are preserved below for forensic provenance and are not overwritten.
+
+FINAL_HEAD: 187d4d2
+VERSION: 0.4.0
+PR: #1
+PR_STATE: READY_FOR_REVIEW
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_SHA: 0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a
+CODEX_AUTH_TEST_BINARY: /home/charlie/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af460f8a65b69
+CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
+CODEX_AUTH_JSON_SCHEMA: 1
+
+UNIT_TEST_COUNT: 198
+CI_311: PASS
+CI_312: PASS
+CI_313: PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+PACKAGE_INSTALL: PASS
+DOCTOR: PASS
+
+REMOVE_SCHEMA_REAL_CONTRACT: PASS
+CANONICAL_REGISTRY_LOCK: PASS
+CONCURRENT_A_B_REFRESH_PRESERVATION: PASS
+ACCOUNT_LEASE_PARALLELISM: PASS
+REGISTRY_LOCK_PROVIDER_SCOPE: PASS
+LOCK_ORDER: account lease -> registry lock
+LOCK_ORDER_RESULT: PASS
+NORMAL_QUOTA_CYCLES_OVER_20: PASS
+NORMAL_QUOTA_CYCLES_TESTED: 30
+RECOVERY_FAILURE_CIRCUIT_BREAKER: PASS
+PROVIDER_CAPSULE_SELECTED_ACCOUNT_ONLY: PASS
+ALL_ACCOUNT_EXPORT_REMOVED_BEFORE_PROVIDER: PASS
+
+REAL_CODEX_AUTH_LIST: PASS
+REAL_CODEX_AUTH_SWITCH: PASS
+REAL_CODEX_AUTH_REMOVE: PASS
+REAL_CODEX_AUTH_IMPORT_EXPORT: PASS
+REAL_TWO_ACCOUNT_DISCOVERY: PASS
+REAL_ACCOUNT_A_APP_SERVER: PASS
+REAL_ACCOUNT_B_APP_SERVER: PASS
+REAL_AUTH_REFRESH_PRESERVATION: PASS
+CROSS_ACCOUNT_EXACT_THREAD: UNSUPPORTED
+CONTROLLED_THREAD_HANDOFF: PASS
+REAL_TWO_ACCOUNT_NIGHTWATCH_SMOKE: PASS
+REAL_NATURAL_ACCOUNT_ROTATION: NOT_OBSERVED
+
+CURRENT_ONLY_REGRESSION: PASS
+DEFERRED_START_REGRESSION: PASS
+ADOPT_REGRESSION: PASS
+MULTI_RUN_REGRESSION: PASS
+
+KNOWN_LIMITATIONS:
+
+- Cross-account exact-thread resume across distinct Codex accounts is UNSUPPORTED
+  by upstream Codex App Server / rollout storage (fails with code -32600: no rollout
+  found for thread id). Production behavior remains CONTROLLED_THREAD_HANDOFF (PASS),
+  where mission continuity is preserved and conversation continuity begins on a fresh thread.
+- Real natural quota exhaustion was NOT_OBSERVED during acceptance because neither
+  account was naturally exhausted during testing, and no quota was artificially burned.
+  This does not block release.
+
+MERGE_DECISION: READY_FOR_REVIEW
+READY_FOR_REVIEW: YES
+PRODUCTION_CANDIDATE: READY (DO NOT MERGE - AWAIT OWNER APPROVAL)
+
+Evidence details:
+- Account B login completed via isolated file-backed CODEX_HOME (`account-b-login`)
+  with mode 0700 and zero canonical ~/.codex mutation.
+- Canonical transaction executed during a quiet window with a verified mode-0700
+  recovery point (`~/.local/state/codex-nightwatch/recovery-points/recovery-before-import-b-1788410029`).
+  Account lease for Account B was acquired before entering the canonical registry
+  lock. Account B snapshot was imported, and active account remained Account A
+  (`acct-4cb1604810cd`).
+- Official Codex App Server capsule probes succeeded for both accounts:
+  - Account A (`acct-4cb1604810cd`): 5h used=82%, weekly used=56%.
+  - Account B (`acct-7ce14e017d7b`): 5h used=14%, weekly used=40%.
+- Real auth-refresh preservation tested across sequential A -> B -> A -> B
+  capsule cycles. Both accounts proved fully usable with authoritative live
+  quota; opaque snapshot SHA256 hashes remained identical; canonical active
+  account remained Account A.
+- Cross-account exact-thread experiment in a disposable repository created
+  thread `01a065a9-d227-7693-913f-1edffd814c5d` under Account A. Resuming under
+  Account B returned official Codex error `-32600: no rollout found for thread id`.
+  Classified UNSUPPORTED; controlled thread handoff verified in production.
+- Real Nightwatch AUTO_POOL routing smoke executed in disposable repository with
+  both accounts authorized. Highest-capacity Account B was selected, account lease
+  was held while registry lock was free, goal completed with `DONE`, auth was
+  synchronized, lease was released, and canonical active account was preserved.
+- Codex runtime tmp helper cleanup (`_clean_runtime_tmp`) added to `AccountCapsule`
+  to cleanly remove ephemeral Codex 0.152.1 `$CODEX_HOME/tmp/arg0` symlinks prior
+  to tree hardening, with fail-closed rejection if `tmp` itself is symlinked.
+- Explicit account selector resolution in `operations.py` updated to support
+  matching account fingerprints alongside stable keys and aliases.
+
 ## Hardening acceptance addendum — 2026-09-02
 
-This addendum supersedes the historical fake-only checkpoint below. The
+This historical addendum records the state prior to real Account B login. The
 historical evidence is retained and explicitly labeled; it is not reused as
 proof of the real integration gates.
 
