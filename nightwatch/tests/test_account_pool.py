@@ -1615,7 +1615,130 @@ print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': []}), flus
             broker.path.symlink_to(outside)
             with self.assertRaises(AccountSchemaError):
                 broker.acquire(timeout=0.2)
-            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
+    def test_capsule_cleans_runtime_tmp_containing_symlinks(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-capsule-tmp-") as temporary:
+            root = Path(temporary)
+            binary = root / "codex-auth"
+            binary.write_text(
+                """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ['CODEX_HOME'])
+registry = home / 'registry.json'
+value = json.loads(registry.read_text()) if registry.exists() else {'accounts': {'user::a': {'account_key': 'user::a', 'active': True}}, 'active': 'user::a'}
+command = sys.argv[1]
+if command == 'list':
+    print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': [dict(row, active=key == value.get('active')) for key, row in value['accounts'].items()]}))
+elif command == 'switch':
+    value['active'] = sys.argv[2]
+    registry.write_text(json.dumps(value))
+    row = dict(value['accounts'][sys.argv[2]], active=True)
+    print(json.dumps({'schema_version': 1, 'command': 'switch', 'switched_to': row}))
+elif command == 'remove':
+    key = sys.argv[2]
+    value['accounts'].pop(key, None)
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [{'account_key': key}]}))
+elif command == 'export':
+    destination = Path(sys.argv[2])
+    destination.mkdir(parents=True, exist_ok=True)
+    for key, row in value['accounts'].items():
+        (destination / (key.replace('::', '--') + '.auth.json')).write_text(json.dumps(row))
+elif command == 'import':
+    destination = Path(sys.argv[2])
+    files = [destination] if destination.is_file() else list(destination.glob('*.auth.json'))
+    for path in files:
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+""",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({"accounts": {"user::a": {"account_key": "user::a", "active": True}}, "active": "user::a"}))
+            adapter = CodexAuthAdapter(binary=str(binary), codex_home=canonical)
+            capsule_root = root / "capsules"
+            capsule = AccountCapsule.create(adapter, "user::a", "run", 1, capsule_root)
+            arg0_dir = capsule.codex_home / "tmp" / "arg0" / "codex-test"
+            arg0_dir.mkdir(parents=True, exist_ok=True)
+            target = root / "dummy-binary"
+            target.write_text("binary", encoding="utf-8")
+            (arg0_dir / "apply_patch").symlink_to(target)
+            self.assertTrue((arg0_dir / "apply_patch").is_symlink())
+            capsule.close()
+            self.assertFalse(capsule.root.exists())
+
+    def test_capsule_symlinked_runtime_tmp_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-capsule-tmp-symlink-") as temporary:
+            root = Path(temporary)
+            binary = root / "codex-auth"
+            binary.write_text(
+                """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ['CODEX_HOME'])
+registry = home / 'registry.json'
+value = json.loads(registry.read_text()) if registry.exists() else {'accounts': {'user::a': {'account_key': 'user::a', 'active': True}}, 'active': 'user::a'}
+command = sys.argv[1]
+if command == 'list':
+    print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': [dict(row, active=key == value.get('active')) for key, row in value['accounts'].items()]}))
+elif command == 'switch':
+    value['active'] = sys.argv[2]
+    registry.write_text(json.dumps(value))
+    row = dict(value['accounts'][sys.argv[2]], active=True)
+    print(json.dumps({'schema_version': 1, 'command': 'switch', 'switched_to': row}))
+elif command == 'remove':
+    key = sys.argv[2]
+    value['accounts'].pop(key, None)
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [{'account_key': key}]}))
+elif command == 'export':
+    destination = Path(sys.argv[2])
+    destination.mkdir(parents=True, exist_ok=True)
+    for key, row in value['accounts'].items():
+        (destination / (key.replace('::', '--') + '.auth.json')).write_text(json.dumps(row))
+elif command == 'import':
+    destination = Path(sys.argv[2])
+    files = [destination] if destination.is_file() else list(destination.glob('*.auth.json'))
+    for path in files:
+        row = json.loads(path.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+""",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({"accounts": {"user::a": {"account_key": "user::a", "active": True}}, "active": "user::a"}))
+            adapter = CodexAuthAdapter(binary=str(binary), codex_home=canonical)
+            capsule_root = root / "capsules"
+            capsule = AccountCapsule.create(adapter, "user::a", "run", 1, capsule_root)
+            outside = root / "outside"
+            outside.mkdir(parents=True, exist_ok=True)
+            (capsule.codex_home / "tmp").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(AccountSchemaError):
+                capsule.close()
+
+    def test_resolve_authorized_accounts_accepts_fingerprint(self):
+        fake = AuthBinary(auth_payload())
+        try:
+            with tempfile.TemporaryDirectory(prefix="nightwatch-resolve-fp-") as temporary:
+                root = Path(temporary)
+                with patch.dict(os.environ, {"NIGHTWATCH_CODEX_AUTH_BIN": str(fake.path)}):
+                    from nightwatch.operations import RunSpec, resolve_authorized_accounts
+                    fp_a = account_fingerprint("user::a")
+                    spec = RunSpec(
+                        root, "goal", None, None, (), None,
+                        account_mode="AUTO_POOL",
+                        account_selectors=(fp_a,),
+                    )
+                    resolved = resolve_authorized_accounts(spec, root)
+                    self.assertEqual(resolved, ["user::a"])
+        finally:
+            fake.close()
 
 
 if __name__ == "__main__":

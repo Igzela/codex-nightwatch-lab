@@ -876,10 +876,23 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         if _identity_matches(owner):
             raise AccountBusy("existing account capsule still has a live owner")
         capsule = cls(adapter, account_key, capsule_root, allowed_root)
+        capsule._clean_runtime_tmp()
         capsule._harden_tree(capsule.codex_home)
         capsule.synchronize()
         capsule._remove_capsule_root()
         capsule._closed = True
+
+    def _clean_runtime_tmp(self) -> None:
+        """Clean ephemeral runtime tmp created by official Codex processes."""
+        runtime_tmp = self.codex_home / "tmp"
+        try:
+            info = os.lstat(runtime_tmp)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode):
+            raise AccountSchemaError("account capsule runtime tmp is a symlink")
+        if stat.S_ISDIR(info.st_mode):
+            shutil.rmtree(runtime_tmp)
 
     def _write_manifest(self, run_id: str, generation: int) -> None:
         identity = _linux_process_identity(os.getpid())
@@ -907,6 +920,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         # Query-switch first gives codex-auth its documented opportunity to
         # synchronize a refreshed active auth.json into the managed snapshot.
         self.capsule_adapter.switch(self.account_key)
+        self._clean_runtime_tmp()
         self._harden_tree(self.codex_home)
         self.sync_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.sync_root, 0o700)
@@ -972,5 +986,6 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         allowed = self.allowed_root
         if parent != allowed or self.root == allowed or self.root.is_symlink():
             raise AccountSchemaError("refusing to remove an unsafe account capsule path")
+        self._clean_runtime_tmp()
         self._harden_tree(self.root)
         shutil.rmtree(self.root)

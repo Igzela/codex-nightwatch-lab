@@ -394,7 +394,7 @@ def resolve_authorized_accounts(spec: RunSpec, root: Path) -> list[str]:
     accounts = adapter.list_accounts()
     selected: list[str] = []
     for selector in spec.account_selectors:
-        exact = [item for item in accounts if item.account_key == selector]
+        exact = [item for item in accounts if item.account_key == selector or item.fingerprint == selector]
         matches = exact or [
             item for item in accounts
             if selector.casefold() in {value.casefold() for value in (item.alias, item.account_name) if value}
