@@ -586,16 +586,6 @@ class AgyProviderAdapter(ProviderAdapter):
     def auth_sanity(self, binary: str | None = None) -> bool:
         if os.environ.get("NIGHTWATCH_SKIP_AUTH_CHECK") == "1":
             return True
-        token_path = Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-        if not token_path.is_file():
-            return False
-        try:
-            raw = token_path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            if not isinstance(data, dict) or not data.get("token"):
-                return False
-        except (OSError, json.JSONDecodeError):
-            return False
         bin_path = binary or self._resolve_binary()
         try:
             res = subprocess.run(
