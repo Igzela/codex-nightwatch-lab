@@ -154,20 +154,36 @@ def verify_milestones(store: NightwatchStore, git: GitSnapshot | None = None) ->
     commands = store.load_policy()["final_commands"]
     results: list[dict[str, Any]] = []
     changed = False
-    for item in plan["milestones"]:
-        if item["status"] not in {"working", "implemented"} or item["verification_profile"] != "default" or not commands:
-            continue
-        checks = [_run_trusted_command(store.repo, command) for command in commands]
-        results.extend({"id": item["id"], **check} for check in checks)
-        if all(check["ok"] for check in checks):
-            item["status"] = "verified"
-            item.setdefault("evidence", []).append({"at": _now(), "kind": "trusted_policy_commands", "policy_hash": plan["policy_hash"], "checks": checks})
-            changed = True
-            store.append_event("milestone_verified", "trusted policy checks passed", {"id": item["id"]})
+    eligible = [
+        item for item in plan["milestones"]
+        if item["status"] in {"working", "implemented"} and item["verification_profile"] == "default" and commands
+    ]
+    if eligible:
+        shared_checks = [_run_trusted_command(store.repo, command) for command in commands]
+        all_passed = all(check["ok"] for check in shared_checks)
+        for item in eligible:
+            results.extend({"id": item["id"], **check} for check in shared_checks)
+            if all_passed:
+                item["status"] = "verified"
+                item.setdefault("evidence", []).append({
+                    "at": _now(),
+                    "kind": "trusted_policy_commands",
+                    "policy_hash": plan["policy_hash"],
+                    "checks": shared_checks,
+                })
+                changed = True
+                store.append_event("milestone_verified", "trusted policy checks passed", {"id": item["id"]})
     if changed:
         store.save_plan(plan)
     final_checks = [_run_trusted_command(store.repo, command) for command in commands]
-    return {"milestones": results, "final_checks": final_checks, "all_milestones_verified": all(item["status"] == "verified" for item in plan["milestones"] if item["required"]), "all_final_checks_passed": bool(final_checks) and all(check["ok"] for check in final_checks), "progress": plan_progress(plan), "git": (git or snapshot(store.repo)).to_dict()}
+    return {
+        "milestones": results,
+        "final_checks": final_checks,
+        "all_milestones_verified": all(item["status"] == "verified" for item in plan["milestones"] if item["required"]),
+        "all_final_checks_passed": bool(final_checks) and all(check["ok"] for check in final_checks),
+        "progress": plan_progress(plan),
+        "git": (git or snapshot(store.repo)).to_dict(),
+    }
 
 
 def current_milestone(store: NightwatchStore) -> dict[str, Any] | None:

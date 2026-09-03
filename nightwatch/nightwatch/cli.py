@@ -29,6 +29,7 @@ from .operations import (
     stop_run,
     systemd_quote as _systemd_quote,
     validate_install_targets as _validate_install_targets,
+    MAX_VERIFY_COMMANDS,
     RunSpec,
     resolve_authorized_accounts,
 )
@@ -219,7 +220,7 @@ def _run(args: argparse.Namespace) -> int:
         )
         authorized = resolve_authorized_accounts(run_spec, root)
     except (AccountBrokerError, ValueError) as exc:
-        raise SystemExit(f"nightwatch: account configuration rejected: {exc}") from exc
+        raise SystemExit(f"nightwatch: configuration rejected: {exc}") from exc
     if args.service:
         _validate_install_targets(root)
     else:
@@ -630,7 +631,7 @@ def _adopt(args: argparse.Namespace) -> int:
         )
         authorized = resolve_authorized_accounts(spec, root)
     except (AccountBrokerError, ValueError) as exc:
-        raise SystemExit(f"nightwatch: account configuration rejected: {exc}") from exc
+        raise SystemExit(f"nightwatch: configuration rejected: {exc}") from exc
     state = store.initialize(
         make_run_id(str(root)),
         args.goal or "Adopted conversation",

@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 205 Passing](https://img.shields.io/badge/Tests-205%20Passing-success.svg)](#测试验证)
+[![Tests: 245 Passing](https://img.shields.io/badge/Tests-245%20Passing-success.svg)](#测试验证)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -112,8 +112,8 @@ nightwatch
 未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
 
 ```text
-Nightwatch 0.4.0 · MULTI-THREAD CONTROL
-Runs 2 · ↑/↓ select · / commands · Esc quit
+Nightwatch 0.4.1 · MULTI-THREAD CONTROL
+Runs 2 · ↑/↓ select · / commands · Esc cancel · /quit leaves
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
     ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
@@ -170,9 +170,9 @@ nightwatch run \
 
 Nightwatch 只使用 `codex-auth list --skip-api --json` 获取稳定 `account_key` 和显示信息，并在工作区外的 0700 capsule 中使用账号；不会使用 codex-auth 的远程用量 API。真实可用配额始终来自每个账号上下文中新建的官方 Codex App Server `account/rateLimits/read`。5 小时与 weekly 两个窗口都必须存在且未耗尽，选择策略按较小剩余容量、5 小时剩余、weekly 剩余、reset 时间和短指纹确定性排序。
 
-每次 App Server 探测或 Codex provider 执行前都会持有工作区外的全局账号 lease；子进程退出且刷新后的认证状态同步完成后才释放。所有账号不可用时进入 `WAIT_QUOTA`，等待最早相关 reset 后重新探测整个账号池。跨账号 exact-thread 能否保持尚未假定；在本机 Codex 版本完成安全实测前，状态会明确显示 `CONTROLLED_THREAD_HANDOFF`，使用受信任的目标、冻结验证策略、仓库/Git HEAD、里程碑和旧 Thread 审计包创建新对话，不会冒充原 Thread。缺少兼容 codex-auth 时 AUTO_POOL 安全不可用，但 CURRENT_ONLY 保持兼容。
+每次 App Server 探测或 Codex provider 执行前都会持有工作区外的全局账号 lease；子进程退出且刷新后的认证状态同步完成后才释放。所有账号不可用时进入 `WAIT_QUOTA`，等待最早相关 reset 后重新探测整个账号池。跨账号 exact-thread 能力根据 Codex 版本评估：对于已完成实测验证的版本（如 Codex CLI 0.152.1），跨账号 exact-thread 为 PROVEN，续跑直接跨账号保持原 Thread；对于未经验证或不支持的版本，AUTO_POOL 安全回退至 CONTROLLED_THREAD_HANDOFF，使用受信任的目标、冻结验证策略、仓库/Git HEAD、里程碑和旧 Thread 审计包创建新对话，不会冒充原 Thread。缺少兼容 codex-auth 时 AUTO_POOL 安全不可用，但 CURRENT_ONLY 保持兼容。
 
-正常 AUTO_POOL 配额耗尽只记录信息性的 `quota_cycles`，不会消耗防御性恢复预算；`recovery_failures` 记录有界的异常恢复失败。真实上游 `codex-auth` 合约已审计，并使用隔离的 `v0.3.0-alpha.11`（commit `0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a`）完成实际合约操作测试，未替换主机现有 binary。目前 live discovery 发现 3 个已存账号，但本次测试的两个非活跃账号中只有一个返回了 live App Server 配额，因此双账号生产验收仍待完成。跨账号 exact-thread 结果为 `INCONCLUSIVE`，生产行为继续使用安全的 controlled handoff。
+正常 AUTO_POOL 配额耗尽只记录信息性的 `quota_cycles`，不会消耗防御性恢复预算；`recovery_failures` 记录有界的异常恢复失败。上游 `codex-auth` 集成经过审计并使用 `v0.3.0-alpha.11` 完成验证。
 
 ### 模式一：夜间全自主无人值守模式
 
@@ -301,10 +301,14 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 ├── state.json                 # 持久化状态机 (包含 generation, thread_id, status)
 ├── verification-policy.json   # 用户冻结的哈希绑定验证命令
 ├── acceptance.json            # 目标与真实验收准则
-├── events.jsonl               # 仅追加的单调自增审计日志
-├── account-leases/            # 全局账号生命周期锁
-├── account-capsules/          # 外部临时 CODEX_HOME（认证文件不进 Git）
+├── events/                    # 分段单调自增审计日志
+│   ├── manifest.json          # 分段清单与摘要链
+│   └── segment-000001.jsonl   # 仅追加的有界事件段
 ├── supervisor.lock            # 进程排他锁 (防止 PID 复用漏洞)
+├── codex-runtime/             # 持久化 Thread Store（工作区外受信任存储）
+│   └── codex-home/            # Inode 强校验的持久化 CODEX_HOME
+├── account-leases/            # 临时的全局账号生命周期锁
+├── account-capsules/          # 临时的外部认证 capsule（认证文件不进 Git）
 └── runs/                      # 分代脱敏 stdout/stderr 执行记录
 ```
 
@@ -320,7 +324,7 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 198 tests
+Ran 245 tests
 OK
 ```
 

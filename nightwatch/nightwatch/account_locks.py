@@ -81,23 +81,11 @@ class AccountRegistryLock(AbstractContextManager["AccountRegistryLock"]):
         os.fsync(self._handle.fileno())
 
 
-def _linux_process_identity(pid: int) -> dict[str, Any] | None:
-    if not sys.platform.startswith("linux") or pid <= 0:
-        return None
-    try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        fields = stat_text.rsplit(")", 1)[-1].strip().split()
-        return {"pid": pid, "starttime": fields[19], "executable": os.readlink(f"/proc/{pid}/exe")}
-    except (OSError, IndexError):
-        return None
+from .process_identity import (
+    linux_process_identity as _linux_process_identity,
+    process_identity_matches as _identity_matches,
+)
 
-
-def _identity_matches(record: dict[str, Any]) -> bool:
-    pid = record.get("pid")
-    if not isinstance(pid, int):
-        return False
-    observed = _linux_process_identity(pid)
-    return bool(observed and observed.get("starttime") == record.get("starttime") and observed.get("executable") == record.get("executable"))
 
 
 class AccountRegistryLockBroker:

@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 205 Passing](https://img.shields.io/badge/Tests-205%20Passing-success.svg)](#validation)
+[![Tests: 245 Passing](https://img.shields.io/badge/Tests-245%20Passing-success.svg)](#validation)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -112,8 +112,8 @@ nightwatch
 Natural language starts a guided run preview when no active run is selected. With an active run selected it becomes a confirmed steer request to that exact thread. Nothing mutating is sent before the preview is confirmed.
 
 ```text
-Nightwatch 0.4.0 · MULTI-THREAD CONTROL
-Runs 2 · ↑/↓ select · / commands · Esc quit
+Nightwatch 0.4.1 · MULTI-THREAD CONTROL
+Runs 2 · ↑/↓ select · / commands · Esc cancel · /quit leaves
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
     ███████████░░░░░░░ 61%  gpt-5.6-luna · high  quota 5h 52% · week 8%
@@ -172,9 +172,9 @@ Nightwatch uses `codex-auth list --skip-api --json` only for stable account disc
 
 Before each App Server probe or provider turn, a global external lease prevents another Nightwatch run from using the same account. The lease is held through the child process and released only after that process exits and refreshed auth state is synchronized. If all selected accounts are unavailable, the run enters `WAIT_QUOTA`, sleeps to the earliest relevant reset, and re-probes the whole pool.
 
-Cross-account exact-thread portability is not assumed. Until a safe experiment proves it for the installed Codex version, AUTO_POOL uses `CONTROLLED_THREAD_HANDOFF`: a new provider conversation receives a trusted packet containing the goal, frozen verification policy, repository/Git HEAD, milestone state, and prior thread for audit. The mission continues, but the new conversation is not reported as the old exact thread. Missing or incompatible codex-auth disables AUTO_POOL while preserving CURRENT_ONLY.
+Cross-account exact-thread portability is evaluated per Codex version. For validated versions (such as Codex CLI 0.152.1), cross-account exact-thread capability is PROVEN and exact-thread resume continues across account switches. For unvalidated or unsupported versions, AUTO_POOL safely falls back to CONTROLLED_THREAD_HANDOFF: a new provider conversation receives a trusted packet containing the goal, frozen verification policy, repository/Git HEAD, milestone state, and prior thread for audit. The mission continues safely without falsely claiming exact-thread identity. Missing or incompatible codex-auth disables AUTO_POOL while preserving CURRENT_ONLY.
 
-Normal AUTO_POOL quota exhaustion is an informational `quota_cycles` count and is not limited by the defensive recovery budget. `recovery_failures` records bounded abnormal recovery failures. The real upstream `codex-auth` contract was audited and exercised with isolated `v0.3.0-alpha.11` at commit `0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a`; the installed host binary is left unchanged. The current live acceptance discovered three stored accounts, but only one of the two tested non-active account snapshots returned live App Server quota, so two-account production acceptance remains pending. Exact-thread portability across accounts is therefore `INCONCLUSIVE`, and controlled handoff remains the safe behavior.
+Normal AUTO_POOL quota exhaustion is an informational `quota_cycles` count and is not limited by the defensive recovery budget. `recovery_failures` records bounded abnormal recovery failures. The upstream `codex-auth` integration is audited and validated with `v0.3.0-alpha.11`.
 
 ### Mode A: Unattended Overnight Run (Full Autonomous Supervisor)
 
@@ -303,10 +303,14 @@ Authoritative state is strictly isolated outside the Git workspace:
 ├── state.json                 # Durable state machine (generation, thread_id, status)
 ├── verification-policy.json   # Hash-bound user verification commands
 ├── acceptance.json            # Acceptance criteria & goal binding
-├── events.jsonl               # Append-only sequence-validated audit trail
+├── events/                    # Segmented sequence-validated audit trail
+│   ├── manifest.json          # Segment manifest & digest chain
+│   └── segment-000001.jsonl   # Append-only bounded event segment
 ├── supervisor.lock            # Process lifetime lease (PID reuse safe)
-├── account-leases/            # Global per-account lifetime locks (0700/0600)
-├── account-capsules/          # Ephemeral external CODEX_HOME capsules
+├── codex-runtime/             # Persistent Thread Store (outside workspace)
+│   └── codex-home/            # Inode-validated persistent CODEX_HOME
+├── account-leases/            # Ephemeral per-account lifetime locks (0700/0600)
+├── account-capsules/          # Ephemeral external auth capsules
 └── runs/                      # Per-generation sanitized stdout & stderr logs
 ```
 
@@ -322,7 +326,7 @@ Nightwatch comes with a comprehensive, hardened automated test suite:
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 198 tests
+Ran 245 tests
 OK
 ```
 

@@ -17,6 +17,7 @@ from .git import GitError, repo_root
 from .models import TERMINAL_STATES, State, plan_progress
 from .operations import (
     ActionResult,
+    MAX_VERIFY_COMMANDS,
     RunSpec,
     adopt_run,
     create_worktree,
@@ -36,7 +37,6 @@ from .supervisor import build_report, list_adoptable_sessions, pid_alive, proces
 
 MAX_GOAL_CHARS = 4_000
 MAX_INSTRUCTION_CHARS = 4_000
-MAX_VERIFY_COMMANDS = 20
 MAX_DISCOVERED_RUNS = 1_000
 MAX_ADOPT_GOAL_DISPLAY = 240
 

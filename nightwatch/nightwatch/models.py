@@ -47,7 +47,7 @@ def cross_account_thread_mode_for_version(version: str | None) -> str:
     if override:
         # A normal environment override may only downgrade capability (e.g. PROVEN -> UNSUPPORTED / INCONCLUSIVE)
         # It may not upgrade an unvalidated Codex version to PROVEN in production.
-        if override in {"UNSUPPORTED", "INCONCLUSIVE", "UNKNOWN"}:
+        if override in {"UNSUPPORTED", "INCONCLUSIVE"}:
             return override
         if override == "PROVEN":
             return "PROVEN" if base_mode == "PROVEN" else "INCONCLUSIVE"
@@ -294,6 +294,27 @@ def validate_state(state: dict[str, Any]) -> None:
     if active is not None:
         if not isinstance(active, dict) or not isinstance(active.get("pid"), int) or not isinstance(active.get("starttime"), str):
             raise ValueError("invalid active_process")
+    runtime_id = state.get("codex_runtime_identity")
+    home_id = state.get("codex_home_identity")
+    if runtime_id is not None or home_id is not None:
+        if runtime_id is None or home_id is None:
+            raise ValueError("both codex_runtime_identity and codex_home_identity must be present together")
+        for field_name, value in (("codex_runtime_identity", runtime_id), ("codex_home_identity", home_id)):
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or type(value[0]) is not int
+                or type(value[1]) is not int
+                or isinstance(value[0], bool)
+                or isinstance(value[1], bool)
+                or value[0] <= 0
+                or value[1] <= 0
+            ):
+                raise ValueError(f"state.{field_name} must be a list of two positive integers [st_dev, st_ino]")
+    elif state.get("account_mode") == "AUTO_POOL" and state.get("initialized"):
+        if not state.get("legacy_pre_identity_migration"):
+            raise ValueError("AUTO_POOL state requires codex_runtime_identity and codex_home_identity")
+
 
 
 def validate_plan(plan: dict[str, Any]) -> None:
