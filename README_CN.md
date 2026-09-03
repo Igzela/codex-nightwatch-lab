@@ -8,8 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
-[![Tests: 92 Passing](https://img.shields.io/badge/Tests-92%20Passing-success.svg)](#测试验证)
-[![Codex: 0.150.1+](https://img.shields.io/badge/OpenAI%20Codex-0.150.1%2B-purple.svg)](https://github.com/openai/codex)
+[![Tests: 205 Passing](https://img.shields.io/badge/Tests-205%20Passing-success.svg)](#测试验证)
+[![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
 
@@ -57,6 +57,8 @@
 
 - 🔄 **官方 App Server 协议直连**：通过 JSON-RPC 2.0 stdio 协议直连 Codex 内部 `account/rateLimits/read`，精准获取 5h 与周配额重置 Epoch，杜绝脆弱的正则表达式或 ANSI 屏幕抓取。
 - 🧵 **精确 Thread ID 级断点续传**：跨配额周期与系统重启时，严格执行 `codex exec --json resume <thread_id> -` 精准接续原会话，坚决拒绝模糊的 `--last` 猜测。
+- 👥 **可选账号池**：显式选择的账号子集只会在 provider 退出后轮换；每个账号使用全局 lease，通过新的 App Server 配额会话检查，并同时受 5 小时和 weekly 限制约束。
+- 🔐 **规范认证同步串行化**：规范 `codex-auth` 注册表操作在账号 lease 之后获取外部受信控制面目录上的短时内核锁，并在 provider 执行前释放；provider capsule 只保留被选账号，启动前删除全账号 staging。
 - 🔒 **受信任控制面物理隔离**：核心状态与验收规则保存在 Git 工作区之外（`~/.local/state/codex-nightwatch/`，`0700` 权限），模型沙箱只能读写信箱，绝无可能篡改验收规则。
 - 🧪 **冻结真实验收门禁**：任务完成（`DONE`）必须严格通过用户预冻结的 `--verify` 命令（如 `pytest -q`、`cargo test`、`git diff --check`），彻底杜绝模型幻觉。
 - 🛡️ **无侵入伴随监听与自动接管（`nightwatch watch`）**：安全监听终端中正在运行的交互式 Codex 会话，在不打断前台的前提下实时统计 Token 与配额，并在触发上限或终端关闭后自动无缝接管夜间续跑。
@@ -86,7 +88,7 @@ nightwatch doctor
 ```
 ```text
 Nightwatch doctor: ok
-Codex: codex-cli 0.150.1
+Codex: codex-cli 0.152.1
 Auth: ok
 Quota authority: LIVE_APP_SERVER (live_app_server)
 5h: 7.0% used, reset=1787866896
@@ -110,7 +112,7 @@ nightwatch
 未选中活跃任务时，直接输入自然语言会进入新任务向导和执行预览；选中了活跃任务时，自然语言会变成发给该 exact thread 的待确认 steer 指令。任何会改变状态的操作都不会绕过预览确认。
 
 ```text
-Nightwatch 0.3.1 · MULTI-THREAD CONTROL
+Nightwatch 0.4.0 · MULTI-THREAD CONTROL
 Runs 2 · ↑/↓ select · / commands · Esc quit
 
 ▶ RUNNING             payments-retry         01a050ac-1149…
@@ -152,6 +154,25 @@ nightwatch run \
 ```
 
 不指定某一项时，继续使用 Codex 自身配置的默认值；模型与挡位是否兼容最终由本机 Codex CLI 校验。
+
+### 可选账号池（AUTO_POOL）
+
+任务默认是 `CURRENT_ONLY`，不会自动发现或加入所有本机账号。安装并配置独立的 `codex-auth` 后，必须在启动时明确选择账号子集：
+
+```bash
+nightwatch run \
+  --account-mode auto-pool \
+  --account personal \
+  --account backup \
+  --verify "pytest -q" \
+  "实现功能并通过测试"
+```
+
+Nightwatch 只使用 `codex-auth list --skip-api --json` 获取稳定 `account_key` 和显示信息，并在工作区外的 0700 capsule 中使用账号；不会使用 codex-auth 的远程用量 API。真实可用配额始终来自每个账号上下文中新建的官方 Codex App Server `account/rateLimits/read`。5 小时与 weekly 两个窗口都必须存在且未耗尽，选择策略按较小剩余容量、5 小时剩余、weekly 剩余、reset 时间和短指纹确定性排序。
+
+每次 App Server 探测或 Codex provider 执行前都会持有工作区外的全局账号 lease；子进程退出且刷新后的认证状态同步完成后才释放。所有账号不可用时进入 `WAIT_QUOTA`，等待最早相关 reset 后重新探测整个账号池。跨账号 exact-thread 能否保持尚未假定；在本机 Codex 版本完成安全实测前，状态会明确显示 `CONTROLLED_THREAD_HANDOFF`，使用受信任的目标、冻结验证策略、仓库/Git HEAD、里程碑和旧 Thread 审计包创建新对话，不会冒充原 Thread。缺少兼容 codex-auth 时 AUTO_POOL 安全不可用，但 CURRENT_ONLY 保持兼容。
+
+正常 AUTO_POOL 配额耗尽只记录信息性的 `quota_cycles`，不会消耗防御性恢复预算；`recovery_failures` 记录有界的异常恢复失败。真实上游 `codex-auth` 合约已审计，并使用隔离的 `v0.3.0-alpha.11`（commit `0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a`）完成实际合约操作测试，未替换主机现有 binary。目前 live discovery 发现 3 个已存账号，但本次测试的两个非活跃账号中只有一个返回了 live App Server 配额，因此双账号生产验收仍待完成。跨账号 exact-thread 结果为 `INCONCLUSIVE`，生产行为继续使用安全的 controlled handoff。
 
 ### 模式一：夜间全自主无人值守模式
 
@@ -244,11 +265,12 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 | :--- | :--- |
 | `nightwatch` / `nightwatch ui` | 打开多线程交互式 Dashboard 和 `/` 命令面板 |
 | `nightwatch models [--json]` | 显示本机 Codex 实时模型目录及支持的推理挡位 |
-| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务 |
+| `nightwatch run "<goal>" [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>] [--service]` | 初始化并启动全新的受控自主任务（默认 `CURRENT_ONLY`） |
+| `nightwatch run "<goal>" --account-mode auto-pool --account <key-or-alias> [--account <key-or-alias> ...]` | 使用明确授权的账号子集运行 |
 | `nightwatch watch [--thread <id>] [--auto-takeover] [--once] [--json]` | 无侵入监听活跃交互会话；模型参数用于自动接管 |
 | `nightwatch adopt --thread <id> [--model <slug>] [--reasoning-effort <level>] [--verify <cmd>]` | 将现有对话 Thread 纳入 Nightwatch 受信任控制面 |
 | `nightwatch resume` | 恢复并继续当前仓库的精确 Thread 任务 |
-| `nightwatch status [--watch] [--interval <秒>] [--json]` | 单次或持续查看 Agent 状态、配额与可信里程碑进度 |
+| `nightwatch status [--watch] [--interval <秒>] [--json]` | 单次或持续查看 Agent、账号池、配额与可信里程碑进度 |
 | `nightwatch log [--tail N]` | 查看人类可读的审计与执行日志 |
 | `nightwatch report` | 输出/生成结构化验收报告 |
 | `nightwatch stop` | 安全停止自动执行（保留现场与 Thread 状态） |
@@ -280,6 +302,8 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 ├── verification-policy.json   # 用户冻结的哈希绑定验证命令
 ├── acceptance.json            # 目标与真实验收准则
 ├── events.jsonl               # 仅追加的单调自增审计日志
+├── account-leases/            # 全局账号生命周期锁
+├── account-capsules/          # 外部临时 CODEX_HOME（认证文件不进 Git）
 ├── supervisor.lock            # 进程排他锁 (防止 PID 复用漏洞)
 └── runs/                      # 分代脱敏 stdout/stderr 执行记录
 ```
@@ -296,11 +320,11 @@ Nightwatch 经过严密的工程验证与故障注入测试：
 python3 -m unittest discover -s nightwatch/tests -v
 ```
 ```text
-Ran 109 tests
+Ran 198 tests
 OK
 ```
 
-- ✅ 真实 Codex 0.150.1 App Server 实时配额 JSON-RPC 通信验证
+- ✅ 真实 Codex 0.152.1 App Server 实时配额 JSON-RPC 通信验证
 - ✅ 真实多进程并发冲突与竞争防御实测
 - ✅ SIGKILL 异常崩溃后 Linux PID 身份重校验与精确 Thread 恢复
 - ✅ 符号链接穿透与 Mailbox 命令注入反制

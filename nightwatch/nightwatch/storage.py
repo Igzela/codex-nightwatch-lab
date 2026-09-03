@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -29,6 +30,142 @@ class SupervisorAlreadyRunning(RuntimeError):
 
 
 MAX_EVENT_BYTES = 1_000_000
+
+
+@dataclass(frozen=True)
+class TrustedRunHome:
+    path: Path
+    root: Path
+    repo_dir_name: str
+    runtime_identity: tuple[int, int]
+    home_identity: tuple[int, int]
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def __truediv__(self, other: Any) -> Path:
+        return self.path / other
+
+    def verify(self) -> None:
+        """Verify the entire directory chain using O_NOFOLLOW descriptors without mutating paths."""
+        verify_trusted_codex_home_chain(
+            self.root,
+            self.repo_dir_name,
+            expected_runtime_identity=self.runtime_identity,
+            expected_home_identity=self.home_identity,
+        )
+
+
+def _open_dir_descriptor(
+    name_or_path: str | Path,
+    dir_fd: int | None = None,
+    mode: int = 0o700,
+    create: bool = False,
+) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+    try:
+        if dir_fd is not None:
+            st_pre = os.stat(name_or_path, dir_fd=dir_fd, follow_symlinks=False)
+        else:
+            st_pre = os.lstat(name_or_path)
+    except FileNotFoundError:
+        st_pre = None
+    except OSError as exc:
+        raise StateIntegrityError(f"cannot inspect entry {name_or_path}") from exc
+
+    if st_pre is not None:
+        if stat.S_ISLNK(st_pre.st_mode):
+            raise StateIntegrityError(f"entry {name_or_path} must be a real directory and not a symlink")
+        if not stat.S_ISDIR(st_pre.st_mode):
+            raise StateIntegrityError(f"entry {name_or_path} must be a directory")
+
+    if create and st_pre is None:
+        try:
+            if dir_fd is not None:
+                os.mkdir(name_or_path, mode=mode, dir_fd=dir_fd)
+            else:
+                target_path = Path(name_or_path)
+                if not target_path.parent.exists():
+                    target_path.parent.mkdir(parents=True, exist_ok=True, mode=mode)
+                os.mkdir(name_or_path, mode=mode)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise StateIntegrityError(f"cannot create directory {name_or_path}") from exc
+
+    try:
+        if dir_fd is not None:
+            fd = os.open(name_or_path, flags, dir_fd=dir_fd)
+        else:
+            fd = os.open(name_or_path, flags)
+    except OSError as exc:
+        raise StateIntegrityError(f"cannot securely open directory {name_or_path}: must be real directory and not a symlink") from exc
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            os.close(fd)
+            raise StateIntegrityError(f"descriptor {name_or_path} is not a directory")
+        if create:
+            try:
+                os.fchmod(fd, mode)
+            except OSError:
+                pass
+        return fd, (st.st_dev, st.st_ino)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def establish_trusted_codex_home(
+    root: Path,
+    repo_directory_name: str,
+    create: bool = True,
+    expected_runtime_identity: tuple[int, int] | None = None,
+    expected_home_identity: tuple[int, int] | None = None,
+) -> tuple[Path, tuple[int, int], tuple[int, int]]:
+    root_fd: int | None = None
+    dir_fd: int | None = None
+    runtime_fd: int | None = None
+    home_fd: int | None = None
+    try:
+        root_fd, root_id = _open_dir_descriptor(root, create=create)
+        dir_fd, dir_id = _open_dir_descriptor(repo_directory_name, dir_fd=root_fd, create=create)
+        runtime_fd, runtime_id = _open_dir_descriptor("codex-runtime", dir_fd=dir_fd, create=create)
+        if expected_runtime_identity is not None and runtime_id != expected_runtime_identity:
+            raise StateIntegrityError("codex-runtime directory inode was replaced")
+        home_fd, home_id = _open_dir_descriptor("codex-home", dir_fd=runtime_fd, create=create)
+        if expected_home_identity is not None and home_id != expected_home_identity:
+            raise StateIntegrityError("codex-home directory inode was replaced")
+        home_path = root / repo_directory_name / "codex-runtime" / "codex-home"
+        return home_path, runtime_id, home_id
+    finally:
+        for fd in (home_fd, runtime_fd, dir_fd, root_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def verify_trusted_codex_home_chain(
+    root: Path,
+    repo_directory_name: str,
+    expected_runtime_identity: tuple[int, int],
+    expected_home_identity: tuple[int, int],
+) -> tuple[Path, tuple[int, int], tuple[int, int]]:
+    return establish_trusted_codex_home(
+        root,
+        repo_directory_name,
+        create=False,
+        expected_runtime_identity=expected_runtime_identity,
+        expected_home_identity=expected_home_identity,
+    )
+
 
 
 ALLOWED_TRANSITIONS: dict[State, set[State]] = {
@@ -131,6 +268,75 @@ class NightwatchStore:
         self.reports_path = self.directory / "reports"
         self.lock_path = self.directory / "state.lock"
         self.supervisor_lock_path = self.directory / "supervisor.lock"
+        self.codex_runtime_path = self.directory / "codex-runtime"
+        self.codex_home_path = self.codex_runtime_path / "codex-home"
+        self._codex_runtime_identity: tuple[int, int] | None = None
+        self._codex_home_identity: tuple[int, int] | None = None
+
+    @property
+    def codex_home(self) -> Path:
+        return self.codex_home_path
+
+    @property
+    def trusted_codex_home(self) -> TrustedRunHome:
+        if self._codex_runtime_identity is None or self._codex_home_identity is None:
+            self.ensure_codex_home()
+        return TrustedRunHome(
+            self.codex_home_path,
+            self.root,
+            self.directory.name,
+            self._codex_runtime_identity,
+            self._codex_home_identity,
+        )
+
+    def ensure_codex_home(self) -> Path:
+        self._assert_control_plane_outside_workspace()
+        self._assert_path_outside_workspace(self.directory)
+        expected_runtime_id: tuple[int, int] | None = self._codex_runtime_identity
+        expected_home_id: tuple[int, int] | None = self._codex_home_identity
+        if (expected_runtime_id is None or expected_home_id is None) and self.exists():
+            try:
+                state = self.load_state()
+                if isinstance(state.get("codex_runtime_identity"), list) and len(state["codex_runtime_identity"]) == 2:
+                    expected_runtime_id = (int(state["codex_runtime_identity"][0]), int(state["codex_runtime_identity"][1]))
+                if isinstance(state.get("codex_home_identity"), list) and len(state["codex_home_identity"]) == 2:
+                    expected_home_id = (int(state["codex_home_identity"][0]), int(state["codex_home_identity"][1]))
+            except Exception:
+                pass
+        _, runtime_id, home_id = establish_trusted_codex_home(
+            self.root,
+            self.directory.name,
+            create=True,
+            expected_runtime_identity=expected_runtime_id,
+            expected_home_identity=expected_home_id,
+        )
+        self._codex_runtime_identity = runtime_id
+        self._codex_home_identity = home_id
+        return self.codex_home_path
+
+    def verify_codex_home(self) -> None:
+        self._assert_control_plane_outside_workspace()
+        self._assert_path_outside_workspace(self.directory)
+        expected_runtime_id = self._codex_runtime_identity
+        expected_home_id = self._codex_home_identity
+        if (expected_runtime_id is None or expected_home_id is None) and self.exists():
+            try:
+                state = self.load_state()
+                if isinstance(state.get("codex_runtime_identity"), list) and len(state["codex_runtime_identity"]) == 2:
+                    expected_runtime_id = (int(state["codex_runtime_identity"][0]), int(state["codex_runtime_identity"][1]))
+                if isinstance(state.get("codex_home_identity"), list) and len(state["codex_home_identity"]) == 2:
+                    expected_home_id = (int(state["codex_home_identity"][0]), int(state["codex_home_identity"][1]))
+            except Exception:
+                pass
+        if expected_runtime_id is None or expected_home_id is None:
+            self.ensure_codex_home()
+            return
+        verify_trusted_codex_home_chain(
+            self.root,
+            self.directory.name,
+            expected_runtime_identity=expected_runtime_id,
+            expected_home_identity=expected_home_id,
+        )
 
     def exists(self) -> bool:
         return self.state_path.exists()
@@ -174,6 +380,8 @@ class NightwatchStore:
         thread_id: str | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        account_mode: str = "CURRENT_ONLY",
+        authorized_accounts: list[str] | None = None,
     ) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
@@ -190,6 +398,18 @@ class NightwatchStore:
             reasoning_effort=reasoning_effort,
         )
         state["acceptance_ready"] = sufficient_verification_policy(commands)
+        if account_mode not in {"CURRENT_ONLY", "AUTO_POOL"}:
+            raise StateIntegrityError(f"unsupported account mode: {account_mode}")
+        state["account_mode"] = account_mode
+        state["authorized_accounts"] = list(authorized_accounts or [])
+        if account_mode == "AUTO_POOL":
+            from .models import cross_account_thread_mode_for_version
+            thread_mode = cross_account_thread_mode_for_version(None)
+            state["cross_account_thread_mode"] = thread_mode
+            state["cross_account_thread_capability"] = {
+                "codex_version": None,
+                "mode": thread_mode,
+            }
         if thread_id:
             state["thread_id"] = thread_id
         profile = "default" if commands else "none"
@@ -204,6 +424,11 @@ class NightwatchStore:
             try:
                 self.runs_path.mkdir(mode=0o700)
                 self.reports_path.mkdir(mode=0o700)
+                self.ensure_codex_home()
+                if self._codex_runtime_identity is not None:
+                    state["codex_runtime_identity"] = list(self._codex_runtime_identity)
+                if self._codex_home_identity is not None:
+                    state["codex_home_identity"] = list(self._codex_home_identity)
                 self._clear_mailbox_run_outputs_at(mailbox_fd)
                 self._write_json_at(mailbox_fd, "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
             finally:
@@ -345,11 +570,23 @@ class NightwatchStore:
 
     def _ensure_directory(self) -> None:
         self._assert_control_plane_outside_workspace()
-        self._assert_path_outside_workspace(self.directory.resolve())
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.directory, 0o700)
+        self._assert_path_outside_workspace(self.directory)
+        root_fd: int | None = None
+        dir_fd: int | None = None
+        try:
+            root_fd, _ = _open_dir_descriptor(self.root, create=True)
+            dir_fd, _ = _open_dir_descriptor(self.directory.name, dir_fd=root_fd, create=True)
+        finally:
+            if dir_fd is not None:
+                try:
+                    os.close(dir_fd)
+                except OSError:
+                    pass
+            if root_fd is not None:
+                try:
+                    os.close(root_fd)
+                except OSError:
+                    pass
 
     def _assert_control_plane_outside_workspace(self) -> None:
         self._assert_path_outside_workspace(self.root)

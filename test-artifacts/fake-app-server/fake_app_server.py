@@ -20,6 +20,10 @@ def send(value: dict) -> None:
 
 def main() -> int:
     scenario = os.environ.get("FAKE_APP_SERVER_SCENARIO", "normal")
+    environment_file = os.environ.get("FAKE_APP_SERVER_ENV_FILE")
+    if environment_file:
+        with open(environment_file, "w", encoding="utf-8") as handle:
+            handle.write(os.environ.get("CODEX_HOME", ""))
     initialize = recv()
     if initialize.get("method") != "initialize" or initialize.get("id") != 1:
         send({"jsonrpc": "2.0", "id": initialize.get("id"), "error": {"message": "initialize required"}})

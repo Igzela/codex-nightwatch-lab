@@ -77,6 +77,10 @@ def main() -> int:
     thread_id = state.get("thread_id", "TEST-001")
     save_state(state)
     scenario = os.environ.get("FAKE_CODEX_SCENARIO", "normal")
+    if scenario in {"pool", "pool_weekly", "pool_long"} and not resume:
+        thread_id = f"POOL-{state['starts']}"
+        state["thread_id"] = thread_id
+        save_state(state)
     if resume and os.environ.get("FAKE_CODEX_RESUME_SCENARIO"):
         scenario = os.environ["FAKE_CODEX_RESUME_SCENARIO"]
     if resume and scenario == "quota_then_success":
@@ -86,6 +90,30 @@ def main() -> int:
 
     if scenario != "missing_thread":
         emit({"type": "thread.started", "thread_id": thread_id})
+    if scenario in {"pool", "pool_weekly", "pool_long"}:
+        account = os.environ.get("NIGHTWATCH_ACCOUNT_FINGERPRINT", "unknown")
+        pool_state = state.setdefault("pool_counts", {})
+        pool_state[account] = pool_state.get(account, 0) + 1
+        save_state(state)
+        if scenario == "pool_long":
+            if state.get("quota_events", 0) < int(os.environ.get("FAKE_CODEX_LONG_CYCLES", "30")):
+                state["quota_events"] = state.get("quota_events", 0) + 1
+                save_state(state)
+                reset = int(time.time()) + int(os.environ.get("FAKE_CODEX_RESET_SECONDS", "1"))
+                emit({"type": "error", "error": {"code": "usage_limit_reached", "rateLimitReachedType": "5h", "resetsAt": reset, "message": "usage limit reached"}, "rate_limits": {"primary": {"used_percent": 100, "window_minutes": 300, "resets_at": reset}}})
+                return 1
+        if scenario == "pool" and account == os.environ.get("FAKE_CODEX_ACCOUNT_A") and pool_state[account] == 1:
+            reset = int(time.time()) + int(os.environ.get("FAKE_CODEX_RESET_SECONDS", "1"))
+            emit({"type": "error", "error": {"code": "usage_limit_reached", "rateLimitReachedType": "5h", "resetsAt": reset, "message": "usage limit reached"}, "rate_limits": {"primary": {"used_percent": 100, "window_minutes": 300, "resets_at": reset}}})
+            save_state(state)
+            return 1
+        if account == os.environ.get("FAKE_CODEX_ACCOUNT_B") and pool_state[account] == 1:
+            reset = int(time.time()) + int(os.environ.get("FAKE_CODEX_RESET_SECONDS", "1"))
+            reached_type = "weekly" if scenario == "pool_weekly" else "5h"
+            rate_key = "secondary" if scenario == "pool_weekly" else "primary"
+            emit({"type": "error", "error": {"code": "usage_limit_reached", "rateLimitReachedType": reached_type, "resetsAt": reset, "message": "usage limit reached"}, "rate_limits": {rate_key: {"used_percent": 100, "window_minutes": 10080 if scenario == "pool_weekly" else 300, "resets_at": reset}}})
+            save_state(state)
+            return 1
     if scenario == "duplicate_event":
         value = {"type": "turn.started", "turn_id": "T1"}
         emit(value)
@@ -133,7 +161,7 @@ def main() -> int:
     progress_file = os.environ.get("FAKE_CODEX_PROGRESS_FILE")
     if progress_file:
         mailbox.joinpath("progress.json").write_text(Path(progress_file).read_text())
-    if scenario in {"normal", "done_but_fails"}:
+    if scenario in {"normal", "done_but_fails", "pool", "pool_weekly", "pool_long"}:
         Path.cwd().joinpath("fake-implemented.txt").write_text("implemented\n")
         emit({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}})
         emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})

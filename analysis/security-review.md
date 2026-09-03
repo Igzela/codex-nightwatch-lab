@@ -1,12 +1,19 @@
 # Release hardening security review
 
-Date: 2026-08-28 (Asia/Shanghai)
+Date: 2026-09-02 (Asia/Tokyo)
 
 ## Status
 
-**USABLE_PENDING_REAL_QUOTA_SOAK**. The only intentionally pending gate is a
-natural provider quota exhaustion/recovery cycle; no quota was burned to force
-it.
+**0.4.0 PRODUCTION CANDIDATE = READY (AWAITING OWNER MERGE APPROVAL)**.
+All required real two-account gates passed on 2026-09-03:
+- Real Account B logged in under isolated `ACCOUNT_B_LOGIN_HOME`.
+- Verified mode-0700 recovery point created; canonical quiet-window transaction preserved Account A and unrelated state.
+- Real two-account App Server probes: PASS (Account A: 82% 5h, 56% weekly; Account B: 14% 5h, 40% weekly).
+- Real auth-refresh preservation: PASS across sequential capsule probe cycles.
+- Cross-account exact-thread experiment: UNSUPPORTED by upstream Codex rollout backend; production behavior remains CONTROLLED_THREAD_HANDOFF (PASS).
+- Real Nightwatch AUTO_POOL routing smoke: PASS in disposable repository; high-capacity Account B selected, lease held, registry lock released, completed DONE, canonical active account preserved.
+- Local regression: PASS, 198 tests.
+- PR CI: PASS across Python 3.11, 3.12, 3.13.
 
 ## Closed release blockers
 
@@ -31,8 +38,8 @@ it.
 - Fake App Server verifies required initialize response, `initialized`
   notification, request ordering, wrong IDs, notifications, malformed JSON,
   timeout, exit, error response, and millisecond resets.
-- Real Codex `0.150.1` App Server handshake and rate-limit read passed on this
-  machine. It returned live 5h and weekly windows.
+- Historical 0.3 real Codex `0.150.1` App Server handshake and rate-limit read
+  passed on this machine. It returned live 5h and weekly windows.
 - A real user-systemd disposable fixture reached DONE; a second fixture was
   SIGKILLed after exact thread capture, systemd restarted it, and it resumed
   `TEST-001` rather than opening a second thread.
@@ -50,6 +57,13 @@ it.
   mailbox root with a symlink is rejected on later reads, and that a state-home
   symlink resolving into the workspace is rejected before creation.
 
+- Current 0.4 regression coverage is 195 tests. The audited upstream
+  `codex-auth 0.3.0-alpha.11` binary was built in isolation and passed the
+  Nightwatch adapter contract smoke for list, switch, remove, import, export,
+  and round-trip behavior. Canonical discovery found three stored accounts;
+  the active account App Server probe passed, while both tested non-active
+  snapshots returned upstream 401 token-parse failures.
+
 ## Residual limits
 
 - A user can intentionally provide a weak non-diff verification command; that
@@ -57,3 +71,27 @@ it.
 - `recover --ack-ambiguous` is deliberately a documented human override.
 - User-service persistence after logout depends on the host's user-manager
   linger policy; Nightwatch does not alter it.
+
+## 0.4 account-pool security boundary
+
+- `codex-auth` is optional. Nightwatch consumes only its schema-v1 local JSON
+  discovery contract and never uses its remote usage API.
+- Account credentials remain outside Git in 0700 capsule directories and
+  restricted files. Capsule synchronization is required before cleanup; an
+  uncertain refresh state is retained for recovery rather than discarded.
+- Per-account lock files are held for the complete App Server/provider
+  lifetime. Symlinked roots/paths, corrupt metadata, stale PID reuse, and
+  changed ownership fail closed without deleting another owner's record.
+- Lease metadata is bound to the exact per-account lock-root inode. Replacing
+  that root fails closed even after the supervisor dies while a provider
+  descendant retains the inherited kernel-lock descriptor.
+- Canonical registry synchronization uses a short-lived directory-inode kernel
+  lock after the account lease; the metadata pathname is checked for symlink,
+  corruption, and replacement, and the lock is not held during provider work.
+- AUTO_POOL selection is explicitly scoped to the run's authorized subset and
+  requires authoritative 5h plus weekly quota. Cross-account exact-thread
+  continuity is not advertised; the tested fallback is an audited controlled
+  mission handoff.
+- Real two-account Nightwatch routing reached DONE with exactly two authorized
+  keys in a disposable repository and preserved the canonical active account,
+  completing the final real two-account gate.

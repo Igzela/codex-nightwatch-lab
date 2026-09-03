@@ -1,0 +1,421 @@
+# Nightwatch 0.4.0 Account Pool Final Report
+
+## Final Trusted-Path Closure, Production Revalidation & Guarded Merge — 2026-09-03
+
+This final addendum documents the complete closure of the trusted path identity hardening, descriptor-based directory establishment, inode identity immutability, capability override protection, production two-turn revalidation, full regression testing (215 unit tests), and remote CI matrix completion.
+
+PR: #1 (feat: add opt-in account pool failover)
+MERGE_STATUS: READY_FOR_GUARDED_MERGE
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_TEST_BINARY: /home/charlie/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+
+LOCAL_UNIT_TEST_COUNT: 215 (all 215 PASS)
+CI_MATRIX: Python 3.11, 3.12, 3.13 all PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+DOCTOR: PASS
+PACKAGE_INSTALL: PASS
+
+### Trusted Directory Descriptor & Path Identity Hardening
+1. **Descriptor Verification (`O_NOFOLLOW | O_DIRECTORY`)**:
+   - Chained file descriptors establish persistent run `CODEX_HOME` (`root -> repo_dir -> codex-runtime -> codex-home`).
+   - Creation is relative to parent descriptor (`dir_fd`), preventing path traversal and TOCTOU directory replacement.
+   - Symlinks and non-directories are rejected immediately before any creation or permission mutation occurs (`fstat`, `fchmod`).
+2. **Immutable Inode Identity**:
+   - `TrustedRunHome` encapsulates `(path, runtime_identity, home_identity)`.
+   - On establish and re-verification, descriptor fstat confirms `(st_dev, st_ino)` match expected identity. Directory rename or inode replacement immediately fails closed before credential injection or supervisor turn dispatch.
+3. **AccountCapsule Boundary Protection**:
+   - `AccountCapsule.create` consumes `TrustedRunHome` without unsafe `.resolve()` normalization.
+   - Re-verifies trusted home inode immediately before importing accounts, synchronizing accounts, and scrubbing credentials.
+4. **Capability Override Safety**:
+   - `models.py:cross_account_thread_mode_for_version` enforces that `NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE` can only downgrade capability (`UNSUPPORTED`, `INCONCLUSIVE`), never upgrade an unproven version to `PROVEN`. Added safe test seam `NIGHTWATCH_UNSAFE_FORCE_CROSS_ACCOUNT_PROVEN` for fake test doubles.
+
+### Production Revalidation Results
+- **Gate 14: Real Same-Account Two-Turn Revalidation**: PASS
+  - Run ID: `gate14_same_account_repo-20260903T082259`
+  - Turn 1: Started thread `01a0665d-44ea-7fb1-8fa1-0617421adefa`, intentionally failed milestone verification (`test -f turn2_done.txt`).
+  - Transition: `verification_failed_continue` -> `resuming exact thread`.
+  - Turn 2: Exact resume of `01a0665d-44ea-7fb1-8fa1-0617421adefa`, passed all verification checks.
+  - Final State: DONE. Zero `no rollout found` errors.
+- **Section 16: Credential Scrubbing & Thread Store Durability**: PASS
+  - Residual credentials (`auth.json`, `registry.json`, `accounts/`, `*.auth.json`): Confirmed completely absent.
+  - Thread Store (`sessions/` rollout JSONL, SQLite databases `state_5.sqlite`, `goals_1.sqlite`, `thread_history_1.sqlite`): Fully preserved and intact.
+- **Cross-Account Thread Status**: PROVEN for installed Codex `0.152.1`.
+
+---
+
+## Durable Thread Store / Ephemeral Auth Hardening & Final Production Acceptance — 2026-09-03
+
+This addendum records the complete resolution of the P1 release blocker, empirical proof
+of exact-thread continuity across turns and accounts, and final production acceptance.
+
+VERSION: 0.4.0
+PR: #1
+PR_STATE: DRAFT
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+UNIT_TEST_COUNT: 205 (all 205 PASS)
+
+### Root Cause Forensic Confirmation
+The previous `no rollout found for thread id` failure was caused solely by `AccountCapsule`
+deleting the ephemeral capsule directory upon turn completion, which destroyed `$CODEX_HOME/sessions`.
+Official OpenAI Codex CLI stores local thread sessions and rollout JSONL in `$CODEX_HOME/sessions`
+and local metadata in SQLite databases (`state_5.sqlite`, etc.). When sessions are preserved,
+exact thread resume works seamlessly.
+
+### Architectural Hardening Implemented
+1. **Durable Run CODEX_HOME**: `NightwatchStore.codex_home` (`~/.local/state/codex-nightwatch/<repo_id>/codex-runtime/codex-home/`, mode `0700`) persists across all provider turns, restarts, and handoffs.
+2. **Ephemeral Auth Leases**: `AccountCapsule` injects credentials (`auth.json`, `registry.json`, `accounts/`) into the persistent run `codex_home` strictly while holding the global account lease.
+3. **Export Staging Pruning**: Single-account staging pruning strips all foreign accounts before import, guaranteeing only the leased account is present.
+4. **Credential Scrubbing**: Upon turn completion or failure, credentials are unlinked and scrubbed while strictly preserving `sessions/` and SQLite databases.
+5. **Adoption Protection**: `AUTO_POOL` mode explicitly rejects `--thread` and `adopt` to fail closed against session pollution.
+6. **Thread Mode Reporting**: CLI reports and TUI display `THREAD_MODE`, `RUN_STORE: persistent`, and `AUTH_LEASE: leased / active` or `inactive / scrubbed`.
+
+### Acceptance Gate Evidence
+- **Section 11: Real Same-Account Two-Turn Acceptance Gate**: PASS
+  - Mode: `--account-mode auto-pool`
+  - Repo: Disposable local git repo on `charlie`
+  - Turn 1: Created thread `01a065dc-8940-78c2-9a57-135fabf01aed`, created `turn1_done.txt`, failed verification (`test -f turn2_done.txt`).
+  - Turn 2: Exact resume of thread `01a065dc-8940-78c2-9a57-135fabf01aed` via `codex exec resume`, created `turn2_done.txt`, passed verification.
+  - Final State: DONE. Zero `no rollout found` errors.
+- **Section 12: Real Cross-Account Exact-Thread Verification Gate**: PROVEN
+  - Tested: Account A (`acct-7ce14e017d7b`) -> Account B (`acct-4cb1604810cd`) -> Account A (`acct-7ce14e017d7b`)
+  - Turn 1 (Account A): Created thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN1_A`.
+  - Turn 2 (Account B): Exact resume of thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN2_B`. Exit code: 0.
+  - Turn 3 (Account A): Exact resume of thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN3_A`. Exit code: 0.
+  - Definitive conclusion: `CROSS_ACCOUNT_EXACT_THREAD = PROVEN` for `codex-cli 0.152.1`.
+
+---
+
+## Real two-account acceptance completion addendum — 2026-09-03 (Pre-Durable Store)
+
+This addendum records the completion of all real two-account gates following the
+safe import of a real user-authorized Account B into canonical `~/.codex`.
+Historical checkpoints (2026-09-02 hardening addendum and historical fake-only
+checkpoint) are preserved below for forensic provenance and are not overwritten.
+
+FINAL_HEAD: 187d4d2
+VERSION: 0.4.0
+PR: #1
+PR_STATE: READY_FOR_REVIEW
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_SHA: 0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a
+CODEX_AUTH_TEST_BINARY: /home/charlie/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af460f8a65b69
+CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
+CODEX_AUTH_JSON_SCHEMA: 1
+
+UNIT_TEST_COUNT: 198
+CI_311: PASS
+CI_312: PASS
+CI_313: PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+PACKAGE_INSTALL: PASS
+DOCTOR: PASS
+
+REMOVE_SCHEMA_REAL_CONTRACT: PASS
+CANONICAL_REGISTRY_LOCK: PASS
+CONCURRENT_A_B_REFRESH_PRESERVATION: PASS
+ACCOUNT_LEASE_PARALLELISM: PASS
+REGISTRY_LOCK_PROVIDER_SCOPE: PASS
+LOCK_ORDER: account lease -> registry lock
+LOCK_ORDER_RESULT: PASS
+NORMAL_QUOTA_CYCLES_OVER_20: PASS
+NORMAL_QUOTA_CYCLES_TESTED: 30
+RECOVERY_FAILURE_CIRCUIT_BREAKER: PASS
+PROVIDER_CAPSULE_SELECTED_ACCOUNT_ONLY: PASS
+ALL_ACCOUNT_EXPORT_REMOVED_BEFORE_PROVIDER: PASS
+
+REAL_CODEX_AUTH_LIST: PASS
+REAL_CODEX_AUTH_SWITCH: PASS
+REAL_CODEX_AUTH_REMOVE: PASS
+REAL_CODEX_AUTH_IMPORT_EXPORT: PASS
+REAL_TWO_ACCOUNT_DISCOVERY: PASS
+REAL_ACCOUNT_A_APP_SERVER: PASS
+REAL_ACCOUNT_B_APP_SERVER: PASS
+REAL_AUTH_REFRESH_PRESERVATION: PASS
+CROSS_ACCOUNT_EXACT_THREAD: UNSUPPORTED
+CONTROLLED_THREAD_HANDOFF: PASS
+REAL_TWO_ACCOUNT_NIGHTWATCH_SMOKE: PASS
+REAL_NATURAL_ACCOUNT_ROTATION: NOT_OBSERVED
+
+CURRENT_ONLY_REGRESSION: PASS
+DEFERRED_START_REGRESSION: PASS
+ADOPT_REGRESSION: PASS
+MULTI_RUN_REGRESSION: PASS
+
+KNOWN_LIMITATIONS:
+
+- Cross-account exact-thread resume across distinct Codex accounts is UNSUPPORTED
+  by upstream Codex App Server / rollout storage (fails with code -32600: no rollout
+  found for thread id). Production behavior remains CONTROLLED_THREAD_HANDOFF (PASS),
+  where mission continuity is preserved and conversation continuity begins on a fresh thread.
+- Real natural quota exhaustion was NOT_OBSERVED during acceptance because neither
+  account was naturally exhausted during testing, and no quota was artificially burned.
+  This does not block release.
+
+MERGE_DECISION: READY_FOR_REVIEW
+READY_FOR_REVIEW: YES
+PRODUCTION_CANDIDATE: READY (DO NOT MERGE - AWAIT OWNER APPROVAL)
+
+Evidence details:
+- Account B login completed via isolated file-backed CODEX_HOME (`account-b-login`)
+  with mode 0700 and zero canonical ~/.codex mutation.
+- Canonical transaction executed during a quiet window with a verified mode-0700
+  recovery point (`~/.local/state/codex-nightwatch/recovery-points/recovery-before-import-b-1788410029`).
+  Account lease for Account B was acquired before entering the canonical registry
+  lock. Account B snapshot was imported, and active account remained Account A
+  (`acct-4cb1604810cd`).
+- Official Codex App Server capsule probes succeeded for both accounts:
+  - Account A (`acct-4cb1604810cd`): 5h used=82%, weekly used=56%.
+  - Account B (`acct-7ce14e017d7b`): 5h used=14%, weekly used=40%.
+- Real auth-refresh preservation tested across sequential A -> B -> A -> B
+  capsule cycles. Both accounts proved fully usable with authoritative live
+  quota; opaque snapshot SHA256 hashes remained identical; canonical active
+  account remained Account A.
+- Cross-account exact-thread experiment in a disposable repository created
+  thread `01a065a9-d227-7693-913f-1edffd814c5d` under Account A. Resuming under
+  Account B returned official Codex error `-32600: no rollout found for thread id`.
+  Classified UNSUPPORTED; controlled thread handoff verified in production.
+- Real Nightwatch AUTO_POOL routing smoke executed in disposable repository with
+  both accounts authorized. Highest-capacity Account B was selected, account lease
+  was held while registry lock was free, goal completed with `DONE`, auth was
+  synchronized, lease was released, and canonical active account was preserved.
+- Codex runtime tmp helper cleanup (`_clean_runtime_tmp`) added to `AccountCapsule`
+  to cleanly remove ephemeral Codex 0.152.1 `$CODEX_HOME/tmp/arg0` symlinks prior
+  to tree hardening, with fail-closed rejection if `tmp` itself is symlinked.
+- Explicit account selector resolution in `operations.py` updated to support
+  matching account fingerprints alongside stable keys and aliases.
+
+## Hardening acceptance addendum — 2026-09-02
+
+This historical addendum records the state prior to real Account B login. The
+historical evidence is retained and explicitly labeled; it is not reused as
+proof of the real integration gates.
+
+FINAL_HEAD: 0f87b263cd7e214141b9d3605f7c47d4fa6f8270
+VERSION: 0.4.0
+PR: #1
+PR_STATE: DRAFT
+BASE_MASTER: 1f7dbd12bce89f26df2379aaed37c39c1004a49c
+
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+CODEX_AUTH_SHA: 0fde29598c2e02e28e0e8bcc33a4bb8d45d7b23a
+CODEX_AUTH_TEST_BINARY: /home/igzela/.local/lib/nightwatch-test/codex-auth/0.3.0-alpha.11/codex-auth
+CODEX_AUTH_BINARY_SHA256: 3a766717d2b3263a678de170594373885dcebedd71bfb590755af460f8a65b69
+CODEX_AUTH_HOST_VERSION: codex-auth 0.2.10 (unchanged)
+CODEX_AUTH_JSON_SCHEMA: 1
+
+UNIT_TEST_COUNT: 195
+CI_311: PASS
+CI_312: PASS
+CI_313: PASS
+COMPILEALL: PASS
+DIFF_CHECK: PASS
+PACKAGE_INSTALL: PASS
+DOCTOR: PASS
+
+REMOVE_SCHEMA_REAL_CONTRACT: PASS
+CANONICAL_REGISTRY_LOCK: PASS
+CONCURRENT_A_B_REFRESH_PRESERVATION: PASS
+ACCOUNT_LEASE_PARALLELISM: PASS
+REGISTRY_LOCK_PROVIDER_SCOPE: PASS
+LOCK_ORDER: account lease -> registry lock
+LOCK_ORDER_RESULT: PASS
+NORMAL_QUOTA_CYCLES_OVER_20: PASS
+NORMAL_QUOTA_CYCLES_TESTED: 30
+RECOVERY_FAILURE_CIRCUIT_BREAKER: PASS
+PROVIDER_CAPSULE_SELECTED_ACCOUNT_ONLY: PASS
+ALL_ACCOUNT_EXPORT_REMOVED_BEFORE_PROVIDER: PASS
+
+REAL_CODEX_AUTH_LIST: PASS
+REAL_CODEX_AUTH_SWITCH: PASS
+REAL_CODEX_AUTH_REMOVE: PASS
+REAL_CODEX_AUTH_IMPORT_EXPORT: PASS
+REAL_TWO_ACCOUNT_DISCOVERY: PASS
+REAL_ACCOUNT_A_APP_SERVER: PASS
+REAL_ACCOUNT_B_APP_SERVER: FAIL
+REAL_AUTH_REFRESH_PRESERVATION: INCONCLUSIVE
+CROSS_ACCOUNT_EXACT_THREAD: INCONCLUSIVE
+CONTROLLED_THREAD_HANDOFF: PASS
+REAL_TWO_ACCOUNT_NIGHTWATCH_SMOKE: PASS
+REAL_NATURAL_ACCOUNT_ROTATION: NOT_OBSERVED
+
+CURRENT_ONLY_REGRESSION: PASS
+DEFERRED_START_REGRESSION: PASS
+ADOPT_REGRESSION: PASS
+MULTI_RUN_REGRESSION: PASS
+
+KNOWN_LIMITATIONS:
+
+- Live canonical discovery found three stored accounts. The active account
+  returned authoritative App Server quota; the selected second account
+  returned upstream `401 Unauthorized` token-parsing errors. The other
+  non-active candidate showed the same condition. This prevents a real
+  two-usable-account acceptance, so the PR remains Draft.
+- Real two-account auth-refresh preservation cannot be classified PASS while
+  the second account cannot complete an authoritative App Server session.
+- Cross-account exact-thread portability was not attempted after the failed
+  second-account gate and remains INCONCLUSIVE. Production behavior remains
+  `CONTROLLED_THREAD_HANDOFF` (mission continuity yes; conversation continuity
+  is a new thread).
+- Natural quota rotation was not observed and no quota was intentionally
+  consumed to manufacture it.
+
+MERGE_DECISION: KEEP_DRAFT
+READY_FOR_REVIEW: NO
+
+Evidence details: the isolated real contract smoke exercised import, list,
+switch, remove, export, and import/export round-trip through Nightwatch's
+adapter. The real Nightwatch routing smoke used exactly two authorized keys in
+a disposable Git repository, completed `DONE`, and preserved the canonical
+active account; the unusable second candidate was skipped. No credentials or
+token differences were logged.
+
+The hardening checkpoint `0f87b26` additionally makes active-account
+read/import/restore one canonical transaction, passes the directory lock FD to
+the codex-auth child, rejects replaced metadata paths, and exercises seven
+capsule crash seams plus the three canonical registry crash-hook boundaries.
+It binds lease metadata to the hidden per-account lock-root inode, proving that
+replacement cannot bypass either a live supervisor or a stale supervisor whose
+provider descendant still holds the inherited lock FD. The integrated
+`AFTER_PROVIDER_EXIT` fault test proves lease release, parseable durable state,
+and successful restart reconciliation.
+The report commit is documentation-only; `FINAL_HEAD` identifies the exact
+implementation checkpoint covered by these results.
+
+## Historical fake-only checkpoint
+
+HISTORICAL_FINAL_HEAD: 325b2aa1fe523b9b5b202094c9e51b710eb0c75c
+BRANCH: account-pool-0-4
+VERSION: 0.4.0
+DATE: 2026-09-02
+
+`FINAL_HEAD` is the exact implementation checkpoint covered by the local
+verification below. The report commit is documentation-only and is called out
+separately by the delivery message.
+
+## Executive result
+
+The opt-in account-pool implementation is complete at the code and test seam.
+`CURRENT_ONLY` remains the default and does not require `codex-auth`. The
+explicit `AUTO_POOL` path is fail-closed when the optional machine-readable
+adapter is unavailable, and the fake end-to-end suite proves deterministic
+selection, both quota windows, global account leases, external account
+capsules, rotation, wait/re-probe, refresh preservation, and controlled
+cross-account handoff.
+
+The host's installed `codex-auth` is 0.2.10 and does not provide the required
+JSON contract: both local `list --skip-api --json` probes exited non-zero with
+empty stdout, and `export --help` is unsupported. Therefore no real account
+switch, real two-account rotation, or natural quota consumption was attempted.
+That is an environment capability limit, not a claimed production pass.
+
+## Requirement-by-requirement acceptance
+
+The table below is retained historical fake-only evidence. Its fake auth
+refresh result does not supersede the current real result of `INCONCLUSIVE` in
+the hardening addendum above.
+
+| Requirement | Result | Evidence or boundary |
+|---|---|---|
+| Start from current master and preserve unrelated work | PASS | `origin/master` was refreshed at `1f7dbd12bce89f26df2379aaed37c39c1004a49c`; implementation was made in linked worktree `/home/igzela/Projects/.worktrees/codex-nightwatch-lab/account-pool-0-4`. |
+| Default current-account behavior | PASS | Legacy state loads as `CURRENT_ONLY`; current-only runs do not invoke account-pool discovery. Covered by `test_pre_pool_state_loads_as_current_only` and the existing regression suite. |
+| Explicit account subset only | PASS | `AUTO_POOL` requires one or more explicit `--account` selectors; exact stable keys and unique alias/name matches are accepted; all stored accounts are never implicitly enrolled. |
+| Stable account identity | PASS | `account_key` is the only adapter identity; persisted and displayed operationally as a one-way fingerprint. Row numbers, email-like fields, and unknown fields are not identity inputs. |
+| Optional `codex-auth` machine contract | PASS | Adapter uses argv-only local `list [--active] --skip-api --json` and `switch <account_key> --json`, requires schema v1, ignores unknown fields, rejects future/malformed schema, and never parses stderr as logic. |
+| No `codex-auth` remote usage API | PASS | Adapter has no remote usage call; quota selection uses only fresh App Server `account/rateLimits/read` or the explicitly marked fake-file authority. |
+| Both 5h and weekly windows govern | PASS | Selection rejects missing/unknown windows and maximizes `min(5h remaining, weekly remaining)`; weekly-only exhaustion is separately tested. |
+| Deterministic selection | PASS | Tie order is minimum remaining capacity, 5h remaining, weekly remaining, earlier reset, then fingerprint. |
+| Global same-account exclusion | PASS | Kernel-backed file lifetime lease; same account is exclusive, different accounts are independent, and lease metadata is audited. |
+| PID identity and stale-state safety | PASS | PID starttime plus executable identity; corrupt, symlinked, mismatched, and live-owner records fail closed. |
+| Provider/App Server lease lifetime | PASS | The account lease and capsule surround the quota/provider boundary and are released only after provider exit and capsule synchronization. Lease fd is passed to child boundaries. |
+| External `CODEX_HOME` capsules | PASS | Per-run external 0700 capsule; managed files are hardened 0600; canonical auth remains outside the repository; capsule cleanup is bounded and recoverable. |
+| Auth refresh preservation | PASS | Opaque snapshot refresh test proves A → B → A preserves refreshed A state without Nightwatch parsing or logging tokens. |
+| Account switch after provider exit | PASS | Pool rotation is triggered only after the provider result is classified and the prior account lease has exited its provider phase. |
+| Cross-account exact-thread claim | INCONCLUSIVE | Exact-thread portability is not assumed or reported. The implementation uses `CONTROLLED_THREAD_HANDOFF` with a new conversation and an auditable trusted packet. |
+| Controlled handoff packet | PASS | Packet binds goal, frozen verification commands, repo, last Git HEAD, prior thread for audit, generation, milestones, and blocker. |
+| Pool exhaustion and busy wait | PASS | All selected accounts exhausted or leased enter `WAIT_QUOTA`; the earliest relevant authoritative reset is persisted and the complete authorized pool is re-probed. |
+| Best account after reset | PASS | Fake weekly scenario proves a previously exhausted account is selected again when it becomes the greatest usable capacity. |
+| All-authorized auth failure | PASS | All account authentication failures transition to `BLOCKED`; no retry loop is created. |
+| Restart reconciliation | PASS | Active account is re-read after supervisor restart; an active account outside the explicit pool fails closed; ambiguous claims remain fail closed. |
+| TUI and CLI surfaces | PASS | CLI flags, status fields, wait status, TUI account picker, current-only fallback, account fingerprints, and lease/pool state are covered by tests. |
+| Deferred first launch | PASS | Existing deferred-start tests remain green; no provider spawn occurs while authoritative quota is exhausted. |
+| Adopt/resume and multi-run safety | PASS | Existing adopt/resume and same-repo/same-account collision suites remain green; account lease is independent per account and supervisor state remains single-writer. |
+
+## Verification evidence
+
+### Local tests and static checks
+
+- Python 3.14/current: `168` tests passed.
+- Python 3.11: `168` tests passed.
+- `python3 -m compileall -q nightwatch`: passed.
+- Python 3.11 compileall: passed.
+- `git diff --check`: passed before the implementation commit.
+- Focused account-pool tests: adapter/schema, selection, lease, capsule,
+  probe, fake rotation, weekly wait/recovery, and TUI coverage all passed.
+- Isolated package install in a temporary virtual environment: passed;
+  `nightwatch --version` reported `0.4.0`.
+- Live packaged `nightwatch doctor`: passed with Codex `codex-cli 0.152.1`,
+  live App Server quota authority, and `systemd-inhibit` available.
+
+Expected test output includes argparse diagnostics for a deliberately invalid
+model and a no-user-bus service warning; both are asserted test scenarios.
+
+### Fake end-to-end evidence
+
+- Two-account 5h rotation: A exhausts, B is selected, B exhausts, the pool
+  waits and re-probes, then A is selected again. The final state is `DONE`,
+  with three account generations, three provider sessions, eight fresh quota
+  probes, and controlled handoff packets marked `INCONCLUSIVE` for exact
+  cross-account thread portability.
+- Weekly-governing scenario: an account with healthy 5h but exhausted weekly
+  quota is rejected; the pool waits through the relevant reset boundaries and
+  reselects the best recovered account.
+- Lease crash/restart seams: kernel-release, stale PID, corrupt metadata,
+  symlink, same-account collision, and different-account parallelism are
+  covered.
+
+## Live capability audit and deferred experiments
+
+- Installed `codex-auth`: `0.2.10`.
+- Audited upstream JSON contract: schema v1, stdout-only JSON document,
+  stderr diagnostics, stable `account_key`, local `--skip-api` discovery,
+  and local switch/export/import command family.
+- Host `codex-auth list --skip-api --json`: unsupported/non-zero with no JSON
+  stdout.
+- Host `codex-auth list --active --skip-api --json`: unsupported/non-zero with
+  no JSON stdout.
+- Host `codex-auth export --help`: unsupported.
+- No real switch was executed, no provider was run under a second real
+  account, and no natural quota was consumed to force rotation.
+- No user Nightwatch/Codex workload in this repository was disturbed.
+
+## Known limitations
+
+1. Real two-account and natural-quota rotation remain deferred until an
+   installed, verified `codex-auth` build exposes the required local JSON and
+   snapshot contract and the user authorizes a safe experiment.
+2. Cross-account exact-thread portability is deliberately not certified for
+   Codex `0.152.1`; controlled handoff is the fail-closed behavior.
+3. Local verification ran Python 3.11 and the current interpreter. Python
+   3.12/3.13 interpreters were not installed on the host; the repository CI
+   matrix remains the authoritative place to run those versions.
+4. The crash tests cover the lease/capsule/restart safety seams and existing
+   supervisor crash matrix; they are not a claim that every individual
+   filesystem instruction has been fault-injected.
+
+## Release boundary
+
+The implementation is versioned `0.4.0`, but merge/release remains gated on
+the exact-head CI and review policy. This report does not certify real-account
+production behavior or cross-account exact-thread continuity beyond the
+evidence explicitly listed above.
