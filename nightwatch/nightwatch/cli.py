@@ -83,6 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("goal")
     run.add_argument("--repo", default=None)
     run.add_argument("--thread", default=None, help="adopt and bind an existing exact thread ID")
+    run.add_argument("--provider", choices=["codex", "agy"], default=None, help="model provider CLI to supervise (codex, agy)")
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
@@ -103,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     adopt.add_argument("--thread", required=True, help="exact thread ID to adopt")
     adopt.add_argument("goal", nargs="?", default="Supervise adopted conversation", help="goal description")
     adopt.add_argument("--repo", default=None)
+    adopt.add_argument("--provider", choices=["codex", "agy"], default=None, help="model provider CLI (codex, agy)")
     adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
     _add_model_options(adopt)
     _add_account_options(adopt)
@@ -122,9 +124,11 @@ def _parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="check Linux, Codex, auth, quota, and local state support")
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--repo", default=None)
+    doctor.add_argument("--provider", choices=["codex", "agy"], default=None, help="check specific provider")
 
-    models = sub.add_parser("models", help="show the installed Codex model catalog and reasoning levels")
+    models = sub.add_parser("models", help="show the installed Codex or AGY model catalog and reasoning levels")
     models.add_argument("--json", action="store_true")
+    models.add_argument("--provider", choices=["codex", "agy"], default=None, help="show model catalog for provider")
 
     ui = sub.add_parser("ui", help="open the interactive multi-thread terminal control plane")
     ui.add_argument("--repo", default=None)
@@ -207,6 +211,7 @@ def _run(args: argparse.Namespace) -> int:
     if getattr(args, "thread", None) and (args.account_mode or "").replace("-", "_").upper() == "AUTO_POOL":
         raise SystemExit("nightwatch: auto-pool adoption of existing interactive threads via --thread is not supported; use current-only mode.")
     try:
+        provider = getattr(args, "provider", None) or os.environ.get("NIGHTWATCH_PROVIDER", "codex")
         run_spec = RunSpec(
             root,
             args.goal,
@@ -217,6 +222,7 @@ def _run(args: argparse.Namespace) -> int:
             service=bool(args.service),
             account_mode=args.account_mode,
             account_selectors=tuple(args.accounts),
+            provider=provider,
         )
         authorized = resolve_authorized_accounts(run_spec, root)
     except (AccountBrokerError, ValueError) as exc:
@@ -235,6 +241,7 @@ def _run(args: argparse.Namespace) -> int:
         reasoning_effort=args.reasoning_effort,
         account_mode=args.account_mode.replace("-", "_").upper(),
         authorized_accounts=authorized,
+        provider=provider,
     )
     if args.service:
         _install_user_files(root)
@@ -513,16 +520,28 @@ def _doctor(args: argparse.Namespace) -> int:
             print(f"5h: {report['quota']['primary'].get('used_percent')}% used, reset={report['quota']['primary'].get('resets_at')}")
         if report["quota"].get("secondary"):
             print(f"weekly: {report['quota']['secondary'].get('used_percent')}% used, reset={report['quota']['secondary'].get('resets_at')}")
+        if report.get("agy"):
+            agy = report["agy"]
+            agy_ver = agy.get("version") or "(missing)"
+            agy_auth = "ok" if agy.get("auth_ok") else "fail"
+            print(f"AGY: {agy_ver}")
+            print(f"AGY Auth: {agy_auth}")
+            if agy.get("quota") and agy["quota"].get("primary"):
+                print(f"AGY 5h: {agy['quota']['primary'].get('used_percent')}% used, reset={agy['quota']['primary'].get('resets_at')}")
+            if agy.get("quota") and agy["quota"].get("secondary"):
+                print(f"AGY weekly: {agy['quota']['secondary'].get('used_percent')}% used, reset={agy['quota']['secondary'].get('resets_at')}")
         print(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
     return 0 if report["status"] == "ok" else 1
 
 
 def _models(args: argparse.Namespace) -> int:
-    catalog = _model_catalog()
+    provider = getattr(args, "provider", None) or "codex"
+    catalog = _model_catalog(provider=provider)
     if args.json:
-        print(json.dumps({"models": catalog}, indent=2, ensure_ascii=False))
+        print(json.dumps({"provider": provider, "models": catalog}, indent=2, ensure_ascii=False))
         return 0
-    print("Installed Codex models (live local catalog)")
+    header = "Installed AGY models (live catalog)" if provider == "agy" else "Installed Codex models (live local catalog)"
+    print(header)
     for item in catalog:
         levels = ",".join(item["supported_reasoning_levels"]) or "(not reported)"
         default = item["default_reasoning_level"] or "(not reported)"

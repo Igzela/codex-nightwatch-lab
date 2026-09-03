@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=%h/.local/bin/nightwatch resume
 Restart=on-failure
 RestartPreventExitStatus=10 11 12

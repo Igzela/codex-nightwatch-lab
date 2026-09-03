@@ -65,6 +65,7 @@ class RunSpec:
     service: bool = True
     account_mode: str = "current-only"
     account_selectors: tuple[str, ...] = ()
+    provider: str = "codex"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repo", Path(self.repo).expanduser().resolve())
@@ -94,6 +95,12 @@ class RunSpec:
         if len(selectors) != len(set(selectors)):
             raise ValueError("account selectors must be unique")
         object.__setattr__(self, "account_selectors", selectors)
+        prov = (self.provider or "codex").strip().lower()
+        if prov not in {"codex", "agy"}:
+            raise ValueError(f"unsupported provider: {self.provider!r}; must be 'codex' or 'agy'")
+        if prov == "agy" and mode == "AUTO_POOL":
+            raise ValueError("AGY provider does not support auto-pool")
+        object.__setattr__(self, "provider", prov)
 
 
 def service_name(service_root: Path) -> str:
@@ -222,10 +229,16 @@ def start_user_service(service_unit_name: str = "nightwatch.service") -> None:
 
 def resume_service(repo: Path) -> ActionResult:
     root = repo_root(repo)
-    live = find_repo_codex_processes(root)
+    store = NightwatchStore(root)
+    provider_name = store.load_state().get("provider", "codex") if store.exists() else "codex"
+    if provider_name == "agy":
+        from .providers import get_provider_adapter
+        live = get_provider_adapter("agy").find_active_processes(root)
+    else:
+        live = find_repo_codex_processes(root)
     if live:
         pids = ", ".join(str(item["pid"]) for item in live)
-        return ActionResult(False, f"Interactive Codex still running (PID {pids}); close it before /resume")
+        return ActionResult(False, f"Interactive {provider_name.capitalize()} still running (PID {pids}); close it before /resume")
     try:
         validate_install_targets(root)
         _launcher, service = install_user_files(root)
@@ -249,15 +262,20 @@ def adopt_run(spec: RunSpec) -> ActionResult:
         service=False,
         account_mode=spec.account_mode,
         account_selectors=spec.account_selectors,
+        provider=spec.provider,
     )
     result = start_run(bound, run_in_service=False)
     if not result.ok:
         return result
-    live = find_repo_codex_processes(bound.repo)
+    if spec.provider == "agy":
+        from .providers import get_provider_adapter
+        live = get_provider_adapter("agy").find_active_processes(bound.repo)
+    else:
+        live = find_repo_codex_processes(bound.repo)
     suffix = " Use /resume to start unattended supervision."
     if live:
         pids = ", ".join(str(item["pid"]) for item in live)
-        suffix = f" Interactive Codex still running (PID {pids}); /resume after it exits."
+        suffix = f" Interactive {spec.provider.capitalize()} still running (PID {pids}); /resume after it exits."
     return ActionResult(True, f"Adopted thread {bound.thread_id} as NEW.{suffix}")
 
 
@@ -375,6 +393,7 @@ def start_run(spec: RunSpec, run_in_service: bool = True) -> ActionResult:
         reasoning_effort=spec.reasoning_effort,
         account_mode=spec.account_mode,
         authorized_accounts=authorized,
+        provider=spec.provider,
     )
     if run_in_service:
         try:
@@ -418,7 +437,10 @@ def list_account_choices() -> list[AccountRecord]:
     return CodexAuthAdapter().list_accounts()
 
 
-def list_models() -> list[dict[str, Any]]:
+def list_models(provider: str = "codex") -> list[dict[str, Any]]:
+    if provider == "agy":
+        from .providers import get_provider_adapter
+        return get_provider_adapter("agy").list_models()
     binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
     try:
         result = subprocess.run(
@@ -555,5 +577,13 @@ def doctor_snapshot(repo: Path | None = None) -> dict[str, Any]:
             )
         except (SystemExit, StateIntegrityError, GitError) as exc:
             report["git"] = {"status": "unavailable", "error": str(exc)}
-    report["status"] = "ok" if report["codex_binary"] and report["auth"]["status"] == "ok" else "fail"
+    try:
+        from .providers import get_provider_adapter
+        agy_doc = get_provider_adapter("agy").doctor_check(repo=repo)
+        report["agy"] = agy_doc
+    except Exception as exc:
+        report["agy"] = {"status": "fail", "error": str(exc)}
+    codex_ok = bool(report["codex_binary"] and report["auth"]["status"] == "ok")
+    agy_ok = bool(report.get("agy") and report["agy"].get("status") == "ok")
+    report["status"] = "ok" if (codex_ok or agy_ok) else "fail"
     return report

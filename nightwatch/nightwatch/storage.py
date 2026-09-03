@@ -438,6 +438,7 @@ class NightwatchStore:
         reasoning_effort: str | None = None,
         account_mode: str = "CURRENT_ONLY",
         authorized_accounts: list[str] | None = None,
+        provider: str = "codex",
     ) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
@@ -452,10 +453,13 @@ class NightwatchStore:
             timestamp,
             model=model,
             reasoning_effort=reasoning_effort,
+            provider=provider,
         )
         state["acceptance_ready"] = sufficient_verification_policy(commands)
         if account_mode not in {"CURRENT_ONLY", "AUTO_POOL"}:
             raise StateIntegrityError(f"unsupported account mode: {account_mode}")
+        if provider == "agy" and account_mode == "AUTO_POOL":
+            raise StateIntegrityError("AGY provider does not support AUTO_POOL")
         state["account_mode"] = account_mode
         state["authorized_accounts"] = list(authorized_accounts or [])
         if account_mode == "AUTO_POOL":
@@ -481,11 +485,12 @@ class NightwatchStore:
                 self.runs_path.mkdir(mode=0o700)
                 self.reports_path.mkdir(mode=0o700)
                 self.events_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-                self.ensure_codex_home()
-                if self._codex_runtime_identity is not None:
-                    state["codex_runtime_identity"] = list(self._codex_runtime_identity)
-                if self._codex_home_identity is not None:
-                    state["codex_home_identity"] = list(self._codex_home_identity)
+                if provider == "codex":
+                    self.ensure_codex_home()
+                    if self._codex_runtime_identity is not None:
+                        state["codex_runtime_identity"] = list(self._codex_runtime_identity)
+                    if self._codex_home_identity is not None:
+                        state["codex_home_identity"] = list(self._codex_home_identity)
                 state["initialized"] = True
                 validate_state(state)
                 self._clear_mailbox_run_outputs_at(mailbox_fd)
@@ -504,20 +509,25 @@ class NightwatchStore:
         return state
 
     def load_state(self) -> dict[str, Any]:
-        """Load durable state after verifying repository binding and event frontier integrity.
+        """
+        Load state with bounded event-frontier validation.
 
-        Frontier validation complexity:
-        - O(number_of_segments) metadata verification: manifests entries, sequence ranges,
-          and sealed segment inode/file sizes are inspected via lstat.
-        - O(1) historical segment BODY reads: historical sealed segment file bodies are NOT read;
-          only the active segment tail (or an orphan candidate during crash recovery) is read.
-        Full historical body hashing occurs during load_events().
+        Complexity contract:
+        - Manifest & segment structural check: O(number_of_segments) metadata validations via os.lstat.
+        - Historical segment content reads: strictly O(1); sealed segment bodies are never parsed.
+        - Active segment tail read: reads only the final record (or single-event orphan during crash recovery).
         """
         try:
             state = self._read_json_regular(self.state_path)
+            if "provider" not in state:
+                state["provider"] = "codex"
             validate_state(state)
             if state.get("repo") != str(self.repo) or state.get("repo_id") != self.repo_id:
-                raise StateIntegrityError("trusted state does not belong to this repository identity")
+                raise StateIntegrityError(
+                    f"trusted state does not belong to this repository identity: "
+                    f"state_repo={state.get('repo')!r} self_repo={str(self.repo)!r} "
+                    f"state_repo_id={state.get('repo_id')!r} self_repo_id={self.repo_id!r}"
+                )
             self._validate_event_frontier()
             return state
         except FileNotFoundError as exc:

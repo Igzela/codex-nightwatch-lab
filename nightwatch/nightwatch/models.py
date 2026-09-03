@@ -180,6 +180,7 @@ def empty_state(
     now: str,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    provider: str = "codex",
 ) -> dict[str, Any]:
     return {
         "schema_version": 2,
@@ -187,6 +188,7 @@ def empty_state(
         "goal": goal,
         "repo": repo,
         "repo_id": repo_id,
+        "provider": provider,
         "thread_id": None,
         "model": model,
         "reasoning_effort": reasoning_effort,
@@ -234,9 +236,9 @@ def empty_state(
         "account_reset_times": {},
         "account_errors": {},
         "last_switch_reason": None,
-        "cross_account_thread_mode": "INCONCLUSIVE",
-        "cross_account_thread_capability": None,
         "thread_handoff": None,
+        "cross_account_thread_mode": "INCONCLUSIVE",
+        "initialized": False,
     }
 
 
@@ -251,6 +253,11 @@ def validate_state(state: dict[str, Any]) -> None:
         raise ValueError(f"state missing fields: {', '.join(missing)}")
     if state.get("schema_version") != 2:
         raise ValueError(f"unsupported state schema: {state.get('schema_version')!r}")
+    provider = state.get("provider", "codex")
+    if provider not in {"codex", "agy"}:
+        raise ValueError(f"unknown provider: {provider!r}")
+    if provider == "agy" and state.get("account_mode") == "AUTO_POOL":
+        raise ValueError("AGY provider does not support AUTO_POOL")
     if state.get("state") not in {item.value for item in State}:
         raise ValueError(f"unknown state: {state.get('state')!r}")
     if not isinstance(state.get("generation"), int) or state["generation"] < 1:
