@@ -504,6 +504,15 @@ class NightwatchStore:
         return state
 
     def load_state(self) -> dict[str, Any]:
+        """Load durable state after verifying repository binding and event frontier integrity.
+
+        Frontier validation complexity:
+        - O(number_of_segments) metadata verification: manifests entries, sequence ranges,
+          and sealed segment inode/file sizes are inspected via lstat.
+        - O(1) historical segment BODY reads: historical sealed segment file bodies are NOT read;
+          only the active segment tail (or an orphan candidate during crash recovery) is read.
+        Full historical body hashing occurs during load_events().
+        """
         try:
             state = self._read_json_regular(self.state_path)
             validate_state(state)
@@ -786,13 +795,13 @@ class NightwatchStore:
 
     def _active_segment_name(self) -> str:
         if self.events_manifest_path.exists():
-            try:
-                manifest = self._read_json_regular(self.events_manifest_path)
-                curr = manifest.get("current_segment")
-                if isinstance(curr, str) and curr:
-                    return curr
-            except Exception:
-                pass
+            manifest = self._read_json_regular(self.events_manifest_path)
+            if not isinstance(manifest, dict):
+                raise StateIntegrityError("trusted events manifest is invalid")
+            curr = manifest.get("current_segment")
+            if isinstance(curr, str) and curr:
+                return curr
+            raise StateIntegrityError("trusted events manifest current_segment is invalid")
         return "segment-000001.jsonl"
 
     def _active_segment_path(self) -> Path:
@@ -803,6 +812,13 @@ class NightwatchStore:
 
     def _read_segment_body(self, path: Path) -> bytes:
         return path.read_bytes()
+
+    @staticmethod
+    def _create_empty_segment(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags, 0o600)
+        os.close(fd)
 
     @staticmethod
     def _read_last_json_line(path: Path, file_size: int) -> dict[str, Any] | None:
@@ -934,6 +950,9 @@ class NightwatchStore:
             segments.append(new_seg)
             manifest["current_segment"] = new_name
             active_seg = new_seg
+            active_path = self.events_dir / active_seg["name"]
+            self._create_empty_segment(active_path)
+            crash_hook("AFTER_SEGMENT_CREATE")
 
         active_path = self.events_dir / active_seg["name"]
         self._append_file(active_path, line_text)
@@ -944,8 +963,164 @@ class NightwatchStore:
         active_seg["byte_size"] = os.lstat(active_path).st_size
         manifest["last_seq"] = next_seq
         self._write_json(self.events_manifest_path, manifest)
+        if need_rotation:
+            crash_hook("AFTER_ROTATION_MANIFEST_COMMIT")
+
+    def _reconcile_orphan_segment_unlocked(self, manifest: dict[str, Any], unexpected_entries: set[str]) -> None:
+        """Reconcile an uncommitted next segment orphan left by a crash during rotation.
+
+        Acceptable orphan candidate must satisfy ALL:
+        - exactly one unexpected non-dot entry;
+        - regular file;
+        - no symlink;
+        - exact expected next segment name;
+        - no path escape;
+        - previous manifest is structurally valid;
+        - previous active segment is intact;
+        - no ambiguity about sequence frontier.
+        """
+        # CASE 6: two or more unknown orphan segments => FAIL CLOSED
+        if len(unexpected_entries) != 1:
+            raise StateIntegrityError("events directory entries do not match manifest: multiple unexpected entries")
+
+        orphan_name = next(iter(unexpected_entries))
+        if not isinstance(orphan_name, str) or Path(orphan_name).name != orphan_name or "/" in orphan_name or "\\" in orphan_name or orphan_name.startswith("."):
+            raise StateIntegrityError("events directory entries do not match manifest: invalid orphan entry name")
+
+        segments = manifest.get("segments")
+        if not isinstance(segments, list) or not segments:
+            raise StateIntegrityError("events directory entries do not match manifest: manifest segments invalid")
+
+        # CASE 7: exact expected next segment name check
+        next_seg_num = sum(1 for s in segments if not s.get("is_legacy_root")) + 1
+        expected_next_name = f"segment-{next_seg_num:06d}.jsonl"
+        if orphan_name != expected_next_name:
+            raise StateIntegrityError(f"events directory entries do not match manifest: unexpected entry {orphan_name}")
+
+        orphan_path = self.events_dir / orphan_name
+        try:
+            orphan_st = os.lstat(orphan_path)
+        except OSError as exc:
+            raise StateIntegrityError(f"cannot inspect orphan entry {orphan_name}") from exc
+
+        # CASE 7: symlink / directory => FAIL CLOSED
+        if stat.S_ISLNK(orphan_st.st_mode):
+            raise StateIntegrityError(f"orphan segment {orphan_name} is a symlink")
+        if not stat.S_ISREG(orphan_st.st_mode):
+            raise StateIntegrityError(f"orphan segment {orphan_name} must be a regular file")
+
+        # Verify previous active segment is intact
+        prev_seg = segments[-1]
+        prev_path = self.legacy_events_path if prev_seg.get("is_legacy_root") else self.events_dir / prev_seg["name"]
+        try:
+            prev_st = os.lstat(prev_path)
+        except OSError as exc:
+            raise StateIntegrityError(f"cannot inspect previous active segment {prev_seg['name']}") from exc
+        if stat.S_ISLNK(prev_st.st_mode) or not stat.S_ISREG(prev_st.st_mode):
+            raise StateIntegrityError(f"previous active segment {prev_seg['name']} must be an intact regular file")
+        if prev_st.st_size != prev_seg["byte_size"]:
+            raise StateIntegrityError("previous active segment size modified")
+        if prev_seg["byte_size"] > 0:
+            last_line = self._read_last_json_line(prev_path, prev_seg["byte_size"])
+            if not isinstance(last_line, dict) or last_line.get("seq") != manifest.get("last_seq"):
+                raise StateIntegrityError("previous active segment tail does not match manifest last_seq")
+        if prev_seg.get("sha256") is not None:
+            prev_bytes = self._read_segment_body(prev_path)
+            if hashlib.sha256(prev_bytes).hexdigest() != prev_seg["sha256"]:
+                raise StateIntegrityError("previous active segment digest mismatch")
+
+        orphan_size = orphan_st.st_size
+        max_allowed = self._max_segment_bytes() + 65_536
+        if orphan_size > max_allowed:
+            raise StateIntegrityError("orphan segment exceeds maximum segment limit")
+
+        # CASE 1: orphan next segment exists and is empty
+        if orphan_size == 0:
+            try:
+                os.unlink(orphan_path)
+            except OSError as exc:
+                raise StateIntegrityError(f"cannot remove empty orphan segment {orphan_name}") from exc
+            return
+
+        try:
+            raw = self._read_segment_body(orphan_path)
+        except OSError as exc:
+            raise StateIntegrityError(f"cannot read orphan segment {orphan_name}") from exc
+
+        if not raw.strip():
+            try:
+                os.unlink(orphan_path)
+            except OSError as exc:
+                raise StateIntegrityError(f"cannot remove empty orphan segment {orphan_name}") from exc
+            return
+
+        if not raw.endswith(b"\n"):
+            # CASE 2 vs CASE 4: Incomplete append vs malformed non-JSON
+            if b"\n" in raw:
+                raise StateIntegrityError("orphan segment contains unexpected multiple records or trailing data")
+            if not raw.strip().startswith(b"{"):
+                raise StateIntegrityError("orphan segment contains malformed non-JSON data")
+            # Incomplete atomic append
+            try:
+                os.unlink(orphan_path)
+            except OSError as exc:
+                raise StateIntegrityError(f"cannot discard uncommitted orphan segment {orphan_name}") from exc
+            return
+
+        lines = [l for l in raw.splitlines() if l.strip()]
+        if len(lines) != 1:
+            raise StateIntegrityError("orphan segment contains multiple records")
+
+        try:
+            item = json.loads(lines[0].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # CASE 4: Complete line with malformed JSON => FAIL CLOSED
+            raise StateIntegrityError("orphan segment contains malformed JSON record") from exc
+
+        if not isinstance(item, dict):
+            raise StateIntegrityError("orphan segment event must be a JSON object")
+
+        event_seq = item.get("seq")
+        expected_seq = manifest["last_seq"] + 1
+        if not isinstance(event_seq, int) or event_seq != expected_seq:
+            # CASE 5: orphan event seq skips/repeats => FAIL CLOSED
+            raise StateIntegrityError(f"orphan segment seq {event_seq} does not match expected {expected_seq}")
+
+        if not isinstance(item.get("event"), str) or not item.get("event"):
+            raise StateIntegrityError("orphan segment event missing event type")
+
+        # CASE 3: Valid single event with seq == manifest.last_seq + 1
+        if prev_seg.get("sha256") is None:
+            prev_bytes = self._read_segment_body(prev_path)
+            prev_hash = hashlib.sha256(prev_bytes).hexdigest()
+            prev_seg["sha256"] = prev_hash
+            prev_seg["byte_size"] = prev_st.st_size
+        else:
+            prev_hash = prev_seg["sha256"]
+
+        new_seg = {
+            "name": orphan_name,
+            "seq_start": event_seq,
+            "seq_end": event_seq,
+            "event_count": 1,
+            "byte_size": orphan_size,
+            "sha256": None,
+            "prev_sha256": prev_hash,
+        }
+        manifest["segments"].append(new_seg)
+        manifest["current_segment"] = orphan_name
+        manifest["last_seq"] = event_seq
+
+        self._write_json(self.events_manifest_path, manifest)
+        crash_hook("AFTER_ROTATION_MANIFEST_COMMIT")
 
     def _validate_event_frontier(self) -> None:
+        """Validate event log frontier and reconcile uncommitted crash records.
+
+        Complexity:
+        - O(number_of_segments) metadata checks (manifest entries, lstat on sealed segments)
+        - O(1) historical body reads (only active segment tail or orphan candidate read)
+        """
         if self._has_legacy_events_only():
             self._validate_legacy_events()
             return
@@ -1002,24 +1177,6 @@ class NightwatchStore:
         if last_seq != segments[-1]["seq_end"]:
             raise StateIntegrityError("manifest last_seq does not match last segment seq_end")
 
-        try:
-            entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
-            expected_entries = {"manifest.json"} | {s["name"] for s in segments if not s.get("is_legacy_root")}
-            if entries != expected_entries:
-                # In-flight manifest update or segment rotation may be completing:
-                time.sleep(0.05)
-                try:
-                    manifest = self._read_json_regular(self.events_manifest_path)
-                    segments = manifest.get("segments", [])
-                    expected_entries = {"manifest.json"} | {s["name"] for s in segments if not s.get("is_legacy_root")}
-                    entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
-                except Exception:
-                    pass
-                if entries != expected_entries:
-                    raise StateIntegrityError("events directory entries do not match manifest")
-        except OSError as exc:
-            raise StateIntegrityError("cannot inspect events directory") from exc
-
         for seg in segments[:-1]:
             path = self.legacy_events_path if seg.get("is_legacy_root") else self.events_dir / seg["name"]
             try:
@@ -1030,6 +1187,28 @@ class NightwatchStore:
                 raise StateIntegrityError(f"sealed segment {seg['name']} must be a regular file")
             if st.st_size != seg["byte_size"]:
                 raise StateIntegrityError(f"sealed segment {seg['name']} size modified")
+
+        try:
+            entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
+        except OSError as exc:
+            raise StateIntegrityError("cannot inspect events directory") from exc
+        expected_entries = {"manifest.json"} | {s["name"] for s in segments if not s.get("is_legacy_root")}
+
+        if entries != expected_entries:
+            missing_entries = expected_entries - entries
+            if missing_entries:
+                raise StateIntegrityError(f"events directory entries do not match manifest: missing {missing_entries}")
+            unexpected_entries = entries - expected_entries
+            self._reconcile_orphan_segment_unlocked(manifest, unexpected_entries)
+            try:
+                entries = {f for f in os.listdir(self.events_dir) if not f.startswith(".")}
+            except OSError as exc:
+                raise StateIntegrityError("cannot inspect events directory after reconciliation") from exc
+            expected_entries = {"manifest.json"} | {s["name"] for s in manifest["segments"] if not s.get("is_legacy_root")}
+            if entries != expected_entries:
+                raise StateIntegrityError("events directory entries do not match manifest after reconciliation")
+            last_seq = manifest["last_seq"]
+            segments = manifest["segments"]
 
         active_seg = segments[-1]
         active_path = self.legacy_events_path if active_seg.get("is_legacy_root") else self.events_dir / active_seg["name"]
