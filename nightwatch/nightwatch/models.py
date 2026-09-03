@@ -33,14 +33,26 @@ def installed_codex_version(binary: str | None = None) -> str | None:
 
 
 def cross_account_thread_mode_for_version(version: str | None) -> str:
-    override = os.environ.get("NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE")
-    if override in {"PROVEN", "UNSUPPORTED", "INCONCLUSIVE", "UNKNOWN"}:
-        return override
+    # Explicit internal test seam for simulating proven behavior in unit fixtures:
+    if os.environ.get("NIGHTWATCH_UNSAFE_FORCE_CROSS_ACCOUNT_PROVEN") == "1":
+        return "PROVEN"
+
+    base_mode = "INCONCLUSIVE"
     if version:
         clean_version = version.split()[-1].strip()
         if clean_version in PROVEN_CROSS_ACCOUNT_CODEX_VERSIONS or version in PROVEN_CROSS_ACCOUNT_CODEX_VERSIONS:
-            return "PROVEN"
-    return "INCONCLUSIVE"
+            base_mode = "PROVEN"
+
+    override = os.environ.get("NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE")
+    if override:
+        # A normal environment override may only downgrade capability (e.g. PROVEN -> UNSUPPORTED / INCONCLUSIVE)
+        # It may not upgrade an unvalidated Codex version to PROVEN in production.
+        if override in {"UNSUPPORTED", "INCONCLUSIVE", "UNKNOWN"}:
+            return override
+        if override == "PROVEN":
+            return "PROVEN" if base_mode == "PROVEN" else "INCONCLUSIVE"
+
+    return base_mode
 
 
 def validate_model_name(value: str) -> str:

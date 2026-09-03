@@ -26,7 +26,7 @@ import fcntl
 from .account_errors import AccountBrokerError, AccountBusy, AccountSchemaError, AccountUnavailable
 from .account_locks import AccountRegistryLockBroker
 from .models import QuotaSnapshot
-from .storage import control_plane_root, now_iso
+from .storage import TrustedRunHome, control_plane_root, now_iso
 from .testing import crash_hook
 
 
@@ -803,25 +803,65 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         account_key: str,
         root: Path,
         allowed_root: Path | None = None,
-        codex_home: Path | None = None,
+        codex_home: Path | Any = None,
+        trusted_home: Any = None,
     ):
         self.adapter = adapter
         self.account_key = account_key
-        self.root = root.resolve()
-        self.allowed_root = (allowed_root or (control_plane_root() / "account-capsules")).resolve()
-        self.codex_home = (codex_home or (self.root / "codex-home")).resolve()
+        self.root = root
+        self.allowed_root = allowed_root or (control_plane_root() / "account-capsules")
+        self.trusted_home = trusted_home if trusted_home is not None else (codex_home if hasattr(codex_home, "verify") else None)
+        self.codex_home = Path(getattr(codex_home, "path", codex_home) or (self.root / "codex-home"))
         self.manifest_path = self.root / "manifest.json"
         self.export_root = self.root / "canonical-export"
         self.sync_root = self.root / "synchronized-export"
         self.capsule_adapter = CodexAuthAdapter(adapter.binary, self.codex_home, adapter.timeout, canonical_registry=False)
         self._closed = False
+        self._home_identity: tuple[int, int] | None = None
         self._validate_paths()
 
     def _validate_paths(self) -> None:
-        if self.root.is_symlink():
-            raise AccountSchemaError("account capsule root must not be a symlink")
-        if self.codex_home.is_symlink():
-            raise AccountSchemaError("account capsule codex-home must not be a symlink")
+        try:
+            info = os.lstat(self.root)
+        except OSError as exc:
+            raise AccountSchemaError(f"account capsule root is missing: {self.root}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise AccountSchemaError("account capsule root must be a real directory and not a symlink")
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(self.codex_home, flags)
+        except OSError as exc:
+            raise AccountSchemaError(f"account capsule codex-home must be a real directory and not a symlink: {self.codex_home}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise AccountSchemaError("account capsule codex-home is not a directory")
+            self._home_identity = (st.st_dev, st.st_ino)
+        finally:
+            os.close(fd)
+
+    def _verify_home_identity(self) -> None:
+        if self.trusted_home is not None and hasattr(self.trusted_home, "verify"):
+            try:
+                self.trusted_home.verify()
+            except Exception as exc:
+                raise AccountSchemaError(f"trusted codex-home verification failed: {exc}") from exc
+            return
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(self.codex_home, flags)
+        except OSError as exc:
+            raise AccountSchemaError(f"cannot securely access codex-home: directory missing or replaced with symlink: {self.codex_home}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise AccountSchemaError("codex-home is not a directory")
+            if self._home_identity is not None and (st.st_dev, st.st_ino) != self._home_identity:
+                raise AccountSchemaError("codex-home directory inode was replaced")
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _matches_account_snapshot(filename: str, account_key: str, data: dict[str, Any]) -> bool:
@@ -851,12 +891,27 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         run_id: str,
         generation: int,
         root: str | Path | None = None,
-        codex_home: str | Path | None = None,
+        codex_home: str | Path | Any = None,
     ) -> "AccountCapsule":
+        trusted_home: Any = None
         if codex_home is not None:
-            target_codex_home = Path(codex_home).expanduser().resolve()
-            capsule_root = target_codex_home.parent.resolve()
-            allowed_base = capsule_root.parent.resolve()
+            if hasattr(codex_home, "verify"):
+                try:
+                    codex_home.verify()
+                except Exception as exc:
+                    raise AccountSchemaError(f"trusted codex-home verification failed: {exc}") from exc
+                trusted_home = codex_home
+                target_codex_home = Path(codex_home.path)
+            else:
+                target_codex_home = Path(codex_home)
+                try:
+                    info = os.lstat(target_codex_home)
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                        raise AccountSchemaError("target codex-home must be a real directory and not a symlink")
+                except FileNotFoundError:
+                    pass
+            capsule_root = target_codex_home.parent
+            allowed_base = capsule_root.parent
         else:
             base = Path(root or (control_plane_root() / "account-capsules")).expanduser()
             if base.exists() or base.is_symlink():
@@ -867,10 +922,10 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
             base_info = os.lstat(base)
             if stat.S_ISLNK(base_info.st_mode) or not stat.S_ISDIR(base_info.st_mode):
                 raise AccountSchemaError("account capsule root is unsafe")
-            allowed_base = base.resolve()
+            allowed_base = base
             os.chmod(allowed_base, 0o700)
-            capsule_root = (allowed_base / str(run_id).replace('/', '_')).resolve()
-            target_codex_home = (capsule_root / "codex-home").resolve()
+            capsule_root = allowed_base / str(run_id).replace('/', '_')
+            target_codex_home = capsule_root / "codex-home"
 
         if capsule_root.exists() or capsule_root.is_symlink():
             info = os.lstat(capsule_root)
@@ -892,7 +947,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         if manifest_path.exists() or auth_file.exists() or accounts_dir.exists():
             cls._recover_existing(adapter, account_key, capsule_root, allowed_base, run_id, generation, codex_home=target_codex_home)
 
-        capsule = cls(adapter, account_key, capsule_root, allowed_base, codex_home=target_codex_home)
+        capsule = cls(adapter, account_key, capsule_root, allowed_base, codex_home=target_codex_home, trusted_home=trusted_home)
         try:
             capsule._write_manifest(run_id, generation)
             capsule.export_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -910,6 +965,9 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
                         record_data = {}
                     if not cls._matches_account_snapshot(file_path.name, account_key, record_data):
                         file_path.unlink()
+
+            # Before credential injection, verify that persistent CODEX_HOME has not been replaced or tampered with
+            capsule._verify_home_identity()
 
             capsule.capsule_adapter.import_accounts(capsule.export_root)
             capsule._clean_runtime_tmp()
@@ -1004,6 +1062,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
     def synchronize(self) -> None:
         if self._closed:
             raise AccountBrokerError("account capsule is closed")
+        self._verify_home_identity()
         auth_file = self.codex_home / "auth.json"
         accounts_dir = self.codex_home / "accounts"
         registry_file = self.codex_home / "registry.json"
@@ -1033,6 +1092,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
 
     def scrub_credentials(self) -> None:
         """Scrub credential-bearing files while preserving durable Thread/session store."""
+        self._verify_home_identity()
         auth_file = self.codex_home / "auth.json"
         if auth_file.exists() or auth_file.is_symlink():
             auth_file.unlink(missing_ok=True)

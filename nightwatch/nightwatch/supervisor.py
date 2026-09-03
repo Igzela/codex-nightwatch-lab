@@ -406,7 +406,7 @@ class Supervisor:
         self.quota_provider = quota_provider or make_quota_provider()
         self.account_pool = account_pool
         if self.account_pool is not None and hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
-            self.account_pool.run_codex_home = self.store.codex_home
+            self.account_pool.run_codex_home = self.store.trusted_codex_home
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -424,9 +424,9 @@ class Supervisor:
 
     def _pool_coordinator(self) -> AccountPoolCoordinator:
         if self.account_pool is None:
-            self.account_pool = AccountPoolCoordinator(CodexAuthAdapter(), AccountLeaseBroker(), run_codex_home=self.store.codex_home)
+            self.account_pool = AccountPoolCoordinator(CodexAuthAdapter(), AccountLeaseBroker(), run_codex_home=self.store.trusted_codex_home)
         elif hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
-            self.account_pool.run_codex_home = self.store.codex_home
+            self.account_pool.run_codex_home = self.store.trusted_codex_home
         return self.account_pool
 
     def _is_auto_pool(self, state: dict[str, Any] | None = None) -> bool:
@@ -734,6 +734,7 @@ class Supervisor:
                         "selected account lease held for provider boundary",
                         lambda item: {**item, "account_lease": {"fingerprint": account_fingerprint(key), "run_id": state["run_id"], "phase": "provider"}},
                     )
+                    self.store.verify_codex_home()
                     result = run_codex(
                         self.store,
                         state["generation"],

@@ -31,9 +31,16 @@ from nightwatch.account_broker import (  # noqa: E402
     select_best_account,
 )
 from nightwatch import cli  # noqa: E402
-from nightwatch.models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State  # noqa: E402
+from nightwatch.models import (  # noqa: E402
+    ErrorKind,
+    ProviderResult,
+    QuotaSnapshot,
+    QuotaWindow,
+    State,
+    cross_account_thread_mode_for_version,
+)
 from nightwatch.quota import AppServerQuotaProvider  # noqa: E402
-from nightwatch.storage import NightwatchStore  # noqa: E402
+from nightwatch.storage import NightwatchStore, StateIntegrityError, TrustedRunHome  # noqa: E402
 from nightwatch.supervisor import Supervisor  # noqa: E402
 
 
@@ -2093,7 +2100,7 @@ elif command == 'import':
                 "FAKE_CODEX_ACCOUNT_B": b_fp,
                 "FAKE_CODEX_PLAN_FILE": str(plan),
                 "FAKE_CODEX_PROGRESS_FILE": str(progress),
-                "NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "PROVEN",
+                "NIGHTWATCH_UNSAFE_FORCE_CROSS_ACCOUNT_PROVEN": "1",
             }, clear=False):
                 store.initialize(
                     "proven-test", "goal", str(root),
@@ -2168,6 +2175,192 @@ elif command == 'import':
             with self.assertRaises(SystemExit) as ctx:
                 cli._adopt(adopt_args)
             self.assertIn("auto-pool adoption", str(ctx.exception))
+
+
+class PersistentCodexHomePathHardeningTests(unittest.TestCase):
+    @staticmethod
+    def make_auth_binary(path: Path) -> None:
+        DurableThreadStoreTests.make_auth_binary(path)
+
+    def test_run_codex_runtime_symlink_fails_before_side_effect(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-sym-rt-") as temporary:
+            repo = Path(temporary) / "repo"
+            victim = Path(temporary) / "victim"
+            victim.mkdir(mode=0o755)
+            victim_mode = os.stat(victim).st_mode
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store._ensure_directory()
+            os.symlink(victim, store.codex_runtime_path)
+            with self.assertRaises(StateIntegrityError):
+                store.ensure_codex_home()
+            self.assertEqual(os.stat(victim).st_mode, victim_mode)
+            self.assertFalse((victim / "codex-home").exists())
+            self.assertFalse((victim / "auth.json").exists())
+
+    def test_run_codex_home_symlink_fails_before_side_effect(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-sym-home-") as temporary:
+            repo = Path(temporary) / "repo"
+            victim = Path(temporary) / "victim"
+            victim.mkdir(mode=0o755)
+            victim_mode = os.stat(victim).st_mode
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store._ensure_directory()
+            store.codex_runtime_path.mkdir(mode=0o700)
+            os.symlink(victim, store.codex_home_path)
+            with self.assertRaises(StateIntegrityError):
+                store.ensure_codex_home()
+            self.assertEqual(os.stat(victim).st_mode, victim_mode)
+            self.assertFalse((victim / "auth.json").exists())
+
+    def test_run_codex_home_replacement_after_validation_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-replace-home-") as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store.initialize("run-1", "goal", str(repo))
+            home = store.ensure_codex_home()
+            trusted = store.trusted_codex_home
+            trusted.verify()
+            store.verify_codex_home()
+            # Replace home directory with new inode
+            home.rename(home.parent / "codex-home-old")
+            home.mkdir(mode=0o700)
+            with self.assertRaises(StateIntegrityError):
+                store.verify_codex_home()
+            with self.assertRaises(StateIntegrityError):
+                trusted.verify()
+
+    def test_run_codex_runtime_root_replacement_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-replace-rt-") as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store.initialize("run-1", "goal", str(repo))
+            store.ensure_codex_home()
+            trusted = store.trusted_codex_home
+            trusted.verify()
+            # Replace runtime directory with new inode
+            store.codex_runtime_path.rename(store.codex_runtime_path.parent / "runtime-old")
+            store.codex_runtime_path.mkdir(mode=0o700)
+            (store.codex_runtime_path / "codex-home").mkdir(mode=0o700)
+            with self.assertRaises(StateIntegrityError):
+                store.verify_codex_home()
+            with self.assertRaises(StateIntegrityError):
+                trusted.verify()
+
+    def test_normal_persistent_codex_home_identity_is_stable(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-stable-home-") as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store.initialize("run-1", "goal", str(repo))
+            home1 = store.ensure_codex_home()
+            id1 = store._codex_home_identity
+            store.verify_codex_home()
+            home2 = store.ensure_codex_home()
+            id2 = store._codex_home_identity
+            self.assertEqual(home1, home2)
+            self.assertEqual(id1, id2)
+            self.assertIsNotNone(id1)
+
+    def test_thread_store_survives_path_hardening(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-survives-") as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store.initialize("run-1", "goal", str(repo))
+            home = store.ensure_codex_home()
+            rollout = home / "sessions" / "2026" / "09" / "03" / "rollout-1.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("session data\n")
+            db = home / "state_5.sqlite"
+            db.write_text("sqlite data\n")
+
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {"user::a": {"account_key": "user::a", "active": True}},
+                "active": "user::a",
+            }))
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+
+            capsule = AccountCapsule.create(
+                adapter, "user::a", "run-1", 1,
+                codex_home=store.trusted_codex_home,
+            )
+            self.assertTrue(rollout.exists())
+            self.assertTrue(db.exists())
+            self.assertTrue((home / "registry.json").exists())
+            capsule.close(discard_unsynced=False)
+
+            self.assertTrue(rollout.exists())
+            self.assertEqual(rollout.read_text(), "session data\n")
+            self.assertTrue(db.exists())
+            self.assertEqual(db.read_text(), "sqlite data\n")
+            self.assertFalse((home / "registry.json").exists())
+
+    def test_credential_injection_boundary_fails_before_side_effect(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-sentinel-") as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            store = NightwatchStore(repo, state_home=Path(temporary) / "state")
+            store.initialize("run-1", "goal", str(repo))
+            store.ensure_codex_home()
+
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {"user::a": {"account_key": "user::a", "active": True}},
+                "active": "user::a",
+            }))
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+
+            injection_occurred = False
+
+            class SentinelAdapter(CodexAuthAdapter):
+                def import_accounts(self, export_dir: Path) -> None:
+                    nonlocal injection_occurred
+                    injection_occurred = True
+                    super().import_accounts(export_dir)
+
+            adapter = SentinelAdapter(binary=str(auth_bin), codex_home=canonical)
+
+            # Replace codex-home before capsule activation
+            trusted = store.trusted_codex_home
+            store.codex_home_path.rename(store.codex_home_path.parent / "home-old")
+            store.codex_home_path.mkdir(mode=0o700)
+
+            with self.assertRaises((StateIntegrityError, AccountSchemaError)):
+                AccountCapsule.create(
+                    adapter, "user::a", "run-1", 1,
+                    codex_home=trusted,
+                )
+
+            self.assertFalse(injection_occurred)
+
+    def test_cross_account_override_cannot_upgrade_unproven_version(self):
+        with patch.dict(os.environ, {"NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "PROVEN"}, clear=False):
+            self.assertEqual(cross_account_thread_mode_for_version("fake-0.1"), "INCONCLUSIVE")
+            self.assertEqual(cross_account_thread_mode_for_version(None), "INCONCLUSIVE")
+
+    def test_cross_account_override_can_downgrade_proven_version(self):
+        with patch.dict(os.environ, {"NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "UNSUPPORTED"}, clear=False):
+            self.assertEqual(cross_account_thread_mode_for_version("0.152.1"), "UNSUPPORTED")
+        with patch.dict(os.environ, {"NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "INCONCLUSIVE"}, clear=False):
+            self.assertEqual(cross_account_thread_mode_for_version("0.152.1"), "INCONCLUSIVE")
+
+    def test_cross_account_unsafe_test_seam(self):
+        with patch.dict(os.environ, {"NIGHTWATCH_UNSAFE_FORCE_CROSS_ACCOUNT_PROVEN": "1"}, clear=False):
+            self.assertEqual(cross_account_thread_mode_for_version("fake-0.1"), "PROVEN")
+            self.assertEqual(cross_account_thread_mode_for_version(None), "PROVEN")
 
 
 if __name__ == "__main__":
