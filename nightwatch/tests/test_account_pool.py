@@ -21,6 +21,7 @@ from nightwatch.account_broker import (  # noqa: E402
     AccountCapsule,
     AccountLeaseBroker,
     AccountPoolCoordinator,
+    AccountRecord,
     AccountRegistryLockBroker,
     AccountSchemaError,
     AccountUnavailable,
@@ -74,7 +75,7 @@ class AuthBinary:
         self.temporary = tempfile.TemporaryDirectory(prefix="nightwatch-auth-fake-")
         self.path = Path(self.temporary.name) / "codex-auth"
         argv_capture = f"open({str(argv_path)!r}, 'w').write(json.dumps(sys.argv[1:]))\n" if argv_path else ""
-        remove_result = [{"account_key": "user::a"}] if remove_result is None else remove_result
+        explicit_remove = remove_result is not None
         code = (
             "#!/usr/bin/env python3\n"
             "import json, sys, time\n"
@@ -85,7 +86,8 @@ class AuthBinary:
             f"payload = {payload!r}\n"
             f"remove_result = {remove_result!r}\n"
             "if sys.argv[1:2] == ['remove']:\n"
-            "    payload = {'schema_version': 1, 'command': 'remove', 'removed': remove_result}\n"
+            f"    removed_payload = remove_result if {explicit_remove!r} else [{{'account_key': sys.argv[2]}}]\n"
+            "    payload = {'schema_version': 1, 'command': 'remove', 'removed': removed_payload}\n"
             "elif sys.argv[1:2] == ['switch']:\n"
             "    payload = {'schema_version': 1, 'command': 'switch', 'switched_to': {'account_key': sys.argv[2]}}\n"
             "print(json.dumps(payload))\n"
@@ -1668,7 +1670,9 @@ elif command == 'import':
             (arg0_dir / "apply_patch").symlink_to(target)
             self.assertTrue((arg0_dir / "apply_patch").is_symlink())
             capsule.close()
-            self.assertFalse(capsule.root.exists())
+            self.assertFalse((capsule.codex_home / "tmp").exists())
+            self.assertTrue(capsule.codex_home.exists())
+            self.assertFalse((capsule.codex_home / "registry.json").exists())
 
     def test_capsule_symlinked_runtime_tmp_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="nightwatch-capsule-tmp-symlink-") as temporary:
@@ -1739,6 +1743,431 @@ elif command == 'import':
                     self.assertEqual(resolved, ["user::a"])
         finally:
             fake.close()
+
+
+class DurableThreadStoreTests(unittest.TestCase):
+    @staticmethod
+    def make_auth_binary(path: Path) -> None:
+        code = """#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+home = Path(os.environ.get('CODEX_HOME', '.'))
+registry = home / 'registry.json'
+value = json.loads(registry.read_text()) if registry.exists() else {'accounts': {}, 'active': None}
+command = sys.argv[1] if len(sys.argv) > 1 else 'list'
+if command == 'list':
+    rows = [dict(row, active=key == value.get('active')) for key, row in value['accounts'].items()]
+    if '--active' in sys.argv:
+        rows = [row for row in rows if row['active']]
+    print(json.dumps({'schema_version': 1, 'command': 'list', 'accounts': rows}))
+elif command == 'switch':
+    value['active'] = sys.argv[2]
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'switch', 'switched_to': {'account_key': sys.argv[2]}}))
+elif command == 'remove':
+    key = sys.argv[2]
+    value['accounts'].pop(key, None)
+    if value.get('active') == key:
+        value['active'] = next(iter(value['accounts']), None)
+    registry.write_text(json.dumps(value))
+    print(json.dumps({'schema_version': 1, 'command': 'remove', 'removed': [{'account_key': key}]}))
+elif command == 'export':
+    destination = Path(sys.argv[2])
+    destination.mkdir(parents=True, exist_ok=True)
+    for key, row in value['accounts'].items():
+        (destination / (key.replace('::', '--') + '.auth.json')).write_text(json.dumps(row))
+elif command == 'import':
+    for p in Path(sys.argv[2]).glob('*.auth.json'):
+        row = json.loads(p.read_text())
+        value['accounts'][row['account_key']] = row
+    registry.write_text(json.dumps(value))
+"""
+        path.write_text(code, encoding="utf-8")
+        path.chmod(0o700)
+
+    def test_run_codex_home_survives_provider_turn(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-durable-turn-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            state_home = Path(temporary) / "state"
+            store = NightwatchStore(root, state_home=state_home)
+            store.initialize("run-durable", "goal", str(root), account_mode="AUTO_POOL", authorized_accounts=["user::a"])
+
+            self.assertEqual(store.codex_home, store.directory / "codex-runtime" / "codex-home")
+            self.assertTrue(store.codex_home.exists())
+
+            sessions_dir = store.codex_home / "sessions" / "2026" / "09" / "03"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            rollout_file = sessions_dir / "rollout-THREAD-X.jsonl"
+            rollout_file.write_text('{"type": "session_meta", "id": "THREAD-X"}\n', encoding="utf-8")
+
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {"user::a": {"account_key": "user::a", "active": True}},
+                "active": "user::a",
+            }))
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+            coordinator = AccountPoolCoordinator(adapter, AccountLeaseBroker(Path(temporary) / "leases"), run_codex_home=store.codex_home)
+            with coordinator.session("user::a", "run-durable", root, 1) as runtime:
+                self.assertEqual(runtime.codex_home, store.codex_home)
+                self.assertTrue((runtime.codex_home / "registry.json").exists())
+
+            self.assertTrue(rollout_file.exists())
+            self.assertFalse((store.codex_home / "auth.json").exists())
+            self.assertFalse((store.codex_home / "registry.json").exists())
+            self.assertFalse((store.codex_home / "accounts").exists())
+
+    def test_auth_scrub_does_not_delete_thread_store(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-scrub-store-") as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {"user::a": {"account_key": "user::a", "active": True}},
+                "active": "user::a",
+            }))
+            auth_bin = root / "codex-auth"
+            self.make_auth_binary(auth_bin)
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+            capsule_root = root / "capsules"
+            capsule = AccountCapsule.create(adapter, "user::a", "run-1", 1, capsule_root)
+
+            sessions_dir = capsule.codex_home / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            (sessions_dir / "rollout.jsonl").write_text("rollout data\n")
+            (capsule.codex_home / "state_5.sqlite").write_text("sqlite data\n")
+
+            capsule.close()
+
+            self.assertTrue((capsule.codex_home / "sessions" / "rollout.jsonl").exists())
+            self.assertTrue((capsule.codex_home / "state_5.sqlite").exists())
+            self.assertFalse((capsule.codex_home / "auth.json").exists())
+            self.assertFalse((capsule.codex_home / "registry.json").exists())
+            self.assertFalse((capsule.codex_home / "accounts").exists())
+
+    def test_auto_pool_same_account_second_turn_preserves_exact_thread(self):
+        fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
+        with tempfile.TemporaryDirectory(prefix="nightwatch-same-acct-2turn-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            (root / "init.txt").write_text("hello\n")
+            subprocess.run(["git", "add", "init.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True)
+
+            state_home = Path(temporary) / "state"
+            store = NightwatchStore(root, state_home=state_home)
+
+            verifier_file = Path(temporary) / "verifier_counter.txt"
+            verifier_file.write_text("0")
+            verify_cmd = f"{sys.executable} -c \"import sys, pathlib; p = pathlib.Path({str(verifier_file)!r}); n = int(p.read_text()); p.write_text(str(n+1)); sys.exit(0 if n >= 1 else 1)\""
+
+            store.initialize(
+                "same-acct-2turn",
+                "goal requiring two turns",
+                str(root),
+                verify_commands=[verify_cmd],
+                account_mode="AUTO_POOL",
+                authorized_accounts=["user::a"],
+            )
+
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {"user::a": {"account_key": "user::a", "active": True}},
+                "active": "user::a",
+            }))
+
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+
+            class StaticQuota:
+                def __init__(self, val): self.val = val
+                def read(self): return self.val
+
+            quota_val = QuotaSnapshot("live_app_server", "now", QuotaWindow("5h", 0, 300, int(time.time())), QuotaWindow("weekly", 20, 10080, int(time.time())))
+            coordinator = AccountPoolCoordinator(
+                adapter,
+                AccountLeaseBroker(Path(temporary) / "leases"),
+                quota_factory=lambda _h, _f, _fd: StaticQuota(quota_val),
+                run_codex_home=store.codex_home,
+            )
+
+            plan = root / "plan-source.json"
+            plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "step 1"}]}))
+
+            progress = root / "progress-source.json"
+            progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
+
+            with patch.dict(os.environ, {
+                "NIGHTWATCH_CODEX_BIN": str(fake_codex),
+                "NIGHTWATCH_SKIP_AUTH_CHECK": "1",
+                "NIGHTWATCH_QUOTA_BUFFER_SECONDS": "0",
+                "FAKE_CODEX_THREAD_ID": "THREAD-EXACT-001",
+                "FAKE_CODEX_PLAN_FILE": str(plan),
+                "FAKE_CODEX_PROGRESS_FILE": str(progress),
+            }, clear=False):
+                final = Supervisor(store, account_pool=coordinator).execute(start=True)
+
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertEqual(final["thread_id"], "THREAD-EXACT-001")
+            self.assertEqual(final["current_account_key"], "user::a")
+
+            events = store.load_events()
+            provider_starts = [e for e in events if e.get("event") == "provider_started"]
+            self.assertEqual(len(provider_starts), 2)
+            self.assertEqual(provider_starts[0]["state"], State.RUNNING.value)
+            self.assertEqual(provider_starts[1]["state"], State.RUNNING.value)
+
+            codex_state = json.loads((root / ".fake-codex-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(codex_state["starts"], 1)
+            self.assertEqual(codex_state["resumes"], 1)
+            self.assertEqual(codex_state["thread_id"], "THREAD-EXACT-001")
+            self.assertIsNone(final.get("thread_handoff"))
+
+    def test_cross_account_unsupported_uses_one_controlled_handoff(self):
+        fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
+        with tempfile.TemporaryDirectory(prefix="nightwatch-handoff-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            (root / "init.txt").write_text("hello\n")
+            subprocess.run(["git", "add", "init.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True)
+
+            plan = root / "plan-source.json"
+            plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "m1"}]}))
+            progress = root / "progress-source.json"
+            progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
+
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+
+            a, b = "user::a", "user::b"
+            a_fp = account_fingerprint(a)
+            b_fp = account_fingerprint(b)
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {
+                    a: {"account_key": a, "active": True},
+                    b: {"account_key": b, "active": False},
+                },
+                "active": a,
+            }))
+
+            class StaticQuota:
+                def __init__(self, val): self.val = val
+                def read(self): return self.val
+
+            class Sequence:
+                def __init__(self): self.calls = 0
+                def __call__(self, _home, fingerprint, _fd):
+                    self.calls += 1
+                    index = (self.calls - 1) // 2
+                    key = a if fingerprint == a_fp else b
+                    if index == 0:
+                        used = (0, 20) if key == a else (30, 40)
+                    elif index == 1:
+                        used = (100, 100) if key == a else (30, 40)
+                    else:
+                        used = (100, 100) if key == a else (0, 20)
+                    reset = int(time.time())
+                    val = QuotaSnapshot("live_app_server", "now", QuotaWindow("5h", used[0], 300, reset), QuotaWindow("weekly", used[1], 10080, reset))
+                    return StaticQuota(val)
+
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+            coordinator = AccountPoolCoordinator(
+                adapter,
+                AccountLeaseBroker(Path(temporary) / "leases"),
+                quota_factory=Sequence(),
+                run_codex_home=store.codex_home,
+            )
+
+            with patch.dict(os.environ, {
+                "NIGHTWATCH_CODEX_BIN": str(fake_codex),
+                "NIGHTWATCH_SKIP_AUTH_CHECK": "1",
+                "NIGHTWATCH_QUOTA_BUFFER_SECONDS": "0",
+                "FAKE_CODEX_SCENARIO": "pool",
+                "FAKE_CODEX_ACCOUNT_A": a_fp,
+                "FAKE_CODEX_ACCOUNT_B": b_fp,
+                "FAKE_CODEX_PLAN_FILE": str(plan),
+                "FAKE_CODEX_PROGRESS_FILE": str(progress),
+                "NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "UNSUPPORTED",
+            }, clear=False):
+                store.initialize(
+                    "handoff-test", "goal", str(root),
+                    verify_commands=["test -f fake-implemented.txt", "git diff --check"],
+                    account_mode="AUTO_POOL",
+                    authorized_accounts=["user::a", "user::b"],
+                )
+                final = Supervisor(store, account_pool=coordinator).execute(start=True)
+
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertEqual(final["cross_account_thread_mode"], "UNSUPPORTED")
+            self.assertIsNotNone(final.get("thread_handoff"))
+            self.assertEqual(final["thread_handoff"]["mode"], "CONTROLLED_THREAD_HANDOFF")
+            self.assertEqual(final["thread_handoff"]["status"], "captured")
+            self.assertEqual(final["thread_handoff"]["from"], a_fp)
+            self.assertEqual(final["thread_handoff"]["to"], b_fp)
+
+    def test_cross_account_proven_preserves_exact_thread(self):
+        fake_codex = PRODUCT.parent / "test-artifacts" / "fake-codex" / "fake_codex.py"
+        with tempfile.TemporaryDirectory(prefix="nightwatch-proven-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            (root / "init.txt").write_text("hello\n")
+            subprocess.run(["git", "add", "init.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True)
+
+            plan = root / "plan-source.json"
+            plan.write_text(json.dumps({"milestones": [{"id": "M1", "title": "m1"}]}))
+            progress = root / "progress-source.json"
+            progress.write_text(json.dumps({"milestones": [{"id": "M1", "status": "implemented"}]}))
+
+            store = NightwatchStore(root, state_home=Path(temporary) / "state")
+
+            a, b = "user::a", "user::b"
+            a_fp = account_fingerprint(a)
+            b_fp = account_fingerprint(b)
+            canonical = Path(temporary) / "canonical"
+            canonical.mkdir(mode=0o700)
+            (canonical / "registry.json").write_text(json.dumps({
+                "accounts": {
+                    a: {"account_key": a, "active": True},
+                    b: {"account_key": b, "active": False},
+                },
+                "active": a,
+            }))
+
+            class StaticQuota:
+                def __init__(self, val): self.val = val
+                def read(self): return self.val
+
+            class Sequence:
+                def __init__(self): self.calls = 0
+                def __call__(self, _home, fingerprint, _fd):
+                    self.calls += 1
+                    index = (self.calls - 1) // 2
+                    key = a if fingerprint == a_fp else b
+                    if index == 0:
+                        used = (0, 20) if key == a else (30, 40)
+                    elif index == 1:
+                        used = (100, 100) if key == a else (30, 40)
+                    else:
+                        used = (100, 100) if key == a else (0, 20)
+                    reset = int(time.time())
+                    val = QuotaSnapshot("live_app_server", "now", QuotaWindow("5h", used[0], 300, reset), QuotaWindow("weekly", used[1], 10080, reset))
+                    return StaticQuota(val)
+
+            auth_bin = Path(temporary) / "codex-auth"
+            self.make_auth_binary(auth_bin)
+            adapter = CodexAuthAdapter(binary=str(auth_bin), codex_home=canonical)
+            coordinator = AccountPoolCoordinator(
+                adapter,
+                AccountLeaseBroker(Path(temporary) / "leases"),
+                quota_factory=Sequence(),
+                run_codex_home=store.codex_home,
+            )
+
+            with patch.dict(os.environ, {
+                "NIGHTWATCH_CODEX_BIN": str(fake_codex),
+                "NIGHTWATCH_SKIP_AUTH_CHECK": "1",
+                "NIGHTWATCH_QUOTA_BUFFER_SECONDS": "0",
+                "FAKE_CODEX_SCENARIO": "pool",
+                "FAKE_CODEX_ACCOUNT_A": a_fp,
+                "FAKE_CODEX_ACCOUNT_B": b_fp,
+                "FAKE_CODEX_PLAN_FILE": str(plan),
+                "FAKE_CODEX_PROGRESS_FILE": str(progress),
+                "NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE": "PROVEN",
+            }, clear=False):
+                store.initialize(
+                    "proven-test", "goal", str(root),
+                    verify_commands=["test -f fake-implemented.txt", "git diff --check"],
+                    account_mode="AUTO_POOL",
+                    authorized_accounts=["user::a", "user::b"],
+                )
+                final = Supervisor(store, account_pool=coordinator).execute(start=True)
+
+            self.assertEqual(final["state"], State.DONE.value)
+            self.assertEqual(final["cross_account_thread_mode"], "PROVEN")
+            self.assertIsNone(final.get("thread_handoff"))
+            self.assertEqual(final["thread_id"], "POOL-1")
+            self.assertEqual(final["current_account_key"], b)
+
+            codex_state = json.loads((root / ".fake-codex-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(codex_state["starts"], 1)
+            self.assertEqual(codex_state["resumes"], 2)
+            self.assertEqual(codex_state["thread_id"], "POOL-1")
+
+    def test_multi_run_thread_store_isolation(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-iso-") as temporary:
+            repo_a = Path(temporary) / "repo_a"
+            repo_b = Path(temporary) / "repo_b"
+            repo_a.mkdir()
+            repo_b.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo_a, check=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo_b, check=True)
+
+            state_home = Path(temporary) / "state"
+            store_a = NightwatchStore(repo_a, state_home=state_home)
+            store_b = NightwatchStore(repo_b, state_home=state_home)
+
+            store_a.initialize("run-a", "goal a", str(repo_a), account_mode="AUTO_POOL")
+            store_b.initialize("run-b", "goal b", str(repo_b), account_mode="AUTO_POOL")
+
+            self.assertNotEqual(store_a.codex_home, store_b.codex_home)
+            self.assertTrue(store_a.codex_home.is_relative_to(store_a.directory))
+            self.assertTrue(store_b.codex_home.is_relative_to(store_b.directory))
+
+            (store_a.codex_home / "sessions").mkdir(parents=True, exist_ok=True)
+            (store_a.codex_home / "sessions" / "rollout-a.jsonl").write_text("data a")
+
+            self.assertFalse((store_b.codex_home / "sessions" / "rollout-a.jsonl").exists())
+
+    def test_auto_pool_adoption_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="nightwatch-adopt-rej-") as temporary:
+            root = Path(temporary) / "repo"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+
+            from nightwatch.operations import RunSpec, adopt_run
+            spec = RunSpec(
+                root, "adopt goal", None, None, (), "THREAD-001",
+                account_mode="AUTO_POOL",
+                account_selectors=("user::a",),
+            )
+            result = adopt_run(spec)
+            self.assertFalse(result.ok)
+            self.assertIn("AUTO_POOL adoption of existing interactive threads is not supported", result.message)
+
+            args = cli._parser().parse_args([
+                "run", "goal", "--thread", "THREAD-001", "--account-mode", "auto-pool", "--account", "user::a", "--repo", str(root)
+            ])
+            with self.assertRaises(SystemExit) as ctx:
+                cli._run(args)
+            self.assertIn("auto-pool adoption", str(ctx.exception))
+
+            adopt_args = cli._parser().parse_args([
+                "adopt", "--thread", "THREAD-001", "--account-mode", "auto-pool", "--account", "user::a", "--repo", str(root)
+            ])
+            with self.assertRaises(SystemExit) as ctx:
+                cli._adopt(adopt_args)
+            self.assertIn("auto-pool adoption", str(ctx.exception))
 
 
 if __name__ == "__main__":

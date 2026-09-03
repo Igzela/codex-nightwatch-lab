@@ -70,3 +70,19 @@ safe version-bound real experiment proves it. The implemented fallback is a
 trusted goal, policy, repository/Git HEAD, and milestone facts, retaining the
 prior thread only for audit. The fake E2E proves A→B→wait→A rotation and both
 5h/weekly governing behavior without claiming exact-thread continuity.
+
+## 0.4.0 Durable Thread Store & Ephemeral Auth Hardening
+
+A critical architecture refinement resolved a P1 release blocker where destroying
+ephemeral per-account capsules wiped out `$CODEX_HOME/sessions`, eliminating local
+session rollout files and causing official Codex to fail with `no rollout found for
+thread id` on multi-turn and cross-account resumes.
+
+Under the hardened architecture:
+1. **Persistent Run CODEX_HOME**: `NightwatchStore.codex_home` (`~/.local/state/codex-nightwatch/<repo_id>/codex-runtime/codex-home/`, mode `0700`) persists across all provider turns, supervisor restarts, and account handoffs within the run.
+2. **Durable Thread Store**: Local Codex session state (`sessions/` rollouts and SQLite databases) remains intact in the persistent run `codex_home`.
+3. **Ephemeral Leased Auth**: `AccountCapsule` manages credential material (`auth.json`, `registry.json`, `accounts/`) strictly within the active account lease window. Single-account staging pruning strips all foreign accounts before import.
+4. **Credential Scrubbing**: Upon turn completion, crash, or account rotation, credential material is scrubbed from the run `codex_home` while strictly preserving the durable Thread Store.
+5. **Adoption Protection**: `AUTO_POOL` mode explicitly rejects `--thread` and `adopt` to prevent session collision and foreign credential leakage.
+6. **Exact-Thread Cross-Account Portability**: Proven empirically with official `codex-cli 0.152.1` in Section 12 (Account A -> Account B -> Account A exact resume). For proven Codex versions (`0.152.1`), `cross_account_thread_mode` resolves to `PROVEN` and uses `codex exec resume <thread_id> -`. For unproven or inconclusive versions, Nightwatch safely falls back to `CONTROLLED_THREAD_HANDOFF`.
+

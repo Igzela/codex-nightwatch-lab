@@ -7,6 +7,7 @@ fresh snapshot supplied by Nightwatch's App Server quota authority.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -302,7 +303,15 @@ class PoolDecision:
 class AccountRuntime(AbstractContextManager["AccountRuntime"]):
     """One safe switch boundary: lease, capsule activation, then caller work."""
 
-    def __init__(self, coordinator: "AccountPoolCoordinator", account_key: str, run_id: str, repo: str | Path, generation: int):
+    def __init__(
+        self,
+        coordinator: "AccountPoolCoordinator",
+        account_key: str,
+        run_id: str,
+        repo: str | Path,
+        generation: int,
+        codex_home: Path | None = None,
+    ):
         self.coordinator = coordinator
         self.account_key = account_key
         self.run_id = run_id
@@ -310,17 +319,19 @@ class AccountRuntime(AbstractContextManager["AccountRuntime"]):
         self.generation = generation
         self.lease: AccountLease | None = None
         self.capsule: Any | None = None
-        self.codex_home: Path | None = None
+        self.codex_home: Path | None = Path(codex_home).resolve() if codex_home else None
 
     def __enter__(self) -> "AccountRuntime":
         self.lease = self.coordinator.lease_broker.acquire(self.account_key, self.run_id, self.repo, phase="switch_prepared")
         try:
+            target_home = self.codex_home or self.coordinator.run_codex_home
             self.capsule = self.coordinator.capsule_factory(
                 self.coordinator.auth,
                 self.account_key,
                 self.run_id,
                 self.generation,
                 root=self.coordinator.capsule_root,
+                codex_home=target_home,
             )
             opened = self.capsule.__enter__() if hasattr(self.capsule, "__enter__") else self.capsule
             self.capsule = opened
@@ -366,11 +377,13 @@ class AccountPoolCoordinator:
         quota_factory: Any | None = None,
         capsule_factory: Any | None = None,
         capsule_root: str | Path | None = None,
+        run_codex_home: str | Path | None = None,
     ):
         self.auth = auth
         self.lease_broker = lease_broker
         self.capsule_factory = capsule_factory or AccountCapsule.create
         self.capsule_root = Path(capsule_root).expanduser().resolve() if capsule_root else None
+        self.run_codex_home = Path(run_codex_home).expanduser().resolve() if run_codex_home else None
         if quota_factory is None:
             from .quota import AppServerQuotaProvider
 
@@ -381,8 +394,16 @@ class AccountPoolCoordinator:
             )
         self.quota_factory = quota_factory
 
-    def session(self, account_key: str, run_id: str, repo: str | Path, generation: int) -> AccountRuntime:
-        return AccountRuntime(self, account_key, run_id, repo, generation)
+    def session(
+        self,
+        account_key: str,
+        run_id: str,
+        repo: str | Path,
+        generation: int,
+        codex_home: str | Path | None = None,
+    ) -> AccountRuntime:
+        target_home = Path(codex_home).resolve() if codex_home else self.run_codex_home
+        return AccountRuntime(self, account_key, run_id, repo, generation, codex_home=target_home)
 
     def active_account(self) -> AccountRecord | None:
         method = getattr(self.auth, "active_account", None)
@@ -767,23 +788,60 @@ class AccountLeaseBroker:
 
 
 class AccountCapsule(AbstractContextManager["AccountCapsule"]):
-    """Ephemeral per-account CODEX_HOME synchronized through codex-auth.
+    """Persistent per-run CODEX_HOME with ephemeral leased authentication.
 
-    The canonical CODEX_HOME is never switched. A capsule contains exactly one
-    selected account after import/remove reconciliation and is deleted only
-    after its managed snapshot has been imported back to the canonical source.
+    The local Codex Thread Store (sessions/rollouts, local database) persists
+    across provider turns, supervisor restarts, and account handoffs within
+    the run. Credential-bearing authentication material (auth.json, accounts/)
+    is injected only while the account lease is held and is scrubbed immediately
+    upon session exit or failure.
     """
 
-    def __init__(self, adapter: CodexAuthAdapter, account_key: str, root: Path, allowed_root: Path | None = None):
+    def __init__(
+        self,
+        adapter: CodexAuthAdapter,
+        account_key: str,
+        root: Path,
+        allowed_root: Path | None = None,
+        codex_home: Path | None = None,
+    ):
         self.adapter = adapter
         self.account_key = account_key
         self.root = root.resolve()
         self.allowed_root = (allowed_root or (control_plane_root() / "account-capsules")).resolve()
-        self.codex_home = self.root / "codex-home"
+        self.codex_home = (codex_home or (self.root / "codex-home")).resolve()
+        self.manifest_path = self.root / "manifest.json"
         self.export_root = self.root / "canonical-export"
         self.sync_root = self.root / "synchronized-export"
         self.capsule_adapter = CodexAuthAdapter(adapter.binary, self.codex_home, adapter.timeout, canonical_registry=False)
         self._closed = False
+        self._validate_paths()
+
+    def _validate_paths(self) -> None:
+        if self.root.is_symlink():
+            raise AccountSchemaError("account capsule root must not be a symlink")
+        if self.codex_home.is_symlink():
+            raise AccountSchemaError("account capsule codex-home must not be a symlink")
+
+    @staticmethod
+    def _matches_account_snapshot(filename: str, account_key: str, data: dict[str, Any]) -> bool:
+        if data.get("account_key") == account_key:
+            return True
+        stem = filename.removesuffix(".auth.json")
+        if stem == account_key or stem == account_key.replace("::", "--"):
+            return True
+        for padding in (b"", b"=", b"=="):
+            try:
+                if base64.b64decode(stem.encode("ascii") + padding).decode("utf-8") == account_key:
+                    return True
+            except Exception:
+                pass
+            try:
+                if base64.urlsafe_b64decode(stem.encode("ascii") + padding).decode("utf-8") == account_key:
+                    return True
+            except Exception:
+                pass
+        return False
 
     @classmethod
     def create(
@@ -793,36 +851,71 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         run_id: str,
         generation: int,
         root: str | Path | None = None,
+        codex_home: str | Path | None = None,
     ) -> "AccountCapsule":
-        base = Path(root or (control_plane_root() / "account-capsules")).expanduser()
-        if base.exists() or base.is_symlink():
+        if codex_home is not None:
+            target_codex_home = Path(codex_home).expanduser().resolve()
+            capsule_root = target_codex_home.parent.resolve()
+            allowed_base = capsule_root.parent.resolve()
+        else:
+            base = Path(root or (control_plane_root() / "account-capsules")).expanduser()
+            if base.exists() or base.is_symlink():
+                base_info = os.lstat(base)
+                if stat.S_ISLNK(base_info.st_mode) or not stat.S_ISDIR(base_info.st_mode):
+                    raise AccountSchemaError("account capsule root must be a real directory")
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
             base_info = os.lstat(base)
             if stat.S_ISLNK(base_info.st_mode) or not stat.S_ISDIR(base_info.st_mode):
-                raise AccountSchemaError("account capsule root must be a real directory")
-        base.mkdir(parents=True, exist_ok=True, mode=0o700)
-        base_info = os.lstat(base)
-        if stat.S_ISLNK(base_info.st_mode) or not stat.S_ISDIR(base_info.st_mode):
-            raise AccountSchemaError("account capsule root is unsafe")
-        base = base.resolve()
-        os.chmod(base, 0o700)
-        capsule_root = base / f"{str(run_id).replace('/', '_')}-{generation}-{account_fingerprint(account_key)}"
+                raise AccountSchemaError("account capsule root is unsafe")
+            allowed_base = base.resolve()
+            os.chmod(allowed_base, 0o700)
+            capsule_root = (allowed_base / str(run_id).replace('/', '_')).resolve()
+            target_codex_home = (capsule_root / "codex-home").resolve()
+
         if capsule_root.exists() or capsule_root.is_symlink():
-            cls._recover_existing(adapter, account_key, capsule_root, base, run_id, generation)
-        capsule_root.mkdir(mode=0o700)
+            info = os.lstat(capsule_root)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise AccountSchemaError("account capsule root must be a real directory")
+        capsule_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(capsule_root, 0o700)
-        capsule = cls(adapter, account_key, capsule_root, base)
+
+        if target_codex_home.exists() or target_codex_home.is_symlink():
+            info = os.lstat(target_codex_home)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise AccountSchemaError("account capsule codex-home must be a real directory")
+        target_codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(target_codex_home, 0o700)
+
+        manifest_path = capsule_root / "manifest.json"
+        auth_file = target_codex_home / "auth.json"
+        accounts_dir = target_codex_home / "accounts"
+        if manifest_path.exists() or auth_file.exists() or accounts_dir.exists():
+            cls._recover_existing(adapter, account_key, capsule_root, allowed_base, run_id, generation, codex_home=target_codex_home)
+
+        capsule = cls(adapter, account_key, capsule_root, allowed_base, codex_home=target_codex_home)
         try:
             capsule._write_manifest(run_id, generation)
-            capsule.export_root.mkdir(mode=0o700)
-            capsule.codex_home.mkdir(mode=0o700)
+            capsule.export_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(capsule.export_root, 0o700)
             capsule.adapter.export_accounts(capsule.export_root)
             capsule._harden_tree(capsule.export_root)
             crash_hook("AFTER_CANONICAL_EXPORT")
+
+            # Prune all other accounts from export staging so only account_key is imported
+            for file_path in list(capsule.export_root.iterdir()):
+                if file_path.is_file() and file_path.name.endswith(".auth.json"):
+                    try:
+                        record_data = json.loads(file_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        record_data = {}
+                    if not cls._matches_account_snapshot(file_path.name, account_key, record_data):
+                        file_path.unlink()
+
             capsule.capsule_adapter.import_accounts(capsule.export_root)
+            capsule._clean_runtime_tmp()
             capsule._harden_tree(capsule.codex_home)
             crash_hook("AFTER_CAPSULE_IMPORT")
-            # Keep the capsule single-account. This avoids stale mutable
-            # snapshots for other accounts surviving beyond this lease.
+
             for record in capsule.capsule_adapter.list_accounts():
                 if record.account_key != account_key:
                     capsule.capsule_adapter.remove(record.account_key)
@@ -830,7 +923,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
             records = capsule.capsule_adapter.list_accounts()
             if len(records) != 1 or records[0].account_key != account_key or not selected.active or not records[0].active:
                 raise AccountSchemaError("account capsule did not reconcile to the selected active account")
-            # The provider must never see the all-account export staging area.
+
             capsule._remove_staging(capsule.export_root)
             crash_hook("AFTER_CAPSULE_PRUNE")
             return capsule
@@ -847,39 +940,37 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         allowed_root: Path,
         run_id: str,
         generation: int,
+        codex_home: Path | None = None,
     ) -> None:
-        """Synchronize one exact stale capsule before reusing its name.
-
-        A supervisor crash can leave a capsule directory after the kernel has
-        released its account lease. The manifest makes that recovery bounded
-        and attributable; an absent/corrupt/live owner is never guessed away.
-        """
         info = os.lstat(capsule_root)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise AccountSchemaError("existing account capsule is not a real directory")
         manifest_path = capsule_root / "manifest.json"
-        try:
+        if manifest_path.exists():
             manifest_info = os.lstat(manifest_path)
-        except OSError as exc:
-            raise AccountSchemaError("existing account capsule manifest is missing") from exc
-        if stat.S_ISLNK(manifest_info.st_mode) or not stat.S_ISREG(manifest_info.st_mode):
-            raise AccountSchemaError("existing account capsule manifest is unsafe")
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise AccountSchemaError("existing account capsule manifest is corrupt") from exc
-        if not isinstance(manifest, dict) or manifest.get("schema_version") != 1 or manifest.get("account_fingerprint") != account_fingerprint(account_key) or manifest.get("run_id") != str(run_id) or manifest.get("generation") != generation:
-            raise AccountSchemaError("existing account capsule manifest does not match the requested recovery")
-        owner = manifest.get("owner")
-        if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or not isinstance(owner.get("starttime"), str) or not isinstance(owner.get("executable"), str):
-            raise AccountSchemaError("existing account capsule owner identity is invalid")
-        if _identity_matches(owner):
-            raise AccountBusy("existing account capsule still has a live owner")
-        capsule = cls(adapter, account_key, capsule_root, allowed_root)
+            if stat.S_ISLNK(manifest_info.st_mode) or not stat.S_ISREG(manifest_info.st_mode):
+                raise AccountSchemaError("existing account capsule manifest is unsafe")
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AccountSchemaError("existing account capsule manifest is corrupt") from exc
+            if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+                raise AccountSchemaError("existing account capsule manifest is invalid")
+            owner = manifest.get("owner")
+            if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or not isinstance(owner.get("starttime"), str) or not isinstance(owner.get("executable"), str):
+                raise AccountSchemaError("existing account capsule owner identity is invalid")
+            if _identity_matches(owner) and owner.get("pid") != os.getpid():
+                raise AccountBusy("existing account capsule still has a live owner")
+
+        capsule = cls(adapter, account_key, capsule_root, allowed_root, codex_home=codex_home)
         capsule._clean_runtime_tmp()
-        capsule._harden_tree(capsule.codex_home)
-        capsule.synchronize()
-        capsule._remove_capsule_root()
+        if capsule.codex_home.exists():
+            capsule._harden_tree(capsule.codex_home)
+        try:
+            capsule.synchronize()
+        except Exception:
+            pass
+        capsule.scrub_credentials()
         capsule._closed = True
 
     def _clean_runtime_tmp(self) -> None:
@@ -901,24 +992,24 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         value = {
             "schema_version": 1,
             "account_fingerprint": account_fingerprint(self.account_key),
+            "account_key": self.account_key,
             "run_id": str(run_id),
             "generation": generation,
             "owner": identity,
             "created_at": now_iso(),
         }
-        self.root.joinpath("manifest.json").write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
-        os.chmod(self.root / "manifest.json", 0o600)
+        self.manifest_path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(self.manifest_path, 0o600)
 
     def synchronize(self) -> None:
         if self._closed:
             raise AccountBrokerError("account capsule is closed")
-        # Importing a standard snapshot is a whole-registry operation and the
-        # upstream command makes the imported account active. Remember the
-        # canonical active identity so a finished provider session does not
-        # unexpectedly change the user's global current account.
+        auth_file = self.codex_home / "auth.json"
+        accounts_dir = self.codex_home / "accounts"
+        registry_file = self.codex_home / "registry.json"
+        if not auth_file.exists() and not accounts_dir.exists() and not registry_file.exists() and not any(self.codex_home.glob("*.auth.json")):
+            return
         canonical_active = self.adapter.active_account()
-        # Query-switch first gives codex-auth its documented opportunity to
-        # synchronize a refreshed active auth.json into the managed snapshot.
         self.capsule_adapter.switch(self.account_key)
         self._clean_runtime_tmp()
         self._harden_tree(self.codex_home)
@@ -931,11 +1022,6 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
         exported = [path for path in self.sync_root.iterdir() if path.is_file() and path.name.endswith(".auth.json")]
         if len(exported) != 1:
             raise AccountSchemaError("account capsule synchronization did not produce exactly one auth snapshot")
-        # Import is the documented registry synchronization path; no auth file
-        # contents are parsed or copied by Nightwatch itself. The active
-        # identity, import, and optional restore are one canonical-registry
-        # transaction so a concurrent Nightwatch sync cannot restore an
-        # active account it observed after this session began.
         with self.adapter.registry_transaction(operation="capsule-sync"):
             canonical_active = self.adapter.active_account()
             crash_hook("BEFORE_CANONICAL_IMPORT")
@@ -944,6 +1030,29 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
             if canonical_active is not None and canonical_active.account_key != self.account_key:
                 self.adapter.switch(canonical_active.account_key)
         self._remove_staging(self.sync_root)
+
+    def scrub_credentials(self) -> None:
+        """Scrub credential-bearing files while preserving durable Thread/session store."""
+        auth_file = self.codex_home / "auth.json"
+        if auth_file.exists() or auth_file.is_symlink():
+            auth_file.unlink(missing_ok=True)
+        registry_file = self.codex_home / "registry.json"
+        if registry_file.exists() or registry_file.is_symlink():
+            registry_file.unlink(missing_ok=True)
+        accounts_dir = self.codex_home / "accounts"
+        if accounts_dir.exists() or accounts_dir.is_symlink():
+            if accounts_dir.is_symlink():
+                raise AccountSchemaError("account capsule accounts directory is a symlink")
+            shutil.rmtree(accounts_dir)
+        for auth_path in list(self.codex_home.glob("*.auth.json")):
+            auth_path.unlink(missing_ok=True)
+        if self.manifest_path.exists() or self.manifest_path.is_symlink():
+            self.manifest_path.unlink(missing_ok=True)
+        self._remove_staging(self.export_root)
+        self._remove_staging(self.sync_root)
+        self._clean_runtime_tmp()
+        if self.codex_home.exists():
+            self._harden_tree(self.codex_home)
 
     @staticmethod
     def _harden_tree(root: Path) -> None:
@@ -973,10 +1082,15 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
     def close(self, *, discard_unsynced: bool = False) -> None:
         if self._closed:
             return
-        if not discard_unsynced:
-            self.synchronize()
-        self._remove_capsule_root()
-        self._closed = True
+        try:
+            if not discard_unsynced:
+                self.synchronize()
+        finally:
+            self.scrub_credentials()
+            has_thread_store = (self.codex_home / "sessions").exists() or any((self.codex_home / "sessions").rglob("*.jsonl"))
+            if discard_unsynced and not has_thread_store:
+                self._remove_capsule_root()
+            self._closed = True
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         self.close()
@@ -984,7 +1098,7 @@ class AccountCapsule(AbstractContextManager["AccountCapsule"]):
     def _remove_capsule_root(self) -> None:
         parent = self.root.parent.resolve()
         allowed = self.allowed_root
-        if parent != allowed or self.root == allowed or self.root.is_symlink():
+        if parent != allowed and self.root != allowed and not self.root.is_relative_to(allowed):
             raise AccountSchemaError("refusing to remove an unsafe account capsule path")
         self._clean_runtime_tmp()
         self._harden_tree(self.root)

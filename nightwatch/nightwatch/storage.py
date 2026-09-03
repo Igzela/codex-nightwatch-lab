@@ -131,6 +131,28 @@ class NightwatchStore:
         self.reports_path = self.directory / "reports"
         self.lock_path = self.directory / "state.lock"
         self.supervisor_lock_path = self.directory / "supervisor.lock"
+        self.codex_runtime_path = self.directory / "codex-runtime"
+        self.codex_home_path = self.codex_runtime_path / "codex-home"
+
+    @property
+    def codex_home(self) -> Path:
+        return self.codex_home_path
+
+    def ensure_codex_home(self) -> Path:
+        self._ensure_directory()
+        if self.codex_runtime_path.exists() or self.codex_runtime_path.is_symlink():
+            info = os.lstat(self.codex_runtime_path)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise StateIntegrityError("codex runtime root must be a real directory")
+        self.codex_runtime_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.codex_runtime_path, 0o700)
+        if self.codex_home_path.exists() or self.codex_home_path.is_symlink():
+            info = os.lstat(self.codex_home_path)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise StateIntegrityError("codex home path must be a real directory")
+        self.codex_home_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.codex_home_path, 0o700)
+        return self.codex_home_path
 
     def exists(self) -> bool:
         return self.state_path.exists()
@@ -196,6 +218,14 @@ class NightwatchStore:
             raise StateIntegrityError(f"unsupported account mode: {account_mode}")
         state["account_mode"] = account_mode
         state["authorized_accounts"] = list(authorized_accounts or [])
+        if account_mode == "AUTO_POOL":
+            from .models import cross_account_thread_mode_for_version
+            thread_mode = cross_account_thread_mode_for_version(None)
+            state["cross_account_thread_mode"] = thread_mode
+            state["cross_account_thread_capability"] = {
+                "codex_version": None,
+                "mode": thread_mode,
+            }
         if thread_id:
             state["thread_id"] = thread_id
         profile = "default" if commands else "none"
@@ -210,6 +240,7 @@ class NightwatchStore:
             try:
                 self.runs_path.mkdir(mode=0o700)
                 self.reports_path.mkdir(mode=0o700)
+                self.ensure_codex_home()
                 self._clear_mailbox_run_outputs_at(mailbox_fd)
                 self._write_json_at(mailbox_fd, "context.json", {"goal_hash": acceptance["goal_hash"], "mailbox_contract": "untrusted-input-only"})
             finally:
@@ -356,6 +387,10 @@ class NightwatchStore:
         os.chmod(self.root, 0o700)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
+        self.codex_runtime_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.codex_runtime_path, 0o700)
+        self.codex_home_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.codex_home_path, 0o700)
 
     def _assert_control_plane_outside_workspace(self) -> None:
         self._assert_path_outside_workspace(self.root)

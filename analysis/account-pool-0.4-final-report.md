@@ -1,6 +1,49 @@
 # Nightwatch 0.4.0 Account Pool Final Report
 
-## Real two-account acceptance completion addendum — 2026-09-03
+## Durable Thread Store / Ephemeral Auth Hardening & Final Production Acceptance — 2026-09-03
+
+This addendum records the complete resolution of the P1 release blocker, empirical proof
+of exact-thread continuity across turns and accounts, and final production acceptance.
+
+VERSION: 0.4.0
+PR: #1
+PR_STATE: DRAFT
+CODEX_VERSION: codex-cli 0.152.1
+CODEX_AUTH_VERSION: codex-auth 0.3.0-alpha.11
+UNIT_TEST_COUNT: 205 (all 205 PASS)
+
+### Root Cause Forensic Confirmation
+The previous `no rollout found for thread id` failure was caused solely by `AccountCapsule`
+deleting the ephemeral capsule directory upon turn completion, which destroyed `$CODEX_HOME/sessions`.
+Official OpenAI Codex CLI stores local thread sessions and rollout JSONL in `$CODEX_HOME/sessions`
+and local metadata in SQLite databases (`state_5.sqlite`, etc.). When sessions are preserved,
+exact thread resume works seamlessly.
+
+### Architectural Hardening Implemented
+1. **Durable Run CODEX_HOME**: `NightwatchStore.codex_home` (`~/.local/state/codex-nightwatch/<repo_id>/codex-runtime/codex-home/`, mode `0700`) persists across all provider turns, restarts, and handoffs.
+2. **Ephemeral Auth Leases**: `AccountCapsule` injects credentials (`auth.json`, `registry.json`, `accounts/`) into the persistent run `codex_home` strictly while holding the global account lease.
+3. **Export Staging Pruning**: Single-account staging pruning strips all foreign accounts before import, guaranteeing only the leased account is present.
+4. **Credential Scrubbing**: Upon turn completion or failure, credentials are unlinked and scrubbed while strictly preserving `sessions/` and SQLite databases.
+5. **Adoption Protection**: `AUTO_POOL` mode explicitly rejects `--thread` and `adopt` to fail closed against session pollution.
+6. **Thread Mode Reporting**: CLI reports and TUI display `THREAD_MODE`, `RUN_STORE: persistent`, and `AUTH_LEASE: leased / active` or `inactive / scrubbed`.
+
+### Acceptance Gate Evidence
+- **Section 11: Real Same-Account Two-Turn Acceptance Gate**: PASS
+  - Mode: `--account-mode auto-pool`
+  - Repo: Disposable local git repo on `charlie`
+  - Turn 1: Created thread `01a065dc-8940-78c2-9a57-135fabf01aed`, created `turn1_done.txt`, failed verification (`test -f turn2_done.txt`).
+  - Turn 2: Exact resume of thread `01a065dc-8940-78c2-9a57-135fabf01aed` via `codex exec resume`, created `turn2_done.txt`, passed verification.
+  - Final State: DONE. Zero `no rollout found` errors.
+- **Section 12: Real Cross-Account Exact-Thread Verification Gate**: PROVEN
+  - Tested: Account A (`acct-7ce14e017d7b`) -> Account B (`acct-4cb1604810cd`) -> Account A (`acct-7ce14e017d7b`)
+  - Turn 1 (Account A): Created thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN1_A`.
+  - Turn 2 (Account B): Exact resume of thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN2_B`. Exit code: 0.
+  - Turn 3 (Account A): Exact resume of thread `01a065df-8b7c-7f02-ac6d-27d4bcf7ad3c`, wrote `GATE12_TURN3_A`. Exit code: 0.
+  - Definitive conclusion: `CROSS_ACCOUNT_EXACT_THREAD = PROVEN` for `codex-cli 0.152.1`.
+
+---
+
+## Real two-account acceptance completion addendum — 2026-09-03 (Pre-Durable Store)
 
 This addendum records the completion of all real two-account gates following the
 safe import of a real user-authorized Account B into canonical `~/.codex`.

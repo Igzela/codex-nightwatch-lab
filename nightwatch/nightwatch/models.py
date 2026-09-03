@@ -2,13 +2,45 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import os
 import re
+import shutil
+import subprocess
 from typing import Any
 
 
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _REASONING_EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 ACCOUNT_MODES = {"CURRENT_ONLY", "AUTO_POOL"}
+PROVEN_CROSS_ACCOUNT_CODEX_VERSIONS = frozenset({"0.152.1"})
+
+
+def installed_codex_version(binary: str | None = None) -> str | None:
+    bin_path = binary or os.environ.get("NIGHTWATCH_CODEX_BIN") or shutil.which("codex") or "codex"
+    try:
+        result = subprocess.run(
+            [bin_path, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def cross_account_thread_mode_for_version(version: str | None) -> str:
+    override = os.environ.get("NIGHTWATCH_CROSS_ACCOUNT_THREAD_MODE")
+    if override in {"PROVEN", "UNSUPPORTED", "INCONCLUSIVE", "UNKNOWN"}:
+        return override
+    if version:
+        clean_version = version.split()[-1].strip()
+        if clean_version in PROVEN_CROSS_ACCOUNT_CODEX_VERSIONS or version in PROVEN_CROSS_ACCOUNT_CODEX_VERSIONS:
+            return "PROVEN"
+    return "INCONCLUSIVE"
 
 
 def validate_model_name(value: str) -> str:
@@ -191,6 +223,7 @@ def empty_state(
         "account_errors": {},
         "last_switch_reason": None,
         "cross_account_thread_mode": "INCONCLUSIVE",
+        "cross_account_thread_capability": None,
         "thread_handoff": None,
     }
 

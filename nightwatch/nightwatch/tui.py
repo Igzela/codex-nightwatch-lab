@@ -1211,6 +1211,12 @@ def status_run(run: RunRecord) -> str:
     progress = plan_progress(run.plan)
     current = next((item for item in run.plan["milestones"] if item.get("status") != "verified"), None)
     latest = run.events[-1] if run.events else {}
+    handoff = state.get("thread_handoff")
+    if isinstance(handoff, dict) and handoff.get("status") in {"prepared", "captured"}:
+        prior = (handoff.get("packet") or {}).get("prior_thread_id") or handoff.get("prior_thread_id") or "none"
+        thread_mode = f"CONTROLLED HANDOFF (prior {prior})"
+    else:
+        thread_mode = "EXACT"
     thread_label = run.thread_id or ("First launch deferred — no Codex thread created yet" if state.get("state") == State.WAIT_QUOTA.value else "Creating/capturing exact thread")
     lines = [
         f"STATUS · {state['state']}",
@@ -1218,6 +1224,9 @@ def status_run(run: RunRecord) -> str:
         f"Repository  {run.repo}",
         f"Run         {state.get('run_id')}",
         f"Thread      {thread_label}",
+        f"Thread Mode {thread_mode}",
+        f"Run Store   persistent",
+        f"Auth Lease  {'leased / active' if state.get('account_lease') else 'inactive / scrubbed'}",
         f"Generation  {state.get('generation')} · quota cycles {state.get('quota_cycles', 0)} · recovery failures {state.get('recovery_failures', 0)}",
         f"Model       {state.get('model') or 'Codex default'} · {state.get('reasoning_effort') or 'default'}",
         f"Account     {_account_line(state)}",

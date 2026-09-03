@@ -235,6 +235,8 @@ def resume_service(repo: Path) -> ActionResult:
 
 
 def adopt_run(spec: RunSpec) -> ActionResult:
+    if (spec.account_mode or "").replace("-", "_").upper() == "AUTO_POOL":
+        return ActionResult(False, "AUTO_POOL adoption of existing interactive threads is not supported; use CURRENT_ONLY to adopt interactive threads.")
     bound = RunSpec(
         spec.repo,
         spec.goal,

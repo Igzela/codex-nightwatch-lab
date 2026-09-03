@@ -201,9 +201,10 @@ def _run(args: argparse.Namespace) -> int:
             state = store.load_state()
         except StateIntegrityError as exc:
             raise SystemExit(f"nightwatch: refusing to overwrite invalid durable state: {exc}") from exc
-        raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}); use nightwatch resume")
     if store.legacy_directory.exists():
         print("nightwatch: legacy repo/.nightwatch state is ignored for schema 2; it is preserved for forensic review", file=sys.stderr)
+    if getattr(args, "thread", None) and (args.account_mode or "").replace("-", "_").upper() == "AUTO_POOL":
+        raise SystemExit("nightwatch: auto-pool adoption of existing interactive threads via --thread is not supported; use current-only mode.")
     try:
         run_spec = RunSpec(
             root,
@@ -608,6 +609,8 @@ def _test(args: argparse.Namespace) -> int:
 
 
 def _adopt(args: argparse.Namespace) -> int:
+    if (args.account_mode or "").replace("-", "_").upper() == "AUTO_POOL":
+        raise SystemExit("nightwatch: auto-pool adoption of existing interactive threads is not supported; use current-only mode to adopt interactive threads.")
     root = _root(args.repo)
     store = NightwatchStore(root)
     if store.exists():

@@ -26,8 +26,17 @@ from .account_broker import (
 )
 from .git import GitError, GitSnapshot, is_ancestor, repo_root, snapshot
 from .milestones import adopt_proposed_plan, current_milestone, ingest_progress, verify_milestones
-from .models import ErrorKind, ProviderResult, QuotaSnapshot, QuotaWindow, State, TERMINAL_STATES
 from .quota import QuotaError, make_quota_provider, quota_recovered
+from .models import (
+    ErrorKind,
+    ProviderResult,
+    QuotaSnapshot,
+    QuotaWindow,
+    State,
+    TERMINAL_STATES,
+    cross_account_thread_mode_for_version,
+    installed_codex_version,
+)
 from .storage import NightwatchStore, StateIntegrityError, SupervisorAlreadyRunning, make_run_id, now_iso
 from .testing import crash_hook
 
@@ -396,6 +405,8 @@ class Supervisor:
         self.store = store
         self.quota_provider = quota_provider or make_quota_provider()
         self.account_pool = account_pool
+        if self.account_pool is not None and hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
+            self.account_pool.run_codex_home = self.store.codex_home
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -413,7 +424,9 @@ class Supervisor:
 
     def _pool_coordinator(self) -> AccountPoolCoordinator:
         if self.account_pool is None:
-            self.account_pool = AccountPoolCoordinator(CodexAuthAdapter(), AccountLeaseBroker())
+            self.account_pool = AccountPoolCoordinator(CodexAuthAdapter(), AccountLeaseBroker(), run_codex_home=self.store.codex_home)
+        elif hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
+            self.account_pool.run_codex_home = self.store.codex_home
         return self.account_pool
 
     def _is_auto_pool(self, state: dict[str, Any] | None = None) -> bool:
@@ -548,6 +561,21 @@ class Supervisor:
             self._fail_closed("Codex authentication sanity check failed", ErrorKind.AUTH)
             return False
         if self._is_auto_pool(state):
+            codex_ver = installed_codex_version(binary)
+            thread_mode = cross_account_thread_mode_for_version(codex_ver)
+            clean_ver = codex_ver.removeprefix("codex-cli ").strip() if codex_ver else None
+            self.store.mutate(
+                "account_thread_mode_reconciled",
+                "cross-account thread capability reconciled with installed Codex",
+                lambda item: {
+                    **item,
+                    "cross_account_thread_mode": thread_mode,
+                    "cross_account_thread_capability": {
+                        "codex_version": clean_ver,
+                        "mode": thread_mode,
+                    },
+                },
+            )
             return self._prepare_pool_account(reselect=True) or self.store.load_state()["state"] == State.WAIT_QUOTA.value
         try:
             quota = self.quota_provider.read()
@@ -1239,6 +1267,9 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         f"- RUNTIME: {state['created_at']} → {state['updated_at']}",
         f"- REPOSITORY: {state.get('repo')}",
         f"- THREAD_ID: {state.get('thread_id') or '(none)' }",
+        f"- THREAD_MODE: {'CONTROLLED HANDOFF' if state.get('thread_handoff') else 'EXACT'}",
+        f"- RUN_STORE: persistent",
+        f"- AUTH_LEASE: {'leased / active' if state.get('account_lease') else 'inactive / scrubbed'}",
         f"- GENERATION: {state.get('generation')}",
         f"- MODEL: {state.get('model') or '(Codex default)'}",
         f"- REASONING: {state.get('reasoning_effort') or '(Codex default)'}",
