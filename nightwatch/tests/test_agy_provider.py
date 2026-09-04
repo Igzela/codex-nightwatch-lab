@@ -419,6 +419,391 @@ class AgyProviderAdapterTests(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_stubborn_mismatch_escalates_to_sigkill_and_kills_descendant(self) -> None:
+        """Prove that conversation mismatch escalates past leader death to SIGKILL for stubborn children."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test stubborn mismatch", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "STUBBORN_DESCENDANT_SENTINEL.txt"
+            descendant_pid_file = repo / "stubborn_descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_mismatch"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(1.2)
+                self.assertFalse(sentinel.exists(), "Stubborn descendant sentinel MUST NOT exist")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                self.assertTrue(descendant_pid_file.exists(), "Stubborn descendant PID file must exist")
+                desc_pid = int(descendant_pid_file.read_text().strip())
+                self.assertFalse(pid_alive(desc_pid), "Stubborn descendant must be killed by SIGKILL escalation")
+
+    def test_stubborn_step_mismatch_escalates_to_sigkill(self) -> None:
+        """Prove that step_update mismatch escalates to SIGKILL and terminates stubborn descendant."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test stubborn step mismatch", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "STUBBORN_DESCENDANT_SENTINEL.txt"
+            descendant_pid_file = repo / "stubborn_descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_step_mismatch"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(1.2)
+                self.assertFalse(sentinel.exists(), "Stubborn descendant sentinel MUST NOT exist")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                self.assertTrue(descendant_pid_file.exists(), "Stubborn descendant PID file must exist")
+                desc_pid = int(descendant_pid_file.read_text().strip())
+                self.assertFalse(pid_alive(desc_pid), "Stubborn descendant must be dead")
+
+    def test_manual_stop_stubborn_group_escalates_to_sigkill(self) -> None:
+        """Prove that Supervisor.request_stop() fully escalates through SIGKILL when leader and descendant ignore SIGINT."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test stubborn stop", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+            sup = Supervisor(store)
+
+            sentinel = repo / "STUBBORN_DESCENDANT_SENTINEL.txt"
+            descendant_pid_file = repo / "stubborn_descendant.pid"
+            turn_done = threading.Event()
+
+            def run_worker() -> None:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_stop"}):
+                    sup._run_turn()
+                    turn_done.set()
+
+            worker = threading.Thread(target=run_worker, daemon=True)
+            worker.start()
+
+            for _ in range(50):
+                if descendant_pid_file.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(descendant_pid_file.exists(), "Descendant PID file was created")
+            desc_pid = int(descendant_pid_file.read_text().strip())
+            self.assertTrue(pid_alive(desc_pid), "Descendant process is running")
+
+            t_stop = time.monotonic()
+            sup.request_stop()
+            worker.join(timeout=6.0)
+            elapsed = time.monotonic() - t_stop
+            self.assertTrue(turn_done.is_set(), "Turn finished after stop request")
+            self.assertLess(elapsed, 5.0, f"Manual stop must return in bounded time (took {elapsed:.2f}s)")
+
+            time.sleep(1.6)
+            self.assertFalse(sentinel.exists(), "Stubborn descendant sentinel MUST NOT exist after manual stop")
+            self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by manual stop")
+
+    def test_stubborn_timeout_escalates_to_sigkill(self) -> None:
+        """Prove that watchdog timeout aborts stubborn descendant with SIGKILL and returns ErrorKind.CRASH."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test stubborn timeout", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "STUBBORN_DESCENDANT_SENTINEL.txt"
+            descendant_pid_file = repo / "stubborn_descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_timeout"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                    timeout=0.15,
+                )
+                self.assertEqual(result.error_kind, ErrorKind.CRASH)
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(1.6)
+                self.assertFalse(sentinel.exists(), "Stubborn descendant sentinel MUST NOT exist after timeout abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Stubborn descendant must be killed by timeout abort")
+
+    def test_signal_escalation_order_sigint_sigterm_sigkill(self) -> None:
+        """Prove that stubborn child causes signals in exact order: SIGINT -> SIGTERM -> SIGKILL to the same PGID."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test signal order", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            signals_sent: list[tuple[int, int]] = []
+            real_killpg = os.killpg
+
+            def spy_killpg(pgid: int, sig: int) -> None:
+                signals_sent.append((pgid, sig))
+                real_killpg(pgid, sig)
+
+            with patch("os.killpg", side_effect=spy_killpg):
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_mismatch"}):
+                    result = self.adapter.run_turn(
+                        store,
+                        1,
+                        "resume prompt",
+                        thread_id="EXPECTED-CONV-ID",
+                    )
+                    self.assertEqual(result.error_kind, ErrorKind.STATE)
+
+            escalation_signals = [(pgid, sig) for pgid, sig in signals_sent if sig != 0]
+            self.assertGreaterEqual(len(escalation_signals), 3)
+            pgids = [p for p, _ in escalation_signals]
+            sigs = [s for _, s in escalation_signals]
+
+            self.assertEqual(len(set(pgids)), 1, "All signals must target the same AGY PGID")
+            self.assertEqual(
+                sigs[:3],
+                [signal.SIGINT, signal.SIGTERM, signal.SIGKILL],
+                f"Signals must be sent in order SIGINT -> SIGTERM -> SIGKILL, got {sigs}",
+            )
+
+    def test_graceful_group_exits_without_sigkill(self) -> None:
+        """Prove that normal AGY group that exits on SIGINT does not trigger SIGTERM or SIGKILL."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test graceful stop", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            signals_sent: list[tuple[int, int]] = []
+            real_killpg = os.killpg
+
+            def spy_killpg(pgid: int, sig: int) -> None:
+                signals_sent.append((pgid, sig))
+                real_killpg(pgid, sig)
+
+            with patch("os.killpg", side_effect=spy_killpg):
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_sentinel"}):
+                    result = self.adapter.run_turn(
+                        store,
+                        1,
+                        "resume prompt",
+                        thread_id="EXPECTED-CONV-ID",
+                    )
+                    self.assertEqual(result.error_kind, ErrorKind.STATE)
+
+            escalation_sigs = [s for _, s in signals_sent if s != 0]
+            self.assertIn(signal.SIGINT, escalation_sigs)
+            self.assertNotIn(signal.SIGTERM, escalation_sigs, "SIGTERM must not be sent if group exits on SIGINT")
+            self.assertNotIn(signal.SIGKILL, escalation_sigs, "SIGKILL must not be sent if group exits on SIGINT")
+
+    def test_unrelated_process_group_survives_stubborn_escalation(self) -> None:
+        """Prove that stubborn escalation to SIGKILL on AGY process group does not affect unrelated process groups."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test unrelated survival stubborn", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                start_new_session=True,
+            )
+            unrelated_pid = unrelated.pid
+            self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must be alive initially")
+
+            try:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stubborn_mismatch"}):
+                    result = self.adapter.run_turn(
+                        store,
+                        1,
+                        "resume prompt",
+                        thread_id="EXPECTED-CONV-ID",
+                    )
+                    self.assertEqual(result.error_kind, ErrorKind.STATE)
+
+                self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must SURVIVE stubborn AGY process group SIGKILL")
+            finally:
+                try:
+                    os.kill(unrelated_pid, signal.SIGKILL)
+                    unrelated.wait(timeout=1.0)
+                except OSError:
+                    pass
+
+
+class ProcessGroupLivenessAndEscalationTests(unittest.TestCase):
+    """Deterministic unit tests for process-group liveness and abort escalation edge cases."""
+
+    def test_group_absent_before_abort_no_dangerous_signaling(self) -> None:
+        """When group is absent before abort, no dangerous killpg signals are sent."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("nightwatch.providers._process_group_alive", return_value=False):
+            with patch("os.killpg") as mock_killpg:
+                ret = _abort_process_group(99999, mock_proc)
+                mock_killpg.assert_not_called()
+                self.assertEqual(ret, 0)
+
+    def test_group_disappears_after_sigint(self) -> None:
+        """When group disappears after SIGINT, SIGTERM and SIGKILL are not sent."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        alive_seq = [True, False, False]
+        with patch("nightwatch.providers._process_group_alive", side_effect=alive_seq):
+            with patch("os.killpg") as mock_killpg:
+                ret = _abort_process_group(99999, mock_proc, grace_seconds=0.2)
+                self.assertEqual(ret, 0)
+                mock_killpg.assert_called_once_with(99999, signal.SIGINT)
+
+    def test_group_survives_sigint_escalates_to_sigterm(self) -> None:
+        """When group survives SIGINT, SIGTERM is sent; if it disappears, SIGKILL is not sent."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        calls: list[int] = []
+
+        def fake_alive(pgid: int) -> bool:
+            if signal.SIGTERM in calls:
+                return False
+            return True
+
+        def fake_killpg(pgid: int, sig: int) -> None:
+            calls.append(sig)
+
+        with patch("nightwatch.providers._process_group_alive", side_effect=fake_alive):
+            with patch("os.killpg", side_effect=fake_killpg):
+                ret = _abort_process_group(99999, mock_proc, grace_seconds=0.05)
+                self.assertEqual(ret, 0)
+                self.assertIn(signal.SIGINT, calls)
+                self.assertIn(signal.SIGTERM, calls)
+                self.assertNotIn(signal.SIGKILL, calls)
+
+    def test_group_survives_sigterm_escalates_to_sigkill(self) -> None:
+        """When group survives SIGTERM, SIGKILL is sent."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        calls: list[int] = []
+
+        def fake_alive(pgid: int) -> bool:
+            if signal.SIGKILL in calls:
+                return False
+            return True
+
+        def fake_killpg(pgid: int, sig: int) -> None:
+            calls.append(sig)
+
+        with patch("nightwatch.providers._process_group_alive", side_effect=fake_alive):
+            with patch("os.killpg", side_effect=fake_killpg):
+                ret = _abort_process_group(99999, mock_proc, grace_seconds=0.05)
+                self.assertEqual(ret, 0)
+                self.assertEqual(calls, [signal.SIGINT, signal.SIGTERM, signal.SIGKILL])
+
+    def test_leader_dead_but_group_alive_escalation_continues(self) -> None:
+        """When leader is dead (poll returns code) but group is alive, escalation continues to SIGKILL."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = -2
+        mock_proc.returncode = -2
+
+        calls: list[int] = []
+
+        def fake_alive(pgid: int) -> bool:
+            if signal.SIGKILL in calls:
+                return False
+            return True
+
+        def fake_killpg(pgid: int, sig: int) -> None:
+            calls.append(sig)
+
+        with patch("nightwatch.providers._process_group_alive", side_effect=fake_alive):
+            with patch("os.killpg", side_effect=fake_killpg):
+                ret = _abort_process_group(99999, mock_proc, grace_seconds=0.05)
+                self.assertIn(signal.SIGKILL, calls)
+                self.assertEqual(ret, -2)
+
+    def test_leader_alive_but_group_absent_safely_reconciled(self) -> None:
+        """When leader is alive (poll returns None) but group is absent, safely reconciles leader directly without os.killpg."""
+        from nightwatch.providers import _abort_process_group
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 99999
+        poll_responses = [None, -15, -15]
+        mock_proc.poll.side_effect = poll_responses
+        mock_proc.returncode = -15
+
+        with patch("nightwatch.providers._process_group_alive", return_value=False):
+            with patch("os.killpg") as mock_killpg:
+                ret = _abort_process_group(99999, mock_proc, grace_seconds=0.05)
+                mock_killpg.assert_not_called()
+                mock_proc.send_signal.assert_called()
+                self.assertEqual(ret, -15)
+
+    def test_permission_error_from_killpg_zero_treated_as_alive(self) -> None:
+        """PermissionError from killpg(pgid, 0) is treated as group alive / fail safely."""
+        from nightwatch.process_identity import process_group_alive
+        with patch("os.killpg", side_effect=PermissionError("Operation not permitted")):
+            self.assertTrue(process_group_alive(88888))
+
+    def test_invalid_pgid_never_signals_supervisor_group(self) -> None:
+        """Invalid pgid (<=1, matching supervisor group, or mismatching leader pid) never calls killpg on supervisor."""
+        from nightwatch.providers import _abort_process_group
+        sup_pgid = os.getpgrp()
+
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.pid = 77777
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+
+        with patch("os.killpg") as mock_killpg:
+            _abort_process_group(sup_pgid, mock_proc)
+            mock_killpg.assert_not_called()
+
+            _abort_process_group(0, mock_proc)
+            _abort_process_group(1, mock_proc)
+            _abort_process_group(-1, mock_proc)
+            mock_killpg.assert_not_called()
+
+            _abort_process_group(12345, mock_proc)
+            mock_killpg.assert_not_called()
+
 
 
 class AgySupervisorIntegrationTests(unittest.TestCase):

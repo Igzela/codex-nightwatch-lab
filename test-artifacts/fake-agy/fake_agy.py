@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -15,6 +16,26 @@ def _spawn_descendant(sentinel_name: str = "DESCENDANT_SHOULD_NOT_EXIST.txt", sl
     code = f"import time, pathlib; time.sleep({sleep_seconds}); pathlib.Path({sentinel_name!r}).write_text('LEAKED\\n')"
     proc = subprocess.Popen([sys.executable, "-c", code])
     Path("descendant.pid").write_text(str(proc.pid))
+    return proc
+
+def _spawn_stubborn_descendant(
+    sentinel_name: str = "STUBBORN_DESCENDANT_SENTINEL.txt",
+    sleep_seconds: float = 1.0,
+    pid_file: str = "stubborn_descendant.pid",
+) -> subprocess.Popen:
+    def _ignore_signals() -> None:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    code = (
+        "import signal, time, pathlib; "
+        "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"time.sleep({sleep_seconds}); "
+        f"pathlib.Path({sentinel_name!r}).write_text('STUBBORN_LEAKED\\n')"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code], preexec_fn=_ignore_signals)
+    Path(pid_file).write_text(str(proc.pid))
     return proc
 
 def main() -> int:
@@ -166,6 +187,32 @@ def main() -> int:
     elif scenario == "stop_descendant":
         _spawn_descendant("DESCENDANT_SHOULD_NOT_EXIST.txt", 1.0)
         conv_id = conv_id or "conv-stop-descendant"
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        for _ in range(300):
+            time.sleep(0.1)
+        return 0
+    elif scenario in ("stubborn_mismatch", "stubborn_mismatch_descendant"):
+        _spawn_stubborn_descendant("STUBBORN_DESCENDANT_SENTINEL.txt", 2.0)
+        emit({"event": "init", "conversation_id": "unexpected-uuid-999", "init": {"cwd": os.getcwd()}})
+        time.sleep(10.0)
+        return 0
+    elif scenario in ("stubborn_step_mismatch", "stubborn_step_mismatch_descendant"):
+        _spawn_stubborn_descendant("STUBBORN_DESCENDANT_SENTINEL.txt", 2.0)
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(0.01)
+        emit({"event": "step_update", "step_update": {"conversation_id": "divergent-step-uuid", "step_index": 0, "state": "DONE"}})
+        time.sleep(10.0)
+        return 0
+    elif scenario in ("stubborn_timeout", "stubborn_timeout_descendant"):
+        _spawn_stubborn_descendant("STUBBORN_DESCENDANT_SENTINEL.txt", 2.0)
+        conv_id = conv_id or "conv-stubborn-timeout"
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(30.0)
+        return 0
+    elif scenario in ("stubborn_stop", "stubborn_stop_descendant"):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        _spawn_stubborn_descendant("STUBBORN_DESCENDANT_SENTINEL.txt", 2.0)
+        conv_id = conv_id or "conv-stubborn-stop"
         emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
         for _ in range(300):
             time.sleep(0.1)
