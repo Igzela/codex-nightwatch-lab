@@ -289,8 +289,16 @@ def validate_state(state: dict[str, Any]) -> None:
     provider = state.get("provider", "codex")
     if provider not in {"codex", "agy"}:
         raise ValueError(f"unknown provider: {provider!r}")
-    if provider == "agy" and state.get("account_mode") == "AUTO_POOL":
-        raise ValueError("AGY provider does not support AUTO_POOL")
+    if provider == "agy":
+        if state.get("account_mode") == "AUTO_POOL":
+            raise ValueError("AGY provider does not support AUTO_POOL")
+        timeout = state.get("agy_print_timeout")
+        if timeout is None or isinstance(timeout, bool) or not isinstance(timeout, str):
+            raise ValueError("state.agy_print_timeout must be a string for AGY provider")
+        validate_agy_print_timeout(timeout)
+    elif provider == "codex":
+        if state.get("agy_print_timeout") is not None:
+            raise ValueError("Codex provider state must not set agy_print_timeout")
     if state.get("state") not in {item.value for item in State}:
         raise ValueError(f"unknown state: {state.get('state')!r}")
     if not isinstance(state.get("generation"), int) or state["generation"] < 1:

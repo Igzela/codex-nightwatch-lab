@@ -25,7 +25,7 @@ from nightwatch.models import (
 )
 from nightwatch.process_identity import pid_alive
 from nightwatch.providers import AgyProviderAdapter, CodexProviderAdapter, get_provider_adapter
-from nightwatch.storage import NightwatchStore
+from nightwatch.storage import NightwatchStore, StateIntegrityError
 from nightwatch.supervisor import Supervisor
 
 
@@ -479,6 +479,170 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         status_output = out.getvalue()
         self.assertIn("PROVIDER       agy", status_output)
         self.assertIn("PRINT TIMEOUT  2h", status_output)
+
+
+class AgyStateValidationAndMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "repo"
+        _git_init(self.repo)
+        self.store = NightwatchStore(self.repo)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_agy_state_valid_timeout_passes(self) -> None:
+        state = empty_state(
+            run_id="run-valid-timeout",
+            goal="Test valid timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+            agy_print_timeout="30m",
+        )
+        validate_state(state)
+        self.assertEqual(state["agy_print_timeout"], "30m")
+
+    def test_agy_state_malformed_timeout_fails_closed(self) -> None:
+        state = empty_state(
+            run_id="run-malformed-timeout",
+            goal="Test malformed timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        for bad in ["not-a-timeout", "60", "60x", "m60", "", "   "]:
+            state["agy_print_timeout"] = bad
+            with self.assertRaises(ValueError):
+                validate_state(state)
+
+    def test_agy_state_timeout_bool_fails(self) -> None:
+        state = empty_state(
+            run_id="run-bool-timeout",
+            goal="Test bool timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = True
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        state["agy_print_timeout"] = False
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_agy_state_timeout_out_of_range_fails(self) -> None:
+        state = empty_state(
+            run_id="run-range-timeout",
+            goal="Test out-of-range timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = "4s"  # < 5s
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        state["agy_print_timeout"] = "25h"  # > 24h
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_agy_state_missing_or_none_timeout_fails(self) -> None:
+        state = empty_state(
+            run_id="run-missing-timeout",
+            goal="Test missing timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = None
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        del state["agy_print_timeout"]
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_codex_state_with_timeout_fails_validate_state(self) -> None:
+        state = empty_state(
+            run_id="run-codex-timeout",
+            goal="Test codex with timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="codex",
+        )
+        state["agy_print_timeout"] = "30m"
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_legacy_agy_state_missing_timeout_migrates_to_60m(self) -> None:
+        self.store.initialize(
+            "run-legacy-agy",
+            "Test legacy migration",
+            str(self.repo),
+            provider="agy",
+        )
+        # Manually remove agy_print_timeout from disk to simulate pre-0.5.2 AGY state
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertIn("agy_print_timeout", state_data)
+        del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        loaded = self.store.load_state()
+        self.assertEqual(loaded["agy_print_timeout"], "60m")
+
+    def test_legacy_migration_persists_timeout(self) -> None:
+        self.store.initialize(
+            "run-legacy-persist",
+            "Test legacy migration persistence",
+            str(self.repo),
+            provider="agy",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        # Load should trigger migration and persist to disk
+        self.store.load_state()
+
+        persisted = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted.get("agy_print_timeout"), "60m")
+
+    def test_present_malformed_timeout_is_not_migrated(self) -> None:
+        self.store.initialize(
+            "run-malformed-persist",
+            "Test malformed not migrated",
+            str(self.repo),
+            provider="agy",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        state_data["agy_print_timeout"] = "invalid-timeout"
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        with self.assertRaises(StateIntegrityError):
+            self.store.load_state()
+
+        persisted = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted.get("agy_print_timeout"), "invalid-timeout")
+
+    def test_codex_legacy_state_without_timeout_still_loads(self) -> None:
+        self.store.initialize(
+            "run-codex-legacy",
+            "Test codex legacy",
+            str(self.repo),
+            provider="codex",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        if "agy_print_timeout" in state_data:
+            del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        loaded = self.store.load_state()
+        self.assertIsNone(loaded.get("agy_print_timeout"))
 
 
 if __name__ == "__main__":
