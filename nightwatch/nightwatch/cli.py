@@ -22,6 +22,7 @@ from .operations import (
     install_paths as _install_paths,
     install_user_files as _install_user_files,
     list_models as _model_catalog,
+    queue_steer,
     resume_service,
     service_name as _service_name,
     service_text as _service_text,
@@ -131,6 +132,10 @@ def _parser() -> argparse.ArgumentParser:
             cmd.add_argument("--tail", type=int, default=80)
         if name == "resume":
             cmd.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
+
+    steer = sub.add_parser("steer", help="queue an instruction to the active supervised run")
+    steer.add_argument("instruction", help="instruction text to send")
+    steer.add_argument("--repo", default=None)
 
     doctor = sub.add_parser("doctor", help="check Linux, Codex, auth, quota, and local state support")
     doctor.add_argument("--json", action="store_true")
@@ -529,6 +534,16 @@ def _stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _steer(args: argparse.Namespace) -> int:
+    store = _store(args.repo)
+    result = queue_steer(store, args.instruction)
+    if result.ok:
+        print(result.message)
+        return 0
+    print(f"nightwatch: {result.message}", file=sys.stderr)
+    return 1
+
+
 def _doctor(args: argparse.Namespace) -> int:
     report = doctor_snapshot(_root(args.repo) if args.repo else None)
     if args.json:
@@ -838,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
             "test": _test,
             "watch": _watch,
             "adopt": _adopt,
+            "steer": _steer,
         }[args.command](args)
     except SupervisorAlreadyRunning:
         print("nightwatch: already supervised by another process; state was not changed", file=sys.stderr)

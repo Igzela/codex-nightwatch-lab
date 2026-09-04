@@ -119,6 +119,14 @@ class ProviderAdapter(ABC):
         """Whether provider supports multi-account pool rotation."""
 
     @abstractmethod
+    def supports_live_steering(self) -> bool:
+        """Whether provider supports live mid-turn or between-turn instruction queueing."""
+
+    @abstractmethod
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        """Deliver or reject live instruction steering for this provider."""
+
+    @abstractmethod
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         """Find running provider processes associated with repository."""
 
@@ -218,6 +226,28 @@ class CodexProviderAdapter(ProviderAdapter):
 
     def supports_auto_pool(self) -> bool:
         return True
+
+    def supports_live_steering(self) -> bool:
+        return True
+
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+        try:
+            result = subprocess.run(
+                [binary, "queue", "--thread", thread_id, "--message", instruction],
+                cwd=repo,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "Codex queue transport was unavailable; no instruction was recorded as delivered."
+        if result.returncode != 0:
+            return False, "Codex did not accept the queued instruction; inspect the exact thread state."
+        return True, f"Instruction queued to exact thread {thread_id}."
 
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         if not sys_platform_linux():
@@ -987,6 +1017,12 @@ class AgyProviderAdapter(ProviderAdapter):
 
     def supports_auto_pool(self) -> bool:
         return False
+
+    def supports_live_steering(self) -> bool:
+        return False
+
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        return False, "AGY live steering is not supported by the current upstream CLI; no instruction was sent."
 
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         if not sys_platform_linux():

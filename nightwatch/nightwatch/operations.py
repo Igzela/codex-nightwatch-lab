@@ -310,6 +310,12 @@ def queue_steer(store: NightwatchStore, instruction: str) -> ActionResult:
             "Instruction was NOT queued because this Nightwatch run is terminal.\n"
             "Use /resume or start a new supervised run before steering.",
         )
+    provider_name = state.get("provider", "codex")
+    from .providers import get_provider_adapter
+    adapter = get_provider_adapter(provider_name)
+    if not adapter.supports_live_steering():
+        ok, msg = adapter.steer(store.repo, state.get("thread_id") or "", text)
+        return ActionResult(ok, msg)
     thread = state.get("thread_id")
     if not isinstance(thread, str) or not thread:
         return ActionResult(False, "No exact thread has been captured; steering was not sent.")

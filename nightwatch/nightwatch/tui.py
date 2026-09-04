@@ -841,6 +841,9 @@ class TuiController:
                 "Use /resume or start a new supervised run before steering."
             )
             return
+        if getattr(run, "provider", "codex") == "agy":
+            self.message = "AGY live steering is not supported by the current upstream CLI; no instruction was sent."
+            return
         if not instruction:
             self.awaiting = "steer"
             self.message = "Type the instruction for the selected exact thread."
@@ -981,6 +984,11 @@ class RunRecord:
     @property
     def active(self) -> bool:
         return not self.terminal
+
+    @property
+    def provider(self) -> str:
+        value = self.state.get("provider")
+        return value if isinstance(value, str) and value else "codex"
 
 
 class RunCatalog:
