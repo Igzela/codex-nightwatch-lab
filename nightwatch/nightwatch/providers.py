@@ -812,12 +812,12 @@ class AgyProviderAdapter(ProviderAdapter):
             res = subprocess.run(
                 [bin_path, "--output-format", "stream-json", "-p", "/usage"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=15,
                 check=False,
             )
-            return res.returncode == 0
+            return res.returncode == 0 and any("command_result" in line for line in res.stdout.splitlines())
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -845,7 +845,7 @@ class AgyProviderAdapter(ProviderAdapter):
             res = subprocess.run(
                 [binary, "--output-format", "stream-json", "-p", "/usage"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=15,
                 check=False,
@@ -853,7 +853,12 @@ class AgyProviderAdapter(ProviderAdapter):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY quota probe timed out or failed: {type(exc).__name__}")
         if res.returncode != 0:
-            return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage command failed with code {res.returncode}")
+            err_msg = (res.stderr or res.stdout or "").strip()
+            err_msg_lower = err_msg.lower()
+            if any(k in err_msg_lower for k in ("unauthorized", "authentication", "not authenticated", "login", "401", "403")) or " auth " in f" {err_msg_lower} ":
+                return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage authentication failure: {err_msg}")
+            return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage command failed with code {res.returncode}: {err_msg}")
+
 
         parsed_data = None
         for line in res.stdout.splitlines():

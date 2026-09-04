@@ -18,11 +18,22 @@ def main() -> int:
     scenario = os.environ.get("FAKE_AGY_SCENARIO", "normal")
 
     # Check for usage probe
-    if "-p" in sys.argv:
-        p_idx = sys.argv.index("-p")
+    if "-p" in sys.argv or "--print" in sys.argv:
+        p_idx = sys.argv.index("-p") if "-p" in sys.argv else sys.argv.index("--print")
         if p_idx + 1 < len(sys.argv) and sys.argv[p_idx + 1] == "/usage":
+            if scenario == "usage_malformed_json":
+                print("MALFORMED NOT JSON", flush=True)
+                return 0
+            if scenario == "usage_exec_failure":
+                sys.stderr.write("executable failure\n")
+                return 1
+            if scenario == "usage_auth_failure":
+                sys.stderr.write("UNAUTHORIZED: login credentials expired\n")
+                return 1
+
             gemini_frac = 0.0 if scenario in ("exhausted", "exhausted_gemini") else 0.40
             tp_frac = 0.0 if scenario in ("exhausted", "exhausted_3p") else 0.50
+
 
             gemini_buckets = []
             if scenario != "missing_gemini_5h":
