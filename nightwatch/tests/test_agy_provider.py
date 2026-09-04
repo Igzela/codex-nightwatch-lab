@@ -208,7 +208,7 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(result.get("next_resume_at"))
 
     def test_synthetic_quota_recovery_cycles(self) -> None:
-        """Verify synthetic quota recovery transitions and circuit breaker without crash or corruption."""
+        """Verify synthetic quota recovery transitions increment quota_cycles without tripping failure breaker."""
         self.store.initialize("run-soak", "Quota soak", str(self.repo), provider="agy", thread_id="conv-soak-1")
         # Step through preflight to running
         self.store.transition(State.PREFLIGHT, "preflight", "checking")
@@ -216,8 +216,8 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         supervisor = Supervisor(self.store)
         now_ts = int(datetime.now(timezone.utc).timestamp())
 
-        # Test recovery cycles within circuit breaker limit
-        for cycle in range(18):
+        # Test 25 recovery cycles (surpassing old 20-cycle limit)
+        for cycle in range(25):
             reset_ts = now_ts + 60
             result = ProviderResult(
                 exit_code=1,
@@ -233,6 +233,8 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
             )
             state = supervisor._handle_result(result)
             self.assertEqual(state["state"], State.WAIT_QUOTA.value)
+            self.assertEqual(state["quota_cycles"], cycle + 1)
+            self.assertEqual(state["recovery_failures"], 0)
 
             recovered_snap = QuotaSnapshot(
                 "AGY_CLI",
@@ -248,44 +250,10 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
                 self.store.transition(State.RUNNING, "recovered", "test ready")
                 self.assertEqual(supervisor.store.load_state()["state"], State.RUNNING.value)
 
-        # Advance to circuit breaker limit (20)
-        for _ in range(2):
-            result = ProviderResult(
-                exit_code=1,
-                signal=None,
-                thread_id="conv-soak-1",
-                event_count=1,
-                malformed_count=0,
-                error_kind=ErrorKind.QUOTA_5H,
-                error_detail="resource exhausted",
-                reset_at=reset_ts,
-                reset_source="agy_usage_probe",
-                quota_windows=[QuotaWindow("5h", 100.0, 300, reset_ts)],
-            )
-            state = supervisor._handle_result(result)
-            if state["state"] == State.WAIT_QUOTA.value:
-                recovered_snap = QuotaSnapshot("AGY_CLI", "now", primary=QuotaWindow("5h", 10.0, 300, reset_ts))
-                with patch.object(supervisor, "_get_quota_snapshot", return_value=recovered_snap), \
-                     patch("nightwatch.supervisor._sleep_until"):
-                    supervisor._wait_and_revalidate_quota()
-                    self.store.transition(State.RUNNING, "recovered", "test ready")
-
-        # The 21st attempt trips the circuit breaker
-        breaker_result = ProviderResult(
-            exit_code=1,
-            signal=None,
-            thread_id="conv-soak-1",
-            event_count=1,
-            malformed_count=0,
-            error_kind=ErrorKind.QUOTA_5H,
-            error_detail="resource exhausted",
-            reset_at=reset_ts,
-            reset_source="agy_usage_probe",
-            quota_windows=[QuotaWindow("5h", 100.0, 300, reset_ts)],
-        )
-        final_state = supervisor._handle_result(breaker_result)
-        self.assertEqual(final_state["state"], State.FAILED.value)
-        self.assertIn("circuit breaker", final_state["last_error"].lower())
+        final_state = self.store.load_state()
+        self.assertEqual(final_state["quota_cycles"], 25)
+        self.assertEqual(final_state["recovery_failures"], 0)
+        self.assertEqual(final_state["state"], State.RUNNING.value)
 
 
 if __name__ == "__main__":

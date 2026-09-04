@@ -87,7 +87,12 @@ class ProviderAdapter(ABC):
         """Verify that credentials and CLI login status are healthy."""
 
     @abstractmethod
-    def probe_quota(self, store: NightwatchStore | None = None, repo: Path | None = None) -> QuotaSnapshot:
+    def probe_quota(
+        self,
+        store: NightwatchStore | None = None,
+        repo: Path | None = None,
+        model: str | None = None,
+    ) -> QuotaSnapshot:
         """Probe authoritative quota / rate-limit state."""
 
     @abstractmethod
@@ -185,7 +190,12 @@ class CodexProviderAdapter(ProviderAdapter):
         except (OSError, subprocess.TimeoutExpired):
             return False
 
-    def probe_quota(self, store: NightwatchStore | None = None, repo: Path | None = None) -> QuotaSnapshot:
+    def probe_quota(
+        self,
+        store: NightwatchStore | None = None,
+        repo: Path | None = None,
+        model: str | None = None,
+    ) -> QuotaSnapshot:
         from .quota import make_quota_provider
         return make_quota_provider().read()
 
@@ -280,6 +290,23 @@ class CodexProviderAdapter(ProviderAdapter):
         }
 
 
+def agy_model_family(model: str) -> str:
+    """Return 'gemini' or '3p' based on model name slug.
+
+    Gemini family: gemini-*
+    Third-party family: claude-*, gpt-*, gpt-oss-*
+    Unknown model family: raises ValueError (fail closed).
+    """
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError(f"unknown AGY model family for model {model!r}")
+    m = model.strip().lower()
+    if m.startswith("gemini-"):
+        return "gemini"
+    if m.startswith(("claude-", "gpt-", "gpt-oss-")):
+        return "3p"
+    raise ValueError(f"unknown AGY model family for model {model!r}")
+
+
 class AgyProviderAdapter(ProviderAdapter):
     """Adapter for Google Antigravity (AGY) CLI provider."""
 
@@ -324,6 +351,9 @@ class AgyProviderAdapter(ProviderAdapter):
         model: str | None = None,
         reasoning_effort: str | None = None,
     ) -> tuple[list[str], str]:
+        # OWNER_APPROVED_UNATTENDED_AGY_PERMISSION_POLICY:
+        # The repository owner has explicitly approved Nightwatch's unattended AGY policy of
+        # invoking --dangerously-skip-permissions for supervised AGY provider turns.
         binary = self._resolve_binary()
         args = [
             binary,
@@ -408,6 +438,10 @@ class AgyProviderAdapter(ProviderAdapter):
         seen_hashes: set[str] = set()
         found_thread = thread_id
         conversation_not_found = False
+        has_init = False
+        init_conv_id: str | None = None
+        has_result_event = False
+        last_result_event: dict[str, Any] | None = None
         result_status: str | None = None
 
         stdout_selector = selectors.DefaultSelector()
@@ -464,29 +498,58 @@ class AgyProviderAdapter(ProviderAdapter):
             event_types.append(event_type)
             store.write_run_event(generation, {"type": f"agy_{event_type}", "event": event})
 
-            # Extract conversation_id from event
-            cid = event.get("conversation_id")
-            if not cid and isinstance(event.get("init"), dict):
-                cid = event["init"].get("conversation_id")
-            if not cid and isinstance(event.get("step_update"), dict):
-                cid = event["step_update"].get("conversation_id")
-            if not cid and isinstance(event.get("result"), dict):
-                cid = event["result"].get("conversation_id")
-
-            if cid and isinstance(cid, str) and cid.strip():
-                cid = cid.strip()
-                if action == "resume" and thread_id:
-                    if cid != thread_id:
-                        # Exact conversation rule violation: AGY emitted a different conversation ID!
-                        store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": cid})
+            # Check for authoritative init event
+            if event_type == "init":
+                has_init = True
+                init_data = event.get("init")
+                cid_from_init = event.get("conversation_id")
+                if not cid_from_init and isinstance(init_data, dict):
+                    cid_from_init = init_data.get("conversation_id")
+                if isinstance(cid_from_init, str) and cid_from_init.strip():
+                    init_conv_id = cid_from_init.strip()
+                    if action == "start":
+                        if found_thread is None:
+                            found_thread = init_conv_id
+                            if on_thread:
+                                on_thread(found_thread)
+                        elif found_thread != init_conv_id:
+                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": init_conv_id})
+                            found_thread = "__MISMATCH__"
+                    elif action == "resume":
+                        if thread_id and init_conv_id != thread_id:
+                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": init_conv_id})
+                            found_thread = "__MISMATCH__"
+                else:
+                    store.write_run_event(generation, {"type": "invalid_init_event", "event": event})
+                    if action == "start":
                         found_thread = "__MISMATCH__"
-                elif not found_thread:
-                    found_thread = cid
-                    if on_thread:
-                        on_thread(cid)
 
-            if event_type == "result" and isinstance(event.get("result"), dict):
-                result_status = event["result"].get("status")
+            # Check ANY event carrying conversation_id against the established identity
+            explicit_cid = None
+            if isinstance(event.get("conversation_id"), str) and event["conversation_id"].strip():
+                explicit_cid = event["conversation_id"].strip()
+            elif isinstance(event.get("step_update"), dict) and isinstance(event["step_update"].get("conversation_id"), str) and event["step_update"]["conversation_id"].strip():
+                explicit_cid = event["step_update"]["conversation_id"].strip()
+            elif isinstance(event.get("result"), dict) and isinstance(event["result"].get("conversation_id"), str) and event["result"]["conversation_id"].strip():
+                explicit_cid = event["result"]["conversation_id"].strip()
+
+            if explicit_cid:
+                if action == "resume" and thread_id:
+                    if explicit_cid != thread_id:
+                        store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": explicit_cid})
+                        found_thread = "__MISMATCH__"
+                elif action == "start":
+                    if found_thread and found_thread != "__MISMATCH__":
+                        if explicit_cid != found_thread:
+                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": explicit_cid})
+                            found_thread = "__MISMATCH__"
+
+            if event_type == "result":
+                has_result_event = True
+                last_result_event = event
+                if isinstance(event.get("result"), dict):
+                    raw_status = event["result"].get("status")
+                    result_status = str(raw_status).upper() if raw_status is not None else None
 
         try:
             stdout_selector.close()
@@ -526,22 +589,43 @@ class AgyProviderAdapter(ProviderAdapter):
             detail = f"AGY conversation mismatch: expected exact thread {thread_id}" if not conversation_not_found else f"AGY conversation {thread_id} not found"
             return ProviderResult(returncode, signal_name, None, len(events), malformed, event_types, kind, detail, run_log=str(run_log))
 
-        # Classify failures
+        # Classify failures with strict precedence: Quota/Auth > Start missing init > Result status / Crash
         kind: ErrorKind | None = None
         detail: str | None = None
         reset_at: int | None = None
         reset_source: str | None = None
         windows: list[QuotaWindow] = []
         blocker: str | None = None
+        aborted = bool(stop_event and stop_event.is_set())
 
-        combined_text = stderr + " " + " ".join(json.dumps(ev) for ev in events)
-        lower = combined_text.lower()
+        error_parts = [stderr]
+        if result_status == "ERROR":
+            res_payload = last_result_event.get("result", {}) if isinstance(last_result_event, dict) else {}
+            if isinstance(res_payload, dict):
+                error_parts.append(str(res_payload.get("error") or ""))
+                error_parts.append(str(res_payload.get("response") or ""))
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("type") == "error":
+                error_parts.append(str(ev.get("error") or ev.get("error_message") or ""))
+        error_text = " ".join(error_parts)
+        lower_err = error_text.lower()
+        selected_model = state.get("model")
 
-        # Check for quota / rate limits
-        if any(token in lower for token in ("resource_exhausted", "quota exceeded", "rate limit", "429", "usage limit")):
-            # Probe authoritative quota to get accurate reset times
+        is_quota = any(token in lower_err for token in ("resource_exhausted", "quota exceeded", "rate limit", "usage limit")) or bool(re.search(r"\b429\b", error_text))
+        is_auth = any(token in lower_err for token in ("unauthorized", "authentication", "invalid token", "login required", "403 forbidden")) or bool(re.search(r"\b401\b", error_text))
+
+        failed_turn = (
+            returncode != 0
+            or bool(signal_name)
+            or (action == "start" and not has_init)
+            or bool(malformed)
+            or not has_result_event
+            or result_status != "SUCCESS"
+        )
+
+        if failed_turn and is_quota:
             try:
-                snap = self.probe_quota(store, store.repo)
+                snap = self.probe_quota(store, store.repo, model=selected_model)
                 windows = snap.windows()
                 for w in windows:
                     if w.resets_at and (reset_at is None or w.resets_at > reset_at):
@@ -549,23 +633,47 @@ class AgyProviderAdapter(ProviderAdapter):
                         reset_source = "agy_usage_probe"
             except Exception:
                 pass
-            is_weekly = "weekly" in lower or any(w.name == "weekly" and w.exhausted for w in windows)
+            is_weekly = "weekly" in lower_err or any(w.name == "weekly" and w.exhausted for w in windows)
             kind = ErrorKind.QUOTA_WEEKLY if is_weekly else ErrorKind.QUOTA_5H
             detail = "AGY quota limit reached"
-        elif any(token in lower for token in ("unauthorized", "authentication", "invalid token", "login required", "401", "403 forbidden")):
+        elif failed_turn and is_auth:
             kind = ErrorKind.AUTH
             detail = "AGY authentication failure"
-        elif result_status == "ERROR" or returncode != 0 or signal_name:
-            kind = ErrorKind.CRASH
-            detail = f"AGY exited {returncode or signal_name}"
+        elif action == "start" and not has_init:
+            kind = ErrorKind.STATE
+            detail = "AGY start turn missing authoritative init event with conversation_id"
         elif malformed:
             kind = ErrorKind.MALFORMED
             detail = f"AGY stdout contained {malformed} malformed JSONL event(s)"
-        elif not found_thread and action == "start":
-            kind = ErrorKind.STATE
-            detail = "AGY did not emit an init event with conversation_id"
+        elif has_result_event:
+            if result_status in {"CANCELED", "INTERRUPTED"}:
+                aborted = True
+                kind = None
+                detail = f"AGY turn was {result_status.lower()}"
+            elif result_status in {"WAITING", "RUNNING"}:
+                kind = ErrorKind.STATE
+                detail = f"AGY emitted non-terminal result status: {result_status}"
+            elif result_status == "ERROR":
+                kind = ErrorKind.CRASH
+                detail = f"AGY result status ERROR (exit code {returncode or signal_name})"
+            elif result_status == "SUCCESS":
+                if returncode != 0 or signal_name:
+                    kind = ErrorKind.CRASH
+                    detail = f"AGY emitted SUCCESS but exited with {returncode or signal_name}"
+                else:
+                    kind = None
+                    detail = None
+            else:
+                kind = ErrorKind.STATE
+                detail = f"AGY emitted unknown result status: {result_status}"
+        else:
+            if returncode != 0 or signal_name:
+                kind = ErrorKind.CRASH
+                detail = f"AGY process terminated with {returncode or signal_name} without result event"
+            else:
+                kind = ErrorKind.STATE
+                detail = "AGY exited 0 without emitting a terminal result event"
 
-        aborted = bool(stop_event and stop_event.is_set())
         return ProviderResult(
             returncode,
             signal_name,
@@ -600,9 +708,26 @@ class AgyProviderAdapter(ProviderAdapter):
         except (OSError, subprocess.TimeoutExpired):
             return False
 
-    def probe_quota(self, store: NightwatchStore | None = None, repo: Path | None = None) -> QuotaSnapshot:
+    def probe_quota(
+        self,
+        store: NightwatchStore | None = None,
+        repo: Path | None = None,
+        model: str | None = None,
+    ) -> QuotaSnapshot:
         binary = self._resolve_binary()
         read_at = _utc_now_iso()
+
+        target_model = model
+        if target_model is None and store is not None and store.exists():
+            target_model = store.load_state().get("model")
+        if target_model is None:
+            target_model = "gemini-3.8-flash-high"
+
+        try:
+            family = agy_model_family(target_model)
+        except ValueError as exc:
+            return QuotaSnapshot("AGY_CLI", read_at, error=f"authoritative quota unavailable: {exc}")
+
         try:
             res = subprocess.run(
                 [binary, "--output-format", "stream-json", "-p", "/usage"],
@@ -635,6 +760,9 @@ class AgyProviderAdapter(ProviderAdapter):
         if not parsed_data or not isinstance(parsed_data.get("groups"), list):
             return QuotaSnapshot("AGY_CLI", read_at, error="AGY /usage returned unexpected response format")
 
+        target_5h_id = "gemini-5h" if family == "gemini" else "3p-5h"
+        target_weekly_id = "gemini-weekly" if family == "gemini" else "3p-weekly"
+
         primary_window: QuotaWindow | None = None
         secondary_window: QuotaWindow | None = None
 
@@ -644,22 +772,33 @@ class AgyProviderAdapter(ProviderAdapter):
             for bucket in group.get("buckets", []):
                 if not isinstance(bucket, dict):
                     continue
-                win = bucket.get("window")
+                bid = bucket.get("id")
+                if bid not in (target_5h_id, target_weekly_id):
+                    continue
                 rem_frac = bucket.get("remaining_fraction")
+                if rem_frac is None or isinstance(rem_frac, bool) or not isinstance(rem_frac, (int, float)) or not (0.0 <= float(rem_frac) <= 1.0):
+                    return QuotaSnapshot("AGY_CLI", read_at, error=f"malformed remaining_fraction in bucket {bid}: {rem_frac!r}")
                 reset_iso = bucket.get("reset_time")
                 reset_epoch = _parse_iso_epoch(reset_iso)
-                used_pct = round((1.0 - float(rem_frac)) * 100, 1) if isinstance(rem_frac, (int, float)) else None
-                if win == "5h" and not primary_window:
+                used_pct = round((1.0 - float(rem_frac)) * 100, 1)
+
+                win = bucket.get("window")
+                if bid == target_5h_id or win == "5h":
                     primary_window = QuotaWindow("5h", used_pct, 300, reset_epoch)
-                elif win == "weekly" and not secondary_window:
+                elif bid == target_weekly_id or win == "weekly":
                     secondary_window = QuotaWindow("weekly", used_pct, 10080, reset_epoch)
+
+        if primary_window is None:
+            return QuotaSnapshot("AGY_CLI", read_at, error=f"missing selected-family 5h bucket for family {family!r}")
+        if secondary_window is None:
+            return QuotaSnapshot("AGY_CLI", read_at, error=f"missing selected-family weekly bucket for family {family!r}")
 
         return QuotaSnapshot(
             source="AGY_CLI",
             read_at=read_at,
             primary=primary_window,
             secondary=secondary_window,
-            plan_type="Google Antigravity",
+            plan_type=f"Google Antigravity ({family})",
         )
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -775,11 +914,16 @@ class AgyProviderAdapter(ProviderAdapter):
             except (OSError, subprocess.TimeoutExpired):
                 pass
         auth_ok = self.auth_sanity(bin_path) if bin_path else False
-        quota_data = None
+        quota_data: dict[str, Any] = {}
         if auth_ok:
             try:
-                snap = self.probe_quota(repo=repo)
-                quota_data = snap.to_dict()
+                gemini_snap = self.probe_quota(repo=repo, model="gemini-3.8-flash-high")
+                quota_data["gemini"] = gemini_snap.to_dict()
+            except Exception:
+                pass
+            try:
+                tp_snap = self.probe_quota(repo=repo, model="claude-sonnet-4-6")
+                quota_data["3p"] = tp_snap.to_dict()
             except Exception:
                 pass
         return {

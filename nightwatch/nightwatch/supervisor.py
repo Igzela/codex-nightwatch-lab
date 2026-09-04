@@ -495,7 +495,7 @@ class Supervisor:
         state = self.store.load_state()
         if state.get("provider") == "agy":
             from .providers import get_provider_adapter
-            return get_provider_adapter("agy").probe_quota(self.store, self.store.repo)
+            return get_provider_adapter("agy").probe_quota(self.store, self.store.repo, model=state.get("model"))
         return self.quota_provider.read()
 
     def _preflight(self) -> bool:
@@ -1016,7 +1016,9 @@ class Supervisor:
 
     def _enter_quota_wait(self, result: ProviderResult) -> dict[str, Any]:
         state = self.store.load_state()
-        if state.get("recoveries", 0) >= MAX_QUOTA_RECOVERIES:
+        if state.get("recovery_failures", 0) >= MAX_RECOVERY_FAILURES or (
+            state.get("quota_cycles", 0) == 0 and state.get("recoveries", 0) >= MAX_QUOTA_RECOVERIES
+        ):
             return self._fail_closed("quota recovery circuit breaker reached", ErrorKind.QUOTA_5H)
         windows = result.quota_windows or [QuotaWindow("weekly" if result.error_kind == ErrorKind.QUOTA_WEEKLY else "5h", 100, 10080 if result.error_kind == ErrorKind.QUOTA_WEEKLY else 300, result.reset_at)]
         reset = result.reset_at or max((window.resets_at or 0 for window in windows), default=0)
@@ -1035,6 +1037,7 @@ class Supervisor:
             "resume_claim": None,
             "retry_attempt": 0,
             "crash_attempt": 0,
+            "quota_cycles": state.get("quota_cycles", 0) + 1,
             "recoveries": state.get("recoveries", 0) + 1,
             "last_error": result.error_detail,
             "error_kind": result.error_kind.value,
@@ -1059,6 +1062,27 @@ class Supervisor:
             return False
         try:
             quota = self._get_quota_snapshot()
+            if quota.error:
+                failures = int(state.get("recovery_failures", 0)) + 1
+                detail = f"quota authority error: {quota.error}"
+                if failures >= MAX_RECOVERY_FAILURES:
+                    detail = f"quota recovery circuit breaker reached: {quota.error}"
+                    self.store.transition(
+                        State.FAILED,
+                        "quota_recovery_budget_exhausted",
+                        detail,
+                        {"recovery_failures": failures, "last_error": detail, "error_kind": ErrorKind.QUOTA_5H.value, "resume_claim": None},
+                    )
+                    return False
+                retry = int(time.time()) + QUOTA_POLL_SECONDS * failures
+                self.store.transition(
+                    State.WAIT_QUOTA,
+                    "quota_probe_failed",
+                    detail,
+                    {"next_resume_at": datetime.fromtimestamp(retry, timezone.utc).isoformat().replace("+00:00", "Z"), "recovery_failures": failures, "last_error": detail, "resume_claim": None},
+                )
+                return True
+
             self.store.mutate("quota_revalidated", "quota authority queried after reset", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
             if quota.source in {"live_app_server", "fake_file", "AGY_CLI"}:
                 if not quota_recovered(quota, governing):
@@ -1067,10 +1091,28 @@ class Supervisor:
                     self.store.transition(State.WAIT_QUOTA, "quota_still_exhausted", "live quota authority is still exhausted; no resume sent", {"next_resume_at": datetime.fromtimestamp(later + max(0, buffer_seconds), timezone.utc).isoformat().replace("+00:00", "Z"), "resume_claim": None})
                     return True
                 return self._start_quota_recovery("live quota authority confirmed recovery")
+
             return self._guarded_quota_probe("live quota authority unavailable; rollout is schedule-only")
         except Exception as exc:
-            self.store.mutate("quota_revalidation_failed", "live quota authority unavailable after reset", lambda item: {**item, "last_error": f"quota authority unavailable: {type(exc).__name__}", "quota_source": "unavailable"})
-            return self._guarded_quota_probe("live quota authority unavailable after provider-declared reset")
+            failures = int(state.get("recovery_failures", 0)) + 1
+            detail = f"quota authority unavailable: {type(exc).__name__}"
+            if failures >= MAX_RECOVERY_FAILURES:
+                detail = f"quota recovery circuit breaker reached: {type(exc).__name__}"
+                self.store.transition(
+                    State.FAILED,
+                    "quota_recovery_budget_exhausted",
+                    detail,
+                    {"recovery_failures": failures, "last_error": detail, "error_kind": ErrorKind.QUOTA_5H.value, "resume_claim": None},
+                )
+                return False
+            retry = int(time.time()) + QUOTA_POLL_SECONDS * failures
+            self.store.transition(
+                State.WAIT_QUOTA,
+                "quota_probe_failed",
+                detail,
+                {"next_resume_at": datetime.fromtimestamp(retry, timezone.utc).isoformat().replace("+00:00", "Z"), "recovery_failures": failures, "last_error": detail, "resume_claim": None},
+            )
+            return True
 
     def _wait_and_revalidate_pool(self) -> bool:
         state = self.store.load_state()
@@ -1126,7 +1168,7 @@ class Supervisor:
     def _start_quota_recovery(self, reason: str) -> bool:
         if not self._claim_resume():
             return False
-        self.store.transition(State.RECOVERING, "resume_started", reason)
+        self.store.transition(State.RECOVERING, "resume_started", reason, {"recovery_failures": 0})
         return True
 
     def _guarded_quota_probe(self, reason: str) -> bool:
