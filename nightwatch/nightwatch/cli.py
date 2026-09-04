@@ -238,6 +238,7 @@ def _run(args: argparse.Namespace) -> int:
             account_mode=args.account_mode,
             account_selectors=tuple(args.accounts),
             provider=provider,
+            agy_print_timeout=getattr(args, "agy_print_timeout", None),
         )
         authorized = resolve_authorized_accounts(run_spec, root)
     except (AccountBrokerError, ValueError) as exc:
@@ -257,6 +258,7 @@ def _run(args: argparse.Namespace) -> int:
         account_mode=args.account_mode.replace("-", "_").upper(),
         authorized_accounts=authorized,
         provider=provider,
+        agy_print_timeout=getattr(args, "agy_print_timeout", None),
     )
     if args.service:
         _install_user_files(root)
@@ -419,8 +421,13 @@ def _render_status(value: dict[str, Any]) -> None:
     print(f"AGENT          {agent['status']}{agent_detail}")
     thread_display = state.get("thread_id") or ("(not captured — first launch deferred)" if state["state"] == State.WAIT_QUOTA.value else "(not captured)")
     print(f"THREAD         {thread_display}")
-    print(f"MODEL          {state.get('model') or '(Codex default)'}")
-    print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
+    provider = state.get("provider", "codex")
+    print(f"PROVIDER       {provider}")
+    default_label = f"({provider.capitalize()} default)"
+    print(f"MODEL          {state.get('model') or default_label}")
+    print(f"REASONING      {state.get('reasoning_effort') or default_label}")
+    if provider == "agy":
+        print(f"PRINT TIMEOUT  {state.get('agy_print_timeout') or '60m'}")
     print(f"RUN_ID         {state['run_id']}")
     print(f"GENERATION     {state['generation']}")
     print(f"QUOTA CYCLES   {state.get('quota_cycles', 0)}")
@@ -662,6 +669,7 @@ def _adopt(args: argparse.Namespace) -> int:
     if store.exists():
         state = store.load_state()
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}, thread={state.get('thread_id')})")
+    provider = getattr(args, "provider", None) or os.environ.get("NIGHTWATCH_PROVIDER", "codex")
     try:
         spec = RunSpec(
             root,
@@ -673,6 +681,8 @@ def _adopt(args: argparse.Namespace) -> int:
             service=False,
             account_mode=args.account_mode,
             account_selectors=tuple(args.accounts),
+            provider=provider,
+            agy_print_timeout=getattr(args, "agy_print_timeout", None),
         )
         authorized = resolve_authorized_accounts(spec, root)
     except (AccountBrokerError, ValueError) as exc:
@@ -687,6 +697,8 @@ def _adopt(args: argparse.Namespace) -> int:
         reasoning_effort=args.reasoning_effort,
         account_mode=args.account_mode.replace("-", "_").upper(),
         authorized_accounts=authorized,
+        provider=provider,
+        agy_print_timeout=getattr(args, "agy_print_timeout", None),
     )
     print(f"Nightwatch: adopted thread {args.thread} for repo {root} (run_id={state['run_id']})")
     print("Run `nightwatch resume` to start unattended supervision.")

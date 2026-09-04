@@ -133,6 +133,11 @@ def main() -> int:
         sys.stderr.write("UNAUTHORIZED: authentication token invalid\n")
         sys.stderr.flush()
         return 1
+    elif scenario == "hang":
+        conv_id = conv_id or "conv-hang-123"
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(30)
+        return 0
 
     else:
         if not conv_id:

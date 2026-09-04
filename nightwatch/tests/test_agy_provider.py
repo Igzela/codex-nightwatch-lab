@@ -259,6 +259,7 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         self.repo = Path(self.tmp) / "repo"
         _git_init(self.repo)
         self.store = NightwatchStore(self.repo)
+        self.adapter = get_provider_adapter("agy")
 
     def tearDown(self) -> None:
         os.system(f"rm -rf {self.tmp}")
@@ -375,6 +376,110 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
+    def test_build_command_default_and_custom_print_timeout(self) -> None:
+        """Verify default 60m print timeout and explicit print timeout in build_command."""
+        args_def, _ = self.adapter.build_command(
+            repo="/tmp/test",
+            thread_id=None,
+            prompt="do task",
+        )
+        self.assertIn("--print-timeout", args_def)
+        self.assertEqual(args_def[args_def.index("--print-timeout") + 1], "60m")
 
+        args_custom, _ = self.adapter.build_command(
+            repo="/tmp/test",
+            thread_id=None,
+            prompt="do task",
+            print_timeout="15m",
+        )
+        self.assertIn("--print-timeout", args_custom)
+        self.assertEqual(args_custom[args_custom.index("--print-timeout") + 1], "15m")
+
+        with self.assertRaises(ValueError):
+            self.adapter.build_command(
+                repo="/tmp/test",
+                thread_id=None,
+                prompt="do task",
+                print_timeout="invalid",
+            )
+
+    def test_run_turn_passes_durable_print_timeout(self) -> None:
+        """Verify run_turn passes the configured durable agy_print_timeout."""
+        self.store.initialize(
+            "run-print-timeout",
+            "Test print timeout",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="45m",
+        )
+        with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "normal"}):
+            result = self.adapter.run_turn(self.store, 1, "test prompt")
+            self.assertIsNone(result.error_kind)
+
+        run_events = self.store.load_run_events(1)
+        cmd_events = [e for e in run_events if e.get("type") == "provider_command"]
+        self.assertTrue(len(cmd_events) >= 1)
+        argv = cmd_events[0].get("argv", [])
+        self.assertIn("--print-timeout", argv)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "45m")
+
+    def test_watchdog_timeout_classified_as_crash_not_quota(self) -> None:
+        """Watchdog timeout aborts process and classifies strictly as ErrorKind.CRASH, never quota."""
+        self.store.initialize(
+            "run-watchdog-crash",
+            "Test watchdog crash",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="10s",
+        )
+        with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "hang"}):
+            result = self.adapter.run_turn(self.store, 1, "hang test", timeout=0.2)
+
+        self.assertEqual(result.error_kind, ErrorKind.CRASH)
+        self.assertFalse(result.aborted)
+        self.assertIsNotNone(result.error_detail)
+        self.assertIn("timed out", result.error_detail.lower())
+
+        run_events = self.store.load_run_events(1)
+        timeout_events = [e for e in run_events if e.get("type") == "agy_watchdog_timeout"]
+        self.assertTrue(len(timeout_events) >= 1)
+
+    def test_status_and_report_include_print_timeout(self) -> None:
+        """Verify build_report and _render_status include PROVIDER and PRINT TIMEOUT for AGY."""
+        from io import StringIO
+        from unittest.mock import patch as mock_patch
+        from nightwatch.supervisor import build_report
+        from nightwatch.cli import _render_status
+
+        self.store.initialize(
+            "run-report-status",
+            "Test status display",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="2h",
+        )
+        state = self.store.load_state()
+
+        # Check build_report
+        report = build_report(self.store, state)
+        self.assertIn("- PROVIDER: agy", report)
+        self.assertIn("- PRINT TIMEOUT: 2h", report)
+
+        from nightwatch.models import plan_progress
+
+        plan = self.store.load_plan()
+        out = StringIO()
+        with mock_patch("sys.stdout", out):
+            _render_status({
+                "state": state,
+                "plan": plan,
+                "progress": plan_progress(plan),
+                "agent": {"status": "IDLE", "pid": None, "action": None, "supervisor_pid": None},
+            })
+        status_output = out.getvalue()
+        self.assertIn("PROVIDER       agy", status_output)
+        self.assertIn("PRINT TIMEOUT  2h", status_output)
+
+
+if __name__ == "__main__":
     unittest.main()

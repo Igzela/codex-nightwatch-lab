@@ -18,7 +18,7 @@ from typing import Any, Iterator
 import fcntl
 
 from . import __version__
-from .models import State, empty_state, validate_plan, validate_state
+from .models import State, empty_state, validate_agy_print_timeout, validate_plan, validate_state
 from .testing import crash_hook
 
 
@@ -439,12 +439,17 @@ class NightwatchStore:
         account_mode: str = "CURRENT_ONLY",
         authorized_accounts: list[str] | None = None,
         provider: str = "codex",
+        agy_print_timeout: str | None = None,
     ) -> dict[str, Any]:
         timestamp = timestamp or now_iso()
         commands = list(verify_commands or [])
         policy_core = {"schema_version": 1, "source": "cli", "final_commands": commands}
         policy = {**policy_core, "policy_hash": policy_hash(policy_core)}
         acceptance = {"schema_version": 1, "goal_hash": hashlib.sha256(goal.encode("utf-8")).hexdigest(), "verification_policy_hash": policy["policy_hash"], "required_final_checks": commands, "plan_minimum": {"milestones": 1}, "baseline_repo": str(self.repo), "created_at": timestamp}
+        if agy_print_timeout is not None:
+            agy_print_timeout = validate_agy_print_timeout(agy_print_timeout)
+        elif provider == "agy":
+            agy_print_timeout = "60m"
         state = empty_state(
             run_id,
             goal,
@@ -454,6 +459,7 @@ class NightwatchStore:
             model=model,
             reasoning_effort=reasoning_effort,
             provider=provider,
+            agy_print_timeout=agy_print_timeout,
         )
         state["acceptance_ready"] = sufficient_verification_policy(commands)
         if account_mode not in {"CURRENT_ONLY", "AUTO_POOL"}:

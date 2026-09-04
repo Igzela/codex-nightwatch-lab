@@ -210,7 +210,10 @@ def empty_state(
     model: str | None = None,
     reasoning_effort: str | None = None,
     provider: str = "codex",
+    agy_print_timeout: str | None = None,
 ) -> dict[str, Any]:
+    if provider == "agy" and agy_print_timeout is None:
+        agy_print_timeout = "60m"
     return {
         "schema_version": 2,
         "run_id": run_id,
@@ -218,6 +221,7 @@ def empty_state(
         "repo": repo,
         "repo_id": repo_id,
         "provider": provider,
+        "agy_print_timeout": agy_print_timeout,
         "thread_id": None,
         "model": model,
         "reasoning_effort": reasoning_effort,

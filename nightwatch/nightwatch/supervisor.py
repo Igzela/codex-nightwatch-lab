@@ -1335,7 +1335,8 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
             quota_lines.append(f"- {label}: {window.get('used_percent')}% used; duration={window.get('window_duration_mins')}m; reset={window.get('resets_at')}")
     if not quota_lines:
         quota_lines = ["- (no validated snapshot persisted for this run)"]
-    return "\n".join([
+    provider = state.get("provider", "codex")
+    report_lines = [
         "# Nightwatch report",
         "",
         "## GOAL",
@@ -1345,19 +1346,27 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         f"- RUN_ID: {state.get('run_id')}",
         f"- RUNTIME: {state['created_at']} → {state['updated_at']}",
         f"- REPOSITORY: {state.get('repo')}",
+        f"- PROVIDER: {provider}",
         f"- THREAD_ID: {state.get('thread_id') or '(none)' }",
         f"- THREAD_MODE: {'CONTROLLED HANDOFF' if state.get('thread_handoff') else 'EXACT'}",
         f"- RUN_STORE: persistent",
         f"- AUTH_LEASE: {'leased / active' if state.get('account_lease') else 'inactive / scrubbed'}",
         f"- GENERATION: {state.get('generation')}",
-        f"- MODEL: {state.get('model') or '(Codex default)'}",
-        f"- REASONING: {state.get('reasoning_effort') or '(Codex default)'}",
+        f"- MODEL: {state.get('model') or f'({provider.capitalize()} default)'}",
+        f"- REASONING: {state.get('reasoning_effort') or f'({provider.capitalize()} default)'}",
+    ]
+    if provider == "agy":
+        report_lines.append(f"- PRINT TIMEOUT: {state.get('agy_print_timeout') or '60m'}")
+    report_lines.extend([
         f"- QUOTA SOURCE: {state.get('quota_source') or '(none)'}",
         f"- RECOVERIES: {state.get('recoveries', 0)}",
         f"- QUOTA CYCLES: {state.get('quota_cycles', 0)}",
         f"- RECOVERY FAILURES: {state.get('recovery_failures', 0)}",
         f"- FINAL HEAD: {state.get('last_verified_commit') or state.get('last_git_head') or '(unknown)'}",
         "",
+    ])
+    return "\n".join([
+        *report_lines,
         "## QUOTA WINDOWS",
         *quota_lines,
         "",

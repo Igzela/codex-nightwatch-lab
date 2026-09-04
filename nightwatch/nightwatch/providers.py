@@ -23,6 +23,8 @@ from .models import (
     ProviderResult,
     QuotaSnapshot,
     QuotaWindow,
+    parse_agy_duration_seconds,
+    validate_agy_print_timeout,
     validate_model_name,
     validate_reasoning_effort,
 )
@@ -64,6 +66,7 @@ class ProviderAdapter(ABC):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         """Construct execution argv and action ('start' or 'resume')."""
 
@@ -142,6 +145,7 @@ class CodexProviderAdapter(ProviderAdapter):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         from .codex import build_command as _codex_build_command
         return _codex_build_command(repo, thread_id, prompt, model, reasoning_effort)
@@ -383,6 +387,8 @@ class AgyProviderAdapter(ProviderAdapter):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        print_timeout: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         # OWNER_APPROVED_UNATTENDED_AGY_PERMISSION_POLICY:
         # The repository owner has explicitly approved Nightwatch's unattended AGY policy of
@@ -394,6 +400,9 @@ class AgyProviderAdapter(ProviderAdapter):
             "--output-format",
             "stream-json",
         ]
+        timeout_val = print_timeout or "60m"
+        validate_agy_print_timeout(timeout_val)
+        args.extend(["--print-timeout", timeout_val])
         if model:
             args.extend(["--model", self.validate_model(model)])
         if reasoning_effort:
@@ -420,13 +429,17 @@ class AgyProviderAdapter(ProviderAdapter):
         **kwargs: Any,
     ) -> ProviderResult:
         state = store.load_state()
+        timeout_str = state.get("agy_print_timeout") or "60m"
         args, action = self.build_command(
             store.repo,
             thread_id,
             prompt,
             model=state.get("model"),
             reasoning_effort=state.get("reasoning_effort"),
+            print_timeout=timeout_str,
         )
+        budget_seconds = float(parse_agy_duration_seconds(timeout_str))
+        watchdog_limit = timeout if timeout is not None else (budget_seconds + 30.0)
         run_log = store.runs_path / f"generation-{generation}.stderr.log"
         store.runs_path.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Redact prompt from recorded command
@@ -509,7 +522,7 @@ class AgyProviderAdapter(ProviderAdapter):
                     process.send_signal(signal_module.SIGINT)
                 except OSError:
                     pass
-            if timeout is not None and time.monotonic() - start > timeout and process.poll() is None:
+            if time.monotonic() - start > watchdog_limit and process.poll() is None:
                 timed_out = True
                 _abort_process(process)
                 break
@@ -736,7 +749,14 @@ class AgyProviderAdapter(ProviderAdapter):
             or result_status != "SUCCESS"
         )
 
-        if failed_turn and is_quota:
+        if timed_out:
+            kind = ErrorKind.CRASH
+            detail = f"AGY print-mode turn timed out after {watchdog_limit:.1f}s watchdog"
+            store.write_run_event(
+                generation,
+                {"type": "agy_watchdog_timeout", "watchdog_limit": watchdog_limit, "print_timeout": timeout_str},
+            )
+        elif failed_turn and is_quota:
             try:
                 snap = self.probe_quota(store, store.repo, model=selected_model)
                 windows = snap.windows()
