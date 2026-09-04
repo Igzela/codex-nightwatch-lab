@@ -526,10 +526,21 @@ def _doctor(args: argparse.Namespace) -> int:
             agy_auth = "ok" if agy.get("auth_ok") else "fail"
             print(f"AGY: {agy_ver}")
             print(f"AGY Auth: {agy_auth}")
-            if agy.get("quota") and agy["quota"].get("primary"):
-                print(f"AGY 5h: {agy['quota']['primary'].get('used_percent')}% used, reset={agy['quota']['primary'].get('resets_at')}")
-            if agy.get("quota") and agy["quota"].get("secondary"):
-                print(f"AGY weekly: {agy['quota']['secondary'].get('used_percent')}% used, reset={agy['quota']['secondary'].get('resets_at')}")
+            quota_data = agy.get("quota") or {}
+            gemini_q = quota_data.get("gemini")
+            if gemini_q and gemini_q.get("primary"):
+                print(f"AGY Gemini 5h: {gemini_q['primary'].get('used_percent')}% used, reset={gemini_q['primary'].get('resets_at')}")
+            if gemini_q and gemini_q.get("secondary"):
+                print(f"AGY Gemini weekly: {gemini_q['secondary'].get('used_percent')}% used, reset={gemini_q['secondary'].get('resets_at')}")
+            tp_q = quota_data.get("3p")
+            if tp_q and tp_q.get("primary"):
+                print(f"AGY 3P 5h: {tp_q['primary'].get('used_percent')}% used, reset={tp_q['primary'].get('resets_at')}")
+            if tp_q and tp_q.get("secondary"):
+                print(f"AGY 3P weekly: {tp_q['secondary'].get('used_percent')}% used, reset={tp_q['secondary'].get('resets_at')}")
+            if quota_data.get("primary") and not gemini_q:
+                print(f"AGY 5h: {quota_data['primary'].get('used_percent')}% used, reset={quota_data['primary'].get('resets_at')}")
+            if quota_data.get("secondary") and not gemini_q:
+                print(f"AGY weekly: {quota_data['secondary'].get('used_percent')}% used, reset={quota_data['secondary'].get('resets_at')}")
         print(f"systemd-inhibit: {'available' if report['systemd_inhibit'] else 'unavailable'}")
     return 0 if report["status"] == "ok" else 1
 
