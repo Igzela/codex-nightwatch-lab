@@ -659,6 +659,19 @@ class NightwatchStore:
         self._append_file(path, json.dumps(redact(value), sort_keys=True, ensure_ascii=False) + "\n")
         return path
 
+    def load_run_events(self, generation: int) -> list[dict[str, Any]]:
+        path = self.runs_path / f"generation-{generation}.events.jsonl"
+        if not path.exists():
+            return []
+        items = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
+        return items
+
+
     def write_report(self, text: str, timestamp: str | None = None) -> Path:
         stamp = (timestamp or now_iso()).replace(":", "-").replace(".", "-")
         path = self.reports_path / f"report-{stamp}.md"

@@ -87,8 +87,30 @@ def main() -> int:
         sys.stderr.write(f'warning: conversation "{conv_id or "missing"}" not found\n')
         sys.stderr.flush()
         conv_id = "generated-new-uuid-000"
+    elif scenario == "not_found_sentinel":
+        sys.stderr.write(f'warning: conversation "{conv_id or "missing"}" not found\n')
+        sys.stderr.flush()
+        time.sleep(0.4)
+        Path("SHOULD_NOT_EXIST_AFTER_MISMATCH.txt").write_text("SHOULD NEVER BE CREATED\n")
+        return 1
     elif scenario == "mismatch":
         conv_id = "unexpected-uuid-999"
+    elif scenario == "mismatch_sentinel":
+        # Receives --conversation X, emits init with unexpected UUID, waits briefly, attempts to create file
+        emit({"event": "init", "conversation_id": "unexpected-uuid-999", "init": {"cwd": os.getcwd()}})
+        time.sleep(0.4)
+        Path("SHOULD_NOT_EXIST_AFTER_MISMATCH.txt").write_text("SHOULD NEVER BE CREATED\n")
+        emit({"event": "result", "result": {"status": "SUCCESS", "conversation_id": "unexpected-uuid-999"}})
+        return 0
+    elif scenario == "step_mismatch_sentinel":
+        # Receives --conversation X, emits init with X, then step_update with divergent-step-uuid, waits briefly, attempts to create file
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(0.01)
+        emit({"event": "step_update", "step_update": {"conversation_id": "divergent-step-uuid", "step_index": 0, "state": "DONE"}})
+        time.sleep(0.4)
+        Path("SHOULD_NOT_EXIST_AFTER_MISMATCH.txt").write_text("SHOULD NEVER BE CREATED\n")
+        emit({"event": "result", "result": {"status": "SUCCESS", "conversation_id": "divergent-step-uuid"}})
+        return 0
     elif scenario in ("exhausted", "exhausted_gemini", "exhausted_3p", "error_result_with_quota"):
         sys.stderr.write("RESOURCE_EXHAUSTED: quota exceeded for 5h window\n")
         sys.stderr.flush()
@@ -100,6 +122,7 @@ def main() -> int:
         sys.stderr.write("UNAUTHORIZED: authentication token invalid\n")
         sys.stderr.flush()
         return 1
+
     else:
         if not conv_id:
             conv_id = os.environ.get("FAKE_AGY_CONV_ID", "agy-conv-12345")

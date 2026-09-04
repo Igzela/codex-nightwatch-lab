@@ -307,7 +307,40 @@ def agy_model_family(model: str) -> str:
     raise ValueError(f"unknown AGY model family for model {model!r}")
 
 
+def _abort_process(process: subprocess.Popen, grace_seconds: float = 0.15) -> int:
+    """Escalate SIGINT -> SIGTERM -> SIGKILL to immediately terminate and reap child."""
+    if process.poll() is not None:
+        return process.returncode
+    try:
+        process.send_signal(signal_module.SIGINT)
+    except OSError:
+        pass
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        if process.poll() is not None:
+            return process.returncode
+        time.sleep(0.02)
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        if process.poll() is not None:
+            return process.returncode
+        time.sleep(0.02)
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        return process.wait(timeout=2.0)
+    except (subprocess.TimeoutExpired, OSError):
+        return process.poll() or -9
+
+
 class AgyProviderAdapter(ProviderAdapter):
+
     """Adapter for Google Antigravity (AGY) CLI provider."""
 
     DEFAULT_AGY_MODELS = [
@@ -422,6 +455,7 @@ class AgyProviderAdapter(ProviderAdapter):
             on_spawn(process.pid, action)
 
         stderr_queue: queue.Queue[str] = queue.Queue()
+        stderr_lines: list[str] = []
 
         def read_stderr() -> None:
             if process.stderr is None:
@@ -438,16 +472,34 @@ class AgyProviderAdapter(ProviderAdapter):
         seen_hashes: set[str] = set()
         found_thread = thread_id
         conversation_not_found = False
+        mismatch_detected = False
+        mismatch_expected: str | None = None
+        mismatch_observed: str | None = None
         has_init = False
         init_conv_id: str | None = None
         has_result_event = False
         last_result_event: dict[str, Any] | None = None
         result_status: str | None = None
+        timed_out = False
 
         stdout_selector = selectors.DefaultSelector()
         stdout_open = process.stdout is not None
         if process.stdout is not None:
             stdout_selector.register(process.stdout, selectors.EVENT_READ)
+
+        def _drain_stderr() -> None:
+            nonlocal conversation_not_found, mismatch_detected, mismatch_expected, mismatch_observed
+            while not stderr_queue.empty():
+                try:
+                    s_line = stderr_queue.get_nowait()
+                    stderr_lines.append(s_line)
+                    if thread_id and f'conversation "{thread_id.lower()}" not found' in s_line.lower():
+                        conversation_not_found = True
+                        mismatch_detected = True
+                        mismatch_expected = thread_id
+                        mismatch_observed = "(conversation not found in stderr)"
+                except queue.Empty:
+                    break
 
         while stdout_open:
             if process.poll() is not None and not stdout_open:
@@ -458,12 +510,42 @@ class AgyProviderAdapter(ProviderAdapter):
                 except OSError:
                     pass
             if timeout is not None and time.monotonic() - start > timeout and process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
+                timed_out = True
+                _abort_process(process)
+                break
+            _drain_stderr()
+            if mismatch_detected:
+                found_thread = "__MISMATCH__"
+                store.write_run_event(
+                    generation,
+                    {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                )
+                _abort_process(process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
+
             ready = stdout_selector.select(0.1)
             if not ready:
+                _drain_stderr()
+                if mismatch_detected:
+                    found_thread = "__MISMATCH__"
+                    store.write_run_event(
+                        generation,
+                        {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                    )
+                    _abort_process(process)
+                    if process.stdout is not None:
+                        try:
+                            stdout_selector.unregister(process.stdout)
+                        except (KeyError, OSError):
+                            pass
+                    stdout_open = False
+                    break
                 if process.poll() is not None and process.stdout is not None and process.stdout.closed:
                     stdout_open = False
                 continue
@@ -513,16 +595,20 @@ class AgyProviderAdapter(ProviderAdapter):
                             if on_thread:
                                 on_thread(found_thread)
                         elif found_thread != init_conv_id:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": init_conv_id})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = found_thread
+                            mismatch_observed = init_conv_id
                     elif action == "resume":
                         if thread_id and init_conv_id != thread_id:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": init_conv_id})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = thread_id
+                            mismatch_observed = init_conv_id
                 else:
                     store.write_run_event(generation, {"type": "invalid_init_event", "event": event})
                     if action == "start":
-                        found_thread = "__MISMATCH__"
+                        mismatch_detected = True
+                        mismatch_expected = "(valid conversation ID in init)"
+                        mismatch_observed = "(none)"
 
             # Check ANY event carrying conversation_id against the established identity
             explicit_cid = None
@@ -536,13 +622,30 @@ class AgyProviderAdapter(ProviderAdapter):
             if explicit_cid:
                 if action == "resume" and thread_id:
                     if explicit_cid != thread_id:
-                        store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": explicit_cid})
-                        found_thread = "__MISMATCH__"
+                        mismatch_detected = True
+                        mismatch_expected = thread_id
+                        mismatch_observed = explicit_cid
                 elif action == "start":
                     if found_thread and found_thread != "__MISMATCH__":
                         if explicit_cid != found_thread:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": explicit_cid})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = found_thread
+                            mismatch_observed = explicit_cid
+
+            if mismatch_detected:
+                found_thread = "__MISMATCH__"
+                store.write_run_event(
+                    generation,
+                    {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                )
+                _abort_process(process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
 
             if event_type == "result":
                 has_result_event = True
@@ -558,7 +661,12 @@ class AgyProviderAdapter(ProviderAdapter):
 
         returncode = process.wait()
         stderr_thread.join(timeout=2)
-        stderr = "".join(list(stderr_queue.queue))
+        while not stderr_queue.empty():
+            try:
+                stderr_lines.append(stderr_queue.get_nowait())
+            except queue.Empty:
+                break
+        stderr = "".join(stderr_lines)
         try:
             run_log.write_text(redact(stderr), encoding="utf-8")
             os.chmod(run_log, 0o600)
@@ -580,14 +688,19 @@ class AgyProviderAdapter(ProviderAdapter):
         except OSError:
             pass
 
-        if thread_id and f"conversation \"{thread_id.lower()}\" not found" in stderr.lower():
+        if not conversation_not_found and thread_id and f"conversation \"{thread_id.lower()}\" not found" in stderr.lower():
             conversation_not_found = True
             found_thread = "__MISMATCH__"
 
         if found_thread == "__MISMATCH__":
             kind = ErrorKind.STATE
-            detail = f"AGY conversation mismatch: expected exact thread {thread_id}" if not conversation_not_found else f"AGY conversation {thread_id} not found"
+            detail = (
+                f"AGY conversation {thread_id} not found"
+                if conversation_not_found
+                else f"AGY conversation mismatch: expected exact thread {mismatch_expected or thread_id}"
+            )
             return ProviderResult(returncode, signal_name, None, len(events), malformed, event_types, kind, detail, run_log=str(run_log))
+
 
         # Classify failures with strict precedence: Quota/Auth > Start missing init > Result status / Crash
         kind: ErrorKind | None = None
