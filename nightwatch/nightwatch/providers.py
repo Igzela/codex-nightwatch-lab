@@ -679,14 +679,15 @@ class AgyProviderAdapter(ProviderAdapter):
                     break
 
         while stdout_open:
-            if stop_event and stop_event.is_set() and process.poll() is None:
-                try:
-                    if pgid > 1 and pgid != os.getpgrp():
-                        os.killpg(pgid, signal_module.SIGINT)
-                    else:
-                        process.send_signal(signal_module.SIGINT)
-                except (ProcessLookupError, OSError):
-                    pass
+            if stop_event and stop_event.is_set():
+                _abort_process_group(pgid, process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
             if process.poll() is not None and not stdout_open:
                 break
             if time.monotonic() - start > watchdog_limit:
@@ -716,6 +717,15 @@ class AgyProviderAdapter(ProviderAdapter):
                 break
 
             ready = stdout_selector.select(0.1)
+            if stop_event and stop_event.is_set():
+                _abort_process_group(pgid, process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
             if not ready:
                 _drain_stderr()
                 if mismatch_detected:
@@ -948,6 +958,9 @@ class AgyProviderAdapter(ProviderAdapter):
         elif failed_turn and is_auth:
             kind = ErrorKind.AUTH
             detail = "AGY authentication failure"
+        elif aborted:
+            kind = None
+            detail = detail or "AGY turn was stopped"
         elif action == "start" and not has_init:
             kind = ErrorKind.STATE
             detail = "AGY start turn missing authoritative init event with conversation_id"
