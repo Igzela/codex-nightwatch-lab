@@ -18,6 +18,7 @@ from nightwatch.storage import NightwatchStore
 from nightwatch.supervisor import Supervisor
 
 FAKE_AGY = Path(__file__).resolve().parents[2] / "test-artifacts" / "fake-agy" / "fake_agy.py"
+FAKE_CODEX = Path(__file__).resolve().parents[2] / "test-artifacts" / "fake-codex" / "fake_codex.py"
 
 
 def _make_repo(parent: Path, name: str) -> Path:
@@ -289,7 +290,8 @@ class AgyPreflightAuthoritativeQuotaTests(unittest.TestCase):
         def stop_after_turn(*args, **kwargs):
             supervisor._stop_requested = True
             return ProviderResult(exit_code=0, signal=None, thread_id="thread-codex", event_count=1, malformed_count=0)
-        with patch.object(supervisor, "_get_quota_snapshot", side_effect=RuntimeError("quota network down")), \
+        with patch.dict(os.environ, {"NIGHTWATCH_CODEX_BIN": str(FAKE_CODEX)}), \
+             patch.object(supervisor, "_get_quota_snapshot", side_effect=RuntimeError("quota network down")), \
              patch.object(supervisor, "_auth_sanity", return_value=True), \
              patch("nightwatch.supervisor.run_codex", side_effect=stop_after_turn) as mock_run:
             supervisor._execute(start=True)
