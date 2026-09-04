@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
@@ -52,3 +53,27 @@ def process_identity_matches(record: dict[str, Any]) -> bool:
         and observed.get("starttime") == record.get("starttime")
         and observed.get("executable") == record.get("executable")
     )
+
+
+def process_group_alive(pgid: int | None) -> bool:
+    """Linux process-group liveness helper."""
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    try:
+        if pgid == os.getpgrp():
+            return False
+    except OSError:
+        pass
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ESRCH:
+            return False
+        if getattr(exc, "errno", None) == errno.EPERM:
+            return True
+        return False

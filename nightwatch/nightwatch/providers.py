@@ -28,7 +28,7 @@ from .models import (
     validate_model_name,
     validate_reasoning_effort,
 )
-from .process_identity import linux_process_identity, process_identity_matches, sys_platform_linux
+from .process_identity import linux_process_identity, process_group_alive, process_identity_matches, sys_platform_linux
 from .storage import NightwatchStore, redact
 from .testing import crash_hook
 
@@ -341,46 +341,150 @@ def agy_model_family(model: str) -> str:
     raise ValueError(f"unknown AGY model family for model {model!r}")
 
 
+_process_group_alive = process_group_alive
+
+
+def _is_safe_pgid(pgid: int | None, process: subprocess.Popen | None = None) -> bool:
+    if not isinstance(pgid, int) or pgid <= 1:
+        return False
+    try:
+        if pgid == os.getpgrp():
+            return False
+    except OSError:
+        return False
+    if process is not None and getattr(process, "pid", None) is not None:
+        if pgid != process.pid:
+            return False
+    return True
+
+
+def _reap_leader(process: subprocess.Popen, timeout: float = 2.0) -> int:
+    if process.poll() is not None:
+        return process.returncode
+    try:
+        return process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            process.kill()
+            return process.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            return process.poll() or -9
+
+
 def _abort_process_group(pgid: int, process: subprocess.Popen, grace_seconds: float = 0.5) -> int:
     """
     Escalate SIGINT -> SIGTERM -> SIGKILL across the process group.
-    Safely catches ProcessLookupError / OSError at each stage,
-    polls process termination, and reaps the leader process.
+    Group liveness, rather than leader process exit, strictly drives escalation.
+    Reaps the leader process after group members have been terminated.
     """
-    if process.poll() is not None:
-        return process.returncode
-
-    def _kill_group(sig: int) -> None:
+    if not _is_safe_pgid(pgid, process):
+        # Leader-only fallback only where explicitly safe
+        leader_pid = getattr(process, "pid", None)
         try:
-            if pgid > 1 and pgid != os.getpgrp():
-                os.killpg(pgid, sig)
-            else:
-                process.send_signal(sig)
-        except (ProcessLookupError, OSError):
-            pass
+            sup_pgrp = os.getpgrp()
+        except OSError:
+            sup_pgrp = None
+        if isinstance(leader_pid, int) and leader_pid > 1 and (sup_pgrp is None or leader_pid != sup_pgrp):
+            try:
+                process.send_signal(signal_module.SIGINT)
+            except (ProcessLookupError, OSError):
+                pass
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < grace_seconds:
+                if process.poll() is not None:
+                    return process.returncode
+                time.sleep(0.02)
+            try:
+                process.send_signal(signal_module.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < grace_seconds:
+                if process.poll() is not None:
+                    return process.returncode
+                time.sleep(0.02)
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError):
+                pass
+        return _reap_leader(process)
 
-    # Step 1: SIGINT
-    _kill_group(signal_module.SIGINT)
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < grace_seconds:
-        if process.poll() is not None:
-            return process.returncode
-        time.sleep(0.02)
+    # If the group is already absent before abort: do not send dangerous signals to pgid
+    if not _process_group_alive(pgid):
+        # Leader alive but group absent => safely reconcile/reap leader
+        if process.poll() is None:
+            try:
+                process.send_signal(signal_module.SIGINT)
+            except (ProcessLookupError, OSError):
+                pass
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < grace_seconds:
+                if process.poll() is not None:
+                    return process.returncode
+                time.sleep(0.02)
+            try:
+                process.send_signal(signal_module.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < grace_seconds:
+                if process.poll() is not None:
+                    return process.returncode
+                time.sleep(0.02)
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError):
+                pass
+        return _reap_leader(process)
 
-    # Step 2: SIGTERM
-    _kill_group(signal_module.SIGTERM)
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < grace_seconds:
-        if process.poll() is not None:
-            return process.returncode
-        time.sleep(0.02)
-
-    # Step 3: SIGKILL
-    _kill_group(signal_module.SIGKILL)
+    # Step 1: SIGINT group
     try:
-        return process.wait(timeout=2.0)
-    except (subprocess.TimeoutExpired, OSError):
-        return process.poll() or -9
+        os.killpg(pgid, signal_module.SIGINT)
+    except (ProcessLookupError, OSError):
+        pass
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        process.poll()
+        if not _process_group_alive(pgid):
+            return _reap_leader(process)
+        time.sleep(0.02)
+
+    process.poll()
+    if not _process_group_alive(pgid):
+        return _reap_leader(process)
+
+    # Step 2: SIGTERM group
+    try:
+        os.killpg(pgid, signal_module.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        process.poll()
+        if not _process_group_alive(pgid):
+            return _reap_leader(process)
+        time.sleep(0.02)
+
+    process.poll()
+    if not _process_group_alive(pgid):
+        return _reap_leader(process)
+
+    # Step 3: SIGKILL group
+    try:
+        os.killpg(pgid, signal_module.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        process.poll()
+        if not _process_group_alive(pgid):
+            break
+        time.sleep(0.02)
+
+    return _reap_leader(process)
 
 
 def _abort_process(process: subprocess.Popen, grace_seconds: float = 0.5) -> int:
@@ -575,8 +679,6 @@ class AgyProviderAdapter(ProviderAdapter):
                     break
 
         while stdout_open:
-            if process.poll() is not None and not stdout_open:
-                break
             if stop_event and stop_event.is_set() and process.poll() is None:
                 try:
                     if pgid > 1 and pgid != os.getpgrp():
@@ -585,9 +687,17 @@ class AgyProviderAdapter(ProviderAdapter):
                         process.send_signal(signal_module.SIGINT)
                 except (ProcessLookupError, OSError):
                     pass
-            if time.monotonic() - start > watchdog_limit and process.poll() is None:
+            if process.poll() is not None and not stdout_open:
+                break
+            if time.monotonic() - start > watchdog_limit:
                 timed_out = True
                 _abort_process_group(pgid, process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
                 break
             _drain_stderr()
             if mismatch_detected:
@@ -738,8 +848,7 @@ class AgyProviderAdapter(ProviderAdapter):
         try:
             returncode = process.wait(timeout=5.0)
         except (subprocess.TimeoutExpired, OSError):
-            _abort_process_group(pgid, process)
-            returncode = process.poll() or -9
+            returncode = _abort_process_group(pgid, process)
         stderr_thread.join(timeout=2)
         while not stderr_queue.empty():
             try:
@@ -901,7 +1010,7 @@ class AgyProviderAdapter(ProviderAdapter):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=15,
+                timeout=30,
                 check=False,
             )
             return res.returncode == 0 and any("command_result" in line for line in res.stdout.splitlines())
@@ -934,7 +1043,7 @@ class AgyProviderAdapter(ProviderAdapter):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=15,
+                timeout=30,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
