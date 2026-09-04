@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 def emit(payload: dict) -> None:
     print(json.dumps(payload), flush=True)
+
+def _spawn_descendant(sentinel_name: str = "DESCENDANT_SHOULD_NOT_EXIST.txt", sleep_seconds: float = 0.5) -> subprocess.Popen:
+    code = f"import time, pathlib; time.sleep({sleep_seconds}); pathlib.Path({sentinel_name!r}).write_text('LEAKED\\n')"
+    proc = subprocess.Popen([sys.executable, "-c", code])
+    Path("descendant.pid").write_text(str(proc.pid))
+    return proc
 
 def main() -> int:
     if "--version" in sys.argv:
@@ -137,6 +144,31 @@ def main() -> int:
         conv_id = conv_id or "conv-hang-123"
         emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
         time.sleep(30)
+        return 0
+    elif scenario == "mismatch_descendant":
+        _spawn_descendant("DESCENDANT_SHOULD_NOT_EXIST.txt", 0.5)
+        emit({"event": "init", "conversation_id": "unexpected-uuid-999", "init": {"cwd": os.getcwd()}})
+        time.sleep(2.0)
+        return 0
+    elif scenario == "step_mismatch_descendant":
+        _spawn_descendant("DESCENDANT_SHOULD_NOT_EXIST.txt", 0.5)
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(0.01)
+        emit({"event": "step_update", "step_update": {"conversation_id": "divergent-step-uuid", "step_index": 0, "state": "DONE"}})
+        time.sleep(2.0)
+        return 0
+    elif scenario == "timeout_descendant":
+        _spawn_descendant("DESCENDANT_SHOULD_NOT_EXIST.txt", 1.0)
+        conv_id = conv_id or "conv-timeout-descendant"
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        time.sleep(30.0)
+        return 0
+    elif scenario == "stop_descendant":
+        _spawn_descendant("DESCENDANT_SHOULD_NOT_EXIST.txt", 1.0)
+        conv_id = conv_id or "conv-stop-descendant"
+        emit({"event": "init", "conversation_id": conv_id, "init": {"cwd": os.getcwd()}})
+        for _ in range(300):
+            time.sleep(0.1)
         return 0
 
     else:

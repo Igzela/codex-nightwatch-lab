@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import sys
 
 PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
@@ -250,6 +253,171 @@ class AgyProviderAdapterTests(unittest.TestCase):
                 self.assertTrue(len(spawned_pids) == 1)
                 time.sleep(0.1)
                 self.assertFalse(pid_alive(spawned_pids[0]), "Provider child must be killed and reaped immediately")
+
+    def test_mismatch_aborts_entire_process_group_and_prevents_sentinel(self) -> None:
+        """Prove that AGY initial identity mismatch aborts the entire process group, killing descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test mismatch descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertTrue(len(spawned_pids) == 1, "Expected exactly 1 leader process spawned")
+                leader_pid = spawned_pids[0]
+
+                time.sleep(0.6)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel file MUST NOT exist after mismatch abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by process group abort")
+
+    def test_later_stream_mismatch_aborts_descendants(self) -> None:
+        """Prove that step_update mismatch aborts the entire process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test step mismatch descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "step_mismatch_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(0.6)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after step mismatch abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by process group abort")
+
+    def test_timeout_aborts_descendants(self) -> None:
+        """Prove that watchdog print timeout aborts the entire process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test timeout descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "timeout_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                    timeout=0.15,
+                )
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(1.1)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after timeout abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by timeout abort")
+
+    def test_manual_stop_aborts_descendants(self) -> None:
+        """Prove that manual stop request aborts the entire AGY process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test manual stop descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+            sup = Supervisor(store)
+
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+            turn_done = threading.Event()
+
+            def run_worker() -> None:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stop_descendant"}):
+                    sup._run_turn()
+                    turn_done.set()
+
+            worker = threading.Thread(target=run_worker, daemon=True)
+            worker.start()
+
+            for _ in range(50):
+                if descendant_pid_file.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(descendant_pid_file.exists(), "Descendant PID file was created")
+            desc_pid = int(descendant_pid_file.read_text().strip())
+            self.assertTrue(pid_alive(desc_pid), "Descendant process is running")
+
+            sup.request_stop()
+            worker.join(timeout=5.0)
+            self.assertTrue(turn_done.is_set(), "Turn finished after stop request")
+
+            time.sleep(1.1)
+            self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after manual stop")
+            self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by manual stop")
+
+    def test_unrelated_process_group_survives_killpg(self) -> None:
+        """Prove that killpg on AGY process group does not affect unrelated process groups."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test unrelated survival", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                start_new_session=True,
+            )
+            unrelated_pid = unrelated.pid
+            self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must be alive initially")
+
+            try:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_descendant"}):
+                    result = self.adapter.run_turn(
+                        store,
+                        1,
+                        "resume prompt",
+                        thread_id="EXPECTED-CONV-ID",
+                    )
+                    self.assertEqual(result.error_kind, ErrorKind.STATE)
+
+                self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must SURVIVE AGY process group abort")
+            finally:
+                try:
+                    os.kill(unrelated_pid, signal.SIGKILL)
+                    unrelated.wait(timeout=1.0)
+                except OSError:
+                    pass
 
 
 

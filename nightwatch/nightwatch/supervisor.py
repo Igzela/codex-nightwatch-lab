@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -379,9 +380,11 @@ class Supervisor:
         if self.account_pool is not None and hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
             self.account_pool.run_codex_home = self.store.trusted_codex_home
         self._stop_requested = False
+        self._stop_event = threading.Event()
 
     def request_stop(self) -> None:
         self._stop_requested = True
+        self._stop_event.set()
         try:
             state = self.store.load_state()
         except StateIntegrityError:
@@ -829,7 +832,7 @@ class Supervisor:
                 provider_thread,
                 on_spawn,
                 on_thread,
-                stop_event=None,
+                stop_event=self._stop_event,
             )
         else:
             result = run_codex(self.store, state["generation"], prompt, provider_thread, on_spawn, on_thread)
