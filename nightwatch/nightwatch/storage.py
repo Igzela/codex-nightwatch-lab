@@ -447,6 +447,8 @@ class NightwatchStore:
         policy = {**policy_core, "policy_hash": policy_hash(policy_core)}
         acceptance = {"schema_version": 1, "goal_hash": hashlib.sha256(goal.encode("utf-8")).hexdigest(), "verification_policy_hash": policy["policy_hash"], "required_final_checks": commands, "plan_minimum": {"milestones": 1}, "baseline_repo": str(self.repo), "created_at": timestamp}
         if agy_print_timeout is not None:
+            if provider == "codex":
+                raise StateIntegrityError("Codex provider does not accept agy_print_timeout")
             agy_print_timeout = validate_agy_print_timeout(agy_print_timeout)
         elif provider == "agy":
             agy_print_timeout = "60m"
@@ -527,6 +529,9 @@ class NightwatchStore:
             state = self._read_json_regular(self.state_path)
             if "provider" not in state:
                 state["provider"] = "codex"
+            if state.get("provider") == "agy" and "agy_print_timeout" not in state:
+                state["agy_print_timeout"] = "60m"
+                self._write_json(self.state_path, state)
             validate_state(state)
             if state.get("repo") != str(self.repo) or state.get("repo_id") != self.repo_id:
                 raise StateIntegrityError(

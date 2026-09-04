@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import sys
 
 PRODUCT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PRODUCT))
@@ -25,7 +28,7 @@ from nightwatch.models import (
 )
 from nightwatch.process_identity import pid_alive
 from nightwatch.providers import AgyProviderAdapter, CodexProviderAdapter, get_provider_adapter
-from nightwatch.storage import NightwatchStore
+from nightwatch.storage import NightwatchStore, StateIntegrityError
 from nightwatch.supervisor import Supervisor
 
 
@@ -250,6 +253,171 @@ class AgyProviderAdapterTests(unittest.TestCase):
                 self.assertTrue(len(spawned_pids) == 1)
                 time.sleep(0.1)
                 self.assertFalse(pid_alive(spawned_pids[0]), "Provider child must be killed and reaped immediately")
+
+    def test_mismatch_aborts_entire_process_group_and_prevents_sentinel(self) -> None:
+        """Prove that AGY initial identity mismatch aborts the entire process group, killing descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test mismatch descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertTrue(len(spawned_pids) == 1, "Expected exactly 1 leader process spawned")
+                leader_pid = spawned_pids[0]
+
+                time.sleep(0.6)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel file MUST NOT exist after mismatch abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by process group abort")
+
+    def test_later_stream_mismatch_aborts_descendants(self) -> None:
+        """Prove that step_update mismatch aborts the entire process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test step mismatch descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "step_mismatch_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(0.6)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after step mismatch abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by process group abort")
+
+    def test_timeout_aborts_descendants(self) -> None:
+        """Prove that watchdog print timeout aborts the entire process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test timeout descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "timeout_descendant"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                    timeout=0.15,
+                )
+                self.assertTrue(len(spawned_pids) == 1)
+                leader_pid = spawned_pids[0]
+
+                time.sleep(1.1)
+                self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after timeout abort")
+                self.assertFalse(pid_alive(leader_pid), "AGY leader process must be dead")
+                if descendant_pid_file.exists():
+                    desc_pid = int(descendant_pid_file.read_text().strip())
+                    self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by timeout abort")
+
+    def test_manual_stop_aborts_descendants(self) -> None:
+        """Prove that manual stop request aborts the entire AGY process group and kills descendants."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test manual stop descendant", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+            sup = Supervisor(store)
+
+            sentinel = repo / "DESCENDANT_SHOULD_NOT_EXIST.txt"
+            descendant_pid_file = repo / "descendant.pid"
+            turn_done = threading.Event()
+
+            def run_worker() -> None:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "stop_descendant"}):
+                    sup._run_turn()
+                    turn_done.set()
+
+            worker = threading.Thread(target=run_worker, daemon=True)
+            worker.start()
+
+            for _ in range(50):
+                if descendant_pid_file.exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(descendant_pid_file.exists(), "Descendant PID file was created")
+            desc_pid = int(descendant_pid_file.read_text().strip())
+            self.assertTrue(pid_alive(desc_pid), "Descendant process is running")
+
+            sup.request_stop()
+            worker.join(timeout=5.0)
+            self.assertTrue(turn_done.is_set(), "Turn finished after stop request")
+
+            time.sleep(1.1)
+            self.assertFalse(sentinel.exists(), "Descendant sentinel MUST NOT exist after manual stop")
+            self.assertFalse(pid_alive(desc_pid), "Descendant process must be killed by manual stop")
+
+    def test_unrelated_process_group_survives_killpg(self) -> None:
+        """Prove that killpg on AGY process group does not affect unrelated process groups."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test unrelated survival", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            unrelated = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                start_new_session=True,
+            )
+            unrelated_pid = unrelated.pid
+            self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must be alive initially")
+
+            try:
+                with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_descendant"}):
+                    result = self.adapter.run_turn(
+                        store,
+                        1,
+                        "resume prompt",
+                        thread_id="EXPECTED-CONV-ID",
+                    )
+                    self.assertEqual(result.error_kind, ErrorKind.STATE)
+
+                self.assertTrue(pid_alive(unrelated_pid), "Unrelated process must SURVIVE AGY process group abort")
+            finally:
+                try:
+                    os.kill(unrelated_pid, signal.SIGKILL)
+                    unrelated.wait(timeout=1.0)
+                except OSError:
+                    pass
 
 
 
@@ -479,6 +647,170 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         status_output = out.getvalue()
         self.assertIn("PROVIDER       agy", status_output)
         self.assertIn("PRINT TIMEOUT  2h", status_output)
+
+
+class AgyStateValidationAndMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "repo"
+        _git_init(self.repo)
+        self.store = NightwatchStore(self.repo)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_agy_state_valid_timeout_passes(self) -> None:
+        state = empty_state(
+            run_id="run-valid-timeout",
+            goal="Test valid timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+            agy_print_timeout="30m",
+        )
+        validate_state(state)
+        self.assertEqual(state["agy_print_timeout"], "30m")
+
+    def test_agy_state_malformed_timeout_fails_closed(self) -> None:
+        state = empty_state(
+            run_id="run-malformed-timeout",
+            goal="Test malformed timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        for bad in ["not-a-timeout", "60", "60x", "m60", "", "   "]:
+            state["agy_print_timeout"] = bad
+            with self.assertRaises(ValueError):
+                validate_state(state)
+
+    def test_agy_state_timeout_bool_fails(self) -> None:
+        state = empty_state(
+            run_id="run-bool-timeout",
+            goal="Test bool timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = True
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        state["agy_print_timeout"] = False
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_agy_state_timeout_out_of_range_fails(self) -> None:
+        state = empty_state(
+            run_id="run-range-timeout",
+            goal="Test out-of-range timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = "4s"  # < 5s
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        state["agy_print_timeout"] = "25h"  # > 24h
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_agy_state_missing_or_none_timeout_fails(self) -> None:
+        state = empty_state(
+            run_id="run-missing-timeout",
+            goal="Test missing timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="agy",
+        )
+        state["agy_print_timeout"] = None
+        with self.assertRaises(ValueError):
+            validate_state(state)
+        del state["agy_print_timeout"]
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_codex_state_with_timeout_fails_validate_state(self) -> None:
+        state = empty_state(
+            run_id="run-codex-timeout",
+            goal="Test codex with timeout",
+            repo=str(self.repo),
+            repo_id="repo-123",
+            now="2026-09-04T12:00:00Z",
+            provider="codex",
+        )
+        state["agy_print_timeout"] = "30m"
+        with self.assertRaises(ValueError):
+            validate_state(state)
+
+    def test_legacy_agy_state_missing_timeout_migrates_to_60m(self) -> None:
+        self.store.initialize(
+            "run-legacy-agy",
+            "Test legacy migration",
+            str(self.repo),
+            provider="agy",
+        )
+        # Manually remove agy_print_timeout from disk to simulate pre-0.5.2 AGY state
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertIn("agy_print_timeout", state_data)
+        del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        loaded = self.store.load_state()
+        self.assertEqual(loaded["agy_print_timeout"], "60m")
+
+    def test_legacy_migration_persists_timeout(self) -> None:
+        self.store.initialize(
+            "run-legacy-persist",
+            "Test legacy migration persistence",
+            str(self.repo),
+            provider="agy",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        # Load should trigger migration and persist to disk
+        self.store.load_state()
+
+        persisted = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted.get("agy_print_timeout"), "60m")
+
+    def test_present_malformed_timeout_is_not_migrated(self) -> None:
+        self.store.initialize(
+            "run-malformed-persist",
+            "Test malformed not migrated",
+            str(self.repo),
+            provider="agy",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        state_data["agy_print_timeout"] = "invalid-timeout"
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        with self.assertRaises(StateIntegrityError):
+            self.store.load_state()
+
+        persisted = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted.get("agy_print_timeout"), "invalid-timeout")
+
+    def test_codex_legacy_state_without_timeout_still_loads(self) -> None:
+        self.store.initialize(
+            "run-codex-legacy",
+            "Test codex legacy",
+            str(self.repo),
+            provider="codex",
+        )
+        state_data = json.loads(self.store.state_path.read_text(encoding="utf-8"))
+        if "agy_print_timeout" in state_data:
+            del state_data["agy_print_timeout"]
+        self.store.state_path.write_text(json.dumps(state_data, indent=2), encoding="utf-8")
+
+        loaded = self.store.load_state()
+        self.assertIsNone(loaded.get("agy_print_timeout"))
 
 
 if __name__ == "__main__":

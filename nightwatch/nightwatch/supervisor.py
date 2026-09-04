@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -379,17 +380,30 @@ class Supervisor:
         if self.account_pool is not None and hasattr(self.account_pool, "__dict__") and getattr(self.account_pool, "run_codex_home", None) is None:
             self.account_pool.run_codex_home = self.store.trusted_codex_home
         self._stop_requested = False
+        self._stop_event = threading.Event()
 
     def request_stop(self) -> None:
         self._stop_requested = True
+        self._stop_event.set()
         try:
             state = self.store.load_state()
         except StateIntegrityError:
             return
         active = state.get("active_process")
         if isinstance(active, dict) and process_matches(active):
+            pid = active["pid"]
+            if state.get("provider") == "agy":
+                pgid = active.get("pgid")
+                if isinstance(pgid, int) and pgid == pid and pgid > 1 and pgid != os.getpgrp():
+                    try:
+                        os.killpg(pgid, signal.SIGINT)
+                        return
+                    except ProcessLookupError:
+                        return
+                    except OSError:
+                        pass
             try:
-                os.kill(active["pid"], signal.SIGINT)
+                os.kill(pid, signal.SIGINT)
             except OSError:
                 pass
 
@@ -699,7 +713,30 @@ class Supervisor:
             identity = process_identity(pid)
             if identity is None:
                 raise StateIntegrityError("cannot persist Linux provider process identity")
-            self.store.mutate("provider_started", "Codex child process started", lambda item: {**item, "active_process": {**identity, "action": child_action, "thread_id": item.get("thread_id"), "started_at": now_iso()}, "resume_claim": ({**item["resume_claim"], "phase": "spawned"} if item.get("resume_claim") else None)})
+            extra: dict[str, Any] = {}
+            if state.get("provider") == "agy":
+                try:
+                    p_pgid = os.getpgid(pid)
+                    if p_pgid == pid and p_pgid != os.getpgrp() and p_pgid > 1:
+                        extra["pgid"] = p_pgid
+                except OSError:
+                    pass
+            event_msg = "AGY child process started" if state.get("provider") == "agy" else "Codex child process started"
+            self.store.mutate(
+                "provider_started",
+                event_msg,
+                lambda item: {
+                    **item,
+                    "active_process": {
+                        **identity,
+                        **extra,
+                        "action": child_action,
+                        "thread_id": item.get("thread_id"),
+                        "started_at": now_iso(),
+                    },
+                    "resume_claim": ({**item["resume_claim"], "phase": "spawned"} if item.get("resume_claim") else None),
+                },
+            )
             crash_hook("AFTER_PROVIDER_SPAWN")
 
         def on_thread(candidate: str) -> None:
@@ -795,7 +832,7 @@ class Supervisor:
                 provider_thread,
                 on_spawn,
                 on_thread,
-                stop_event=None,
+                stop_event=self._stop_event,
             )
         else:
             result = run_codex(self.store, state["generation"], prompt, provider_thread, on_spawn, on_thread)

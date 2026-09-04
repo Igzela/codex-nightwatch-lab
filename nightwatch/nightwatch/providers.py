@@ -341,36 +341,54 @@ def agy_model_family(model: str) -> str:
     raise ValueError(f"unknown AGY model family for model {model!r}")
 
 
-def _abort_process(process: subprocess.Popen, grace_seconds: float = 0.15) -> int:
-    """Escalate SIGINT -> SIGTERM -> SIGKILL to immediately terminate and reap child."""
+def _abort_process_group(pgid: int, process: subprocess.Popen, grace_seconds: float = 0.5) -> int:
+    """
+    Escalate SIGINT -> SIGTERM -> SIGKILL across the process group.
+    Safely catches ProcessLookupError / OSError at each stage,
+    polls process termination, and reaps the leader process.
+    """
     if process.poll() is not None:
         return process.returncode
-    try:
-        process.send_signal(signal_module.SIGINT)
-    except OSError:
-        pass
+
+    def _kill_group(sig: int) -> None:
+        try:
+            if pgid > 1 and pgid != os.getpgrp():
+                os.killpg(pgid, sig)
+            else:
+                process.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Step 1: SIGINT
+    _kill_group(signal_module.SIGINT)
     t0 = time.monotonic()
     while time.monotonic() - t0 < grace_seconds:
         if process.poll() is not None:
             return process.returncode
         time.sleep(0.02)
-    try:
-        process.terminate()
-    except OSError:
-        pass
+
+    # Step 2: SIGTERM
+    _kill_group(signal_module.SIGTERM)
     t0 = time.monotonic()
     while time.monotonic() - t0 < grace_seconds:
         if process.poll() is not None:
             return process.returncode
         time.sleep(0.02)
-    try:
-        process.kill()
-    except OSError:
-        pass
+
+    # Step 3: SIGKILL
+    _kill_group(signal_module.SIGKILL)
     try:
         return process.wait(timeout=2.0)
     except (subprocess.TimeoutExpired, OSError):
         return process.poll() or -9
+
+
+def _abort_process(process: subprocess.Popen, grace_seconds: float = 0.5) -> int:
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        pgid = process.pid
+    return _abort_process_group(pgid, process, grace_seconds=grace_seconds)
 
 
 class AgyProviderAdapter(ProviderAdapter):
@@ -486,7 +504,19 @@ class AgyProviderAdapter(ProviderAdapter):
                 text=True,
                 bufsize=1,
                 env=environment,
+                start_new_session=True,
             )
+            leader_pid = process.pid
+            try:
+                pgid = os.getpgid(leader_pid)
+            except OSError:
+                pgid = leader_pid
+            if pgid != leader_pid:
+                _abort_process_group(leader_pid, process)
+                raise RuntimeError(f"AGY process group {pgid} does not match leader pid {leader_pid}")
+            if pgid == os.getpgrp():
+                _abort_process_group(leader_pid, process)
+                raise RuntimeError("AGY process group matches supervisor process group")
         except OSError as exc:
             return ProviderResult(
                 None, None, thread_id, 0, 0,
@@ -495,7 +525,7 @@ class AgyProviderAdapter(ProviderAdapter):
                 run_log=str(run_log),
             )
         if on_spawn:
-            on_spawn(process.pid, action)
+            on_spawn(leader_pid, action)
 
         stderr_queue: queue.Queue[str] = queue.Queue()
         stderr_lines: list[str] = []
@@ -549,12 +579,15 @@ class AgyProviderAdapter(ProviderAdapter):
                 break
             if stop_event and stop_event.is_set() and process.poll() is None:
                 try:
-                    process.send_signal(signal_module.SIGINT)
-                except OSError:
+                    if pgid > 1 and pgid != os.getpgrp():
+                        os.killpg(pgid, signal_module.SIGINT)
+                    else:
+                        process.send_signal(signal_module.SIGINT)
+                except (ProcessLookupError, OSError):
                     pass
             if time.monotonic() - start > watchdog_limit and process.poll() is None:
                 timed_out = True
-                _abort_process(process)
+                _abort_process_group(pgid, process)
                 break
             _drain_stderr()
             if mismatch_detected:
@@ -563,7 +596,7 @@ class AgyProviderAdapter(ProviderAdapter):
                     generation,
                     {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
                 )
-                _abort_process(process)
+                _abort_process_group(pgid, process)
                 if process.stdout is not None:
                     try:
                         stdout_selector.unregister(process.stdout)
@@ -581,7 +614,7 @@ class AgyProviderAdapter(ProviderAdapter):
                         generation,
                         {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
                     )
-                    _abort_process(process)
+                    _abort_process_group(pgid, process)
                     if process.stdout is not None:
                         try:
                             stdout_selector.unregister(process.stdout)
@@ -681,7 +714,7 @@ class AgyProviderAdapter(ProviderAdapter):
                     generation,
                     {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
                 )
-                _abort_process(process)
+                _abort_process_group(pgid, process)
                 if process.stdout is not None:
                     try:
                         stdout_selector.unregister(process.stdout)
@@ -702,7 +735,11 @@ class AgyProviderAdapter(ProviderAdapter):
         except OSError:
             pass
 
-        returncode = process.wait()
+        try:
+            returncode = process.wait(timeout=5.0)
+        except (subprocess.TimeoutExpired, OSError):
+            _abort_process_group(pgid, process)
+            returncode = process.poll() or -9
         stderr_thread.join(timeout=2)
         while not stderr_queue.empty():
             try:
