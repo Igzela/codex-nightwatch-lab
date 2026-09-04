@@ -342,6 +342,10 @@ def validate_state(state: dict[str, Any]) -> None:
     if active is not None:
         if not isinstance(active, dict) or not isinstance(active.get("pid"), int) or not isinstance(active.get("starttime"), str):
             raise ValueError("invalid active_process")
+        pgid_val = active.get("pgid")
+        if pgid_val is not None:
+            if not isinstance(pgid_val, int) or isinstance(pgid_val, bool) or pgid_val <= 1:
+                raise ValueError("invalid active_process pgid")
     runtime_id = state.get("codex_runtime_identity")
     home_id = state.get("codex_home_identity")
     if runtime_id is not None or home_id is not None:
