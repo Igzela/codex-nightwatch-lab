@@ -200,7 +200,7 @@ def redact(value: Any) -> Any:
         return [redact(item) for item in value]
     if isinstance(value, str):
         text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]", value)
-        text = re.sub(r"(?i)\b(?:sk|sess|chatcmpl|ghp|github_pat|xox[baprs])[-_A-Za-z0-9.]{12,}", "[REDACTED]", text)
+        text = re.sub(r"(?i)\b(?:sk[-_]|sess[-_]|chatcmpl[-_]|ghp_|github_pat_|xox[baprs]-)[-_A-Za-z0-9.]{12,}", "[REDACTED]", text)
         text = re.sub(r"(?i)(?:aws_access_key_id|aws_secret_access_key|api[_-]?key|access[_-]?token|authorization|cookie)\s*[=:]\s*\S+", "[REDACTED]", text)
         text = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", text)
         return text[:4000]
