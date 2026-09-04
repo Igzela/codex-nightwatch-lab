@@ -537,8 +537,9 @@ class Supervisor:
                 )
                 return False
         if provider_name == "agy":
-            if not provider.auth_sanity():
-                self._fail_closed("AGY authentication sanity check failed", ErrorKind.AUTH)
+            bin_path = provider._resolve_binary()
+            if not (Path(bin_path).is_file() and os.access(bin_path, os.X_OK)) and not shutil.which(bin_path):
+                self._fail_closed("AGY CLI was not found", ErrorKind.UNKNOWN)
                 return False
         else:
             binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
@@ -566,17 +567,50 @@ class Supervisor:
                 },
             )
             return self._prepare_pool_account(reselect=True) or self.store.load_state()["state"] == State.WAIT_QUOTA.value
-        try:
-            quota = self._get_quota_snapshot()
-            self.store.mutate("quota_sanity_ok", "quota provider returned a validated snapshot", lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source})
-            if (quota.source in {"live_app_server", "fake_file", "AGY_CLI"}) and quota.exhausted_windows():
+        if provider_name == "agy":
+            try:
+                quota = self._get_quota_snapshot()
+            except Exception as exc:
+                self._fail_closed(f"AGY quota authority error: {exc}", ErrorKind.STATE)
+                return False
+            if quota.error:
+                err_low = quota.error.lower()
+                if any(k in err_low for k in ("unauthorized", "authentication", "not authenticated", "login", "401", "403")) or " auth " in f" {err_low} ":
+                    self._fail_closed(f"AGY quota auth check failed: {quota.error}", ErrorKind.AUTH)
+                elif "unknown agy model" in err_low or "unknown model" in err_low:
+                    self._fail_closed(f"AGY configuration error: {quota.error}", ErrorKind.STATE)
+                else:
+                    self._fail_closed(f"AGY quota authority unavailable: {quota.error}", ErrorKind.STATE)
+                return False
+            self.store.mutate(
+                "quota_sanity_ok",
+                "quota provider returned a validated snapshot",
+                lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source},
+            )
+            if quota.exhausted_windows():
                 self._enter_initial_quota_wait(quota)
                 return True
-        except Exception as exc:
-            # A first run can still start: quota may be healthy but its optional
-            # read may be network-blocked. Automatic recovery remains fail closed.
-            self.store.append_event("quota_sanity_unavailable", "quota source unavailable during preflight", {"error": type(exc).__name__})
-        return True
+            return True
+        else:
+            try:
+                quota = self._get_quota_snapshot()
+                self.store.mutate(
+                    "quota_sanity_ok",
+                    "quota provider returned a validated snapshot",
+                    lambda item: {**item, "quota": quota.to_dict(), "quota_source": quota.source},
+                )
+                if (quota.source in {"live_app_server", "fake_file"}) and quota.exhausted_windows():
+                    self._enter_initial_quota_wait(quota)
+                    return True
+            except Exception as exc:
+                # A first run can still start: quota may be healthy but its optional
+                # read may be network-blocked. Automatic recovery remains fail closed.
+                self.store.append_event(
+                    "quota_sanity_unavailable",
+                    "quota source unavailable during preflight",
+                    {"error": type(exc).__name__},
+                )
+            return True
 
     def _auth_sanity(self, binary: str) -> bool:
         if os.environ.get("NIGHTWATCH_SKIP_AUTH_CHECK") == "1":
@@ -1301,7 +1335,8 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
             quota_lines.append(f"- {label}: {window.get('used_percent')}% used; duration={window.get('window_duration_mins')}m; reset={window.get('resets_at')}")
     if not quota_lines:
         quota_lines = ["- (no validated snapshot persisted for this run)"]
-    return "\n".join([
+    provider = state.get("provider", "codex")
+    report_lines = [
         "# Nightwatch report",
         "",
         "## GOAL",
@@ -1311,19 +1346,27 @@ def build_report(store: NightwatchStore, state: dict[str, Any], verification: di
         f"- RUN_ID: {state.get('run_id')}",
         f"- RUNTIME: {state['created_at']} → {state['updated_at']}",
         f"- REPOSITORY: {state.get('repo')}",
+        f"- PROVIDER: {provider}",
         f"- THREAD_ID: {state.get('thread_id') or '(none)' }",
         f"- THREAD_MODE: {'CONTROLLED HANDOFF' if state.get('thread_handoff') else 'EXACT'}",
         f"- RUN_STORE: persistent",
         f"- AUTH_LEASE: {'leased / active' if state.get('account_lease') else 'inactive / scrubbed'}",
         f"- GENERATION: {state.get('generation')}",
-        f"- MODEL: {state.get('model') or '(Codex default)'}",
-        f"- REASONING: {state.get('reasoning_effort') or '(Codex default)'}",
+        f"- MODEL: {state.get('model') or f'({provider.capitalize()} default)'}",
+        f"- REASONING: {state.get('reasoning_effort') or f'({provider.capitalize()} default)'}",
+    ]
+    if provider == "agy":
+        report_lines.append(f"- PRINT TIMEOUT: {state.get('agy_print_timeout') or '60m'}")
+    report_lines.extend([
         f"- QUOTA SOURCE: {state.get('quota_source') or '(none)'}",
         f"- RECOVERIES: {state.get('recoveries', 0)}",
         f"- QUOTA CYCLES: {state.get('quota_cycles', 0)}",
         f"- RECOVERY FAILURES: {state.get('recovery_failures', 0)}",
         f"- FINAL HEAD: {state.get('last_verified_commit') or state.get('last_git_head') or '(unknown)'}",
         "",
+    ])
+    return "\n".join([
+        *report_lines,
         "## QUOTA WINDOWS",
         *quota_lines,
         "",

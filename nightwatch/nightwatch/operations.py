@@ -16,6 +16,7 @@ from .account_broker import AccountBrokerError, AccountRecord, CodexAuthAdapter
 from .models import (
     State,
     TERMINAL_STATES,
+    validate_agy_print_timeout,
     validate_model_name,
     validate_reasoning_effort,
 )
@@ -66,6 +67,7 @@ class RunSpec:
     account_mode: str = "current-only"
     account_selectors: tuple[str, ...] = ()
     provider: str = "codex"
+    agy_print_timeout: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repo", Path(self.repo).expanduser().resolve())
@@ -101,6 +103,10 @@ class RunSpec:
         if prov == "agy" and mode == "AUTO_POOL":
             raise ValueError("AGY provider does not support auto-pool")
         object.__setattr__(self, "provider", prov)
+        if self.agy_print_timeout is not None:
+            object.__setattr__(self, "agy_print_timeout", validate_agy_print_timeout(self.agy_print_timeout))
+        elif prov == "agy":
+            object.__setattr__(self, "agy_print_timeout", "60m")
 
 
 def service_name(service_root: Path) -> str:
@@ -263,6 +269,7 @@ def adopt_run(spec: RunSpec) -> ActionResult:
         account_mode=spec.account_mode,
         account_selectors=spec.account_selectors,
         provider=spec.provider,
+        agy_print_timeout=spec.agy_print_timeout,
     )
     result = start_run(bound, run_in_service=False)
     if not result.ok:
@@ -303,6 +310,12 @@ def queue_steer(store: NightwatchStore, instruction: str) -> ActionResult:
             "Instruction was NOT queued because this Nightwatch run is terminal.\n"
             "Use /resume or start a new supervised run before steering.",
         )
+    provider_name = state.get("provider", "codex")
+    from .providers import get_provider_adapter
+    adapter = get_provider_adapter(provider_name)
+    if not adapter.supports_live_steering():
+        ok, msg = adapter.steer(store.repo, state.get("thread_id") or "", text)
+        return ActionResult(ok, msg)
     thread = state.get("thread_id")
     if not isinstance(thread, str) or not thread:
         return ActionResult(False, "No exact thread has been captured; steering was not sent.")
@@ -394,6 +407,7 @@ def start_run(spec: RunSpec, run_in_service: bool = True) -> ActionResult:
         account_mode=spec.account_mode,
         authorized_accounts=authorized,
         provider=spec.provider,
+        agy_print_timeout=spec.agy_print_timeout,
     )
     if run_in_service:
         try:

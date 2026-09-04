@@ -14,7 +14,7 @@ from typing import Any
 
 from . import __version__
 from .git import GitError, repo_root, snapshot
-from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
+from .models import TERMINAL_STATES, State, plan_progress, validate_agy_print_timeout, validate_model_name, validate_reasoning_effort
 from .operations import (
     atomic_write as _atomic_write,
     backup_marked_install as _backup_marked_install,
@@ -22,6 +22,7 @@ from .operations import (
     install_paths as _install_paths,
     install_user_files as _install_user_files,
     list_models as _model_catalog,
+    queue_steer,
     resume_service,
     service_name as _service_name,
     service_text as _service_text,
@@ -51,6 +52,14 @@ def _reasoning_arg(value: str) -> str:
         return validate_reasoning_effort(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _agy_timeout_arg(value: str) -> str:
+    try:
+        return validate_agy_print_timeout(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
 
 
 def _interval_arg(value: str) -> float:
@@ -87,6 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
+    run.add_argument("--agy-print-timeout", type=_agy_timeout_arg, default=None, help="bounded print-mode timeout for AGY provider (e.g. 60m, 30m, 1h; default 60m)")
     _add_model_options(run)
     _add_account_options(run)
 
@@ -105,9 +115,11 @@ def _parser() -> argparse.ArgumentParser:
     adopt.add_argument("goal", nargs="?", default="Supervise adopted conversation", help="goal description")
     adopt.add_argument("--repo", default=None)
     adopt.add_argument("--provider", choices=["codex", "agy"], default=None, help="model provider CLI (codex, agy)")
+    adopt.add_argument("--agy-print-timeout", type=_agy_timeout_arg, default=None, help="bounded print-mode timeout for AGY provider (default 60m)")
     adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
     _add_model_options(adopt)
     _add_account_options(adopt)
+
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
@@ -120,6 +132,10 @@ def _parser() -> argparse.ArgumentParser:
             cmd.add_argument("--tail", type=int, default=80)
         if name == "resume":
             cmd.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
+
+    steer = sub.add_parser("steer", help="queue an instruction to the active supervised run")
+    steer.add_argument("instruction", help="instruction text to send")
+    steer.add_argument("--repo", default=None)
 
     doctor = sub.add_parser("doctor", help="check Linux, Codex, auth, quota, and local state support")
     doctor.add_argument("--json", action="store_true")
@@ -182,6 +198,10 @@ def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
     child_args = [sys.executable, "-m", "nightwatch.cli", args.command]
     if args.command == "run":
         child_args.append(args.goal)
+        if getattr(args, "provider", None):
+            child_args.extend(["--provider", args.provider])
+        if getattr(args, "agy_print_timeout", None):
+            child_args.extend(["--agy-print-timeout", args.agy_print_timeout])
         if args.thread:
             child_args.extend(["--thread", args.thread])
         if args.model:
@@ -223,6 +243,7 @@ def _run(args: argparse.Namespace) -> int:
             account_mode=args.account_mode,
             account_selectors=tuple(args.accounts),
             provider=provider,
+            agy_print_timeout=getattr(args, "agy_print_timeout", None),
         )
         authorized = resolve_authorized_accounts(run_spec, root)
     except (AccountBrokerError, ValueError) as exc:
@@ -242,6 +263,7 @@ def _run(args: argparse.Namespace) -> int:
         account_mode=args.account_mode.replace("-", "_").upper(),
         authorized_accounts=authorized,
         provider=provider,
+        agy_print_timeout=getattr(args, "agy_print_timeout", None),
     )
     if args.service:
         _install_user_files(root)
@@ -404,8 +426,13 @@ def _render_status(value: dict[str, Any]) -> None:
     print(f"AGENT          {agent['status']}{agent_detail}")
     thread_display = state.get("thread_id") or ("(not captured — first launch deferred)" if state["state"] == State.WAIT_QUOTA.value else "(not captured)")
     print(f"THREAD         {thread_display}")
-    print(f"MODEL          {state.get('model') or '(Codex default)'}")
-    print(f"REASONING      {state.get('reasoning_effort') or '(Codex default)'}")
+    provider = state.get("provider", "codex")
+    print(f"PROVIDER       {provider}")
+    default_label = f"({provider.capitalize()} default)"
+    print(f"MODEL          {state.get('model') or default_label}")
+    print(f"REASONING      {state.get('reasoning_effort') or default_label}")
+    if provider == "agy":
+        print(f"PRINT TIMEOUT  {state.get('agy_print_timeout') or '60m'}")
     print(f"RUN_ID         {state['run_id']}")
     print(f"GENERATION     {state['generation']}")
     print(f"QUOTA CYCLES   {state.get('quota_cycles', 0)}")
@@ -505,6 +532,16 @@ def _stop(args: argparse.Namespace) -> int:
     supervisor.store.transition(State.STOPPED, "manual_stop", "user requested stop; no automatic recovery will continue")
     print("Nightwatch STOPPED; durable state preserved")
     return 0
+
+
+def _steer(args: argparse.Namespace) -> int:
+    store = _store(args.repo)
+    result = queue_steer(store, args.instruction)
+    if result.ok:
+        print(result.message)
+        return 0
+    print(f"nightwatch: {result.message}", file=sys.stderr)
+    return 1
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -647,6 +684,7 @@ def _adopt(args: argparse.Namespace) -> int:
     if store.exists():
         state = store.load_state()
         raise SystemExit(f"nightwatch: a run already exists in {root} (state={state['state']}, thread={state.get('thread_id')})")
+    provider = getattr(args, "provider", None) or os.environ.get("NIGHTWATCH_PROVIDER", "codex")
     try:
         spec = RunSpec(
             root,
@@ -658,6 +696,8 @@ def _adopt(args: argparse.Namespace) -> int:
             service=False,
             account_mode=args.account_mode,
             account_selectors=tuple(args.accounts),
+            provider=provider,
+            agy_print_timeout=getattr(args, "agy_print_timeout", None),
         )
         authorized = resolve_authorized_accounts(spec, root)
     except (AccountBrokerError, ValueError) as exc:
@@ -672,6 +712,8 @@ def _adopt(args: argparse.Namespace) -> int:
         reasoning_effort=args.reasoning_effort,
         account_mode=args.account_mode.replace("-", "_").upper(),
         authorized_accounts=authorized,
+        provider=provider,
+        agy_print_timeout=getattr(args, "agy_print_timeout", None),
     )
     print(f"Nightwatch: adopted thread {args.thread} for repo {root} (run_id={state['run_id']})")
     print("Run `nightwatch resume` to start unattended supervision.")
@@ -811,6 +853,7 @@ def main(argv: list[str] | None = None) -> int:
             "test": _test,
             "watch": _watch,
             "adopt": _adopt,
+            "steer": _steer,
         }[args.command](args)
     except SupervisorAlreadyRunning:
         print("nightwatch: already supervised by another process; state was not changed", file=sys.stderr)

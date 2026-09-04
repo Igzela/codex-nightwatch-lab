@@ -66,6 +66,87 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-terra")
         self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
 
+    def test_inhibit_reexec_preserves_provider_agy(self):
+        args = cli._parser().parse_args(["run", "goal", "--repo", "/repo", "--provider", "agy"])
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.dict(os.environ, {"NIGHTWATCH_INHIBITED": "0"}), patch(
+            "nightwatch.cli.shutil.which", return_value="/usr/bin/systemd-inhibit"
+        ), patch("nightwatch.cli.subprocess.run", return_value=completed), patch(
+            "nightwatch.cli.os.execvpe", side_effect=RuntimeError("captured re-exec")
+        ) as execvpe:
+            with self.assertRaisesRegex(RuntimeError, "captured re-exec"):
+                cli._maybe_inhibit(args, Path("/repo"))
+
+        command = execvpe.call_args.args[1]
+        self.assertIn("--provider", command)
+        self.assertEqual(command[command.index("--provider") + 1], "agy")
+
+    def test_inhibit_reexec_preserves_provider_codex(self):
+        args = cli._parser().parse_args(["run", "goal", "--repo", "/repo", "--provider", "codex"])
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.dict(os.environ, {"NIGHTWATCH_INHIBITED": "0"}), patch(
+            "nightwatch.cli.shutil.which", return_value="/usr/bin/systemd-inhibit"
+        ), patch("nightwatch.cli.subprocess.run", return_value=completed), patch(
+            "nightwatch.cli.os.execvpe", side_effect=RuntimeError("captured re-exec")
+        ) as execvpe:
+            with self.assertRaisesRegex(RuntimeError, "captured re-exec"):
+                cli._maybe_inhibit(args, Path("/repo"))
+
+        command = execvpe.call_args.args[1]
+        self.assertIn("--provider", command)
+        self.assertEqual(command[command.index("--provider") + 1], "codex")
+
+    def test_inhibit_reexec_preserves_agy_model_effort_and_timeout(self):
+        args = cli._parser().parse_args(
+            [
+                "run",
+                "goal",
+                "--repo",
+                "/repo",
+                "--provider",
+                "agy",
+                "--model",
+                "gemini-3.8-flash-high",
+                "--reasoning-effort",
+                "high",
+                "--agy-print-timeout",
+                "45m",
+            ]
+        )
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.dict(os.environ, {"NIGHTWATCH_INHIBITED": "0"}), patch(
+            "nightwatch.cli.shutil.which", return_value="/usr/bin/systemd-inhibit"
+        ), patch("nightwatch.cli.subprocess.run", return_value=completed), patch(
+            "nightwatch.cli.os.execvpe", side_effect=RuntimeError("captured re-exec")
+        ) as execvpe:
+            with self.assertRaisesRegex(RuntimeError, "captured re-exec"):
+                cli._maybe_inhibit(args, Path("/repo"))
+
+        command = execvpe.call_args.args[1]
+        self.assertIn("--provider", command)
+        self.assertEqual(command[command.index("--provider") + 1], "agy")
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "gemini-3.8-flash-high")
+        self.assertIn("--reasoning-effort", command)
+        self.assertEqual(command[command.index("--reasoning-effort") + 1], "high")
+        self.assertIn("--agy-print-timeout", command)
+        self.assertEqual(command[command.index("--agy-print-timeout") + 1], "45m")
+
+    def test_inhibit_reexec_preserves_default_behavior_without_provider(self):
+        args = cli._parser().parse_args(["run", "goal", "--repo", "/repo"])
+        completed = type("Completed", (), {"returncode": 0})()
+        with patch.dict(os.environ, {"NIGHTWATCH_INHIBITED": "0"}), patch(
+            "nightwatch.cli.shutil.which", return_value="/usr/bin/systemd-inhibit"
+        ), patch("nightwatch.cli.subprocess.run", return_value=completed), patch(
+            "nightwatch.cli.os.execvpe", side_effect=RuntimeError("captured re-exec")
+        ) as execvpe:
+            with self.assertRaisesRegex(RuntimeError, "captured re-exec"):
+                cli._maybe_inhibit(args, Path("/repo"))
+
+        command = execvpe.call_args.args[1]
+        self.assertNotIn("--provider", command)
+
+
     def test_model_and_reasoning_selection_are_persisted_and_forwarded(self):
         parsed = cli._parser().parse_args(
             ["run", "goal", "--model", "gpt-5.6-terra", "--reasoning-effort", "high"]

@@ -8,6 +8,11 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import sys
+
+PRODUCT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PRODUCT))
+
 
 from nightwatch.models import (
     ErrorKind,
@@ -18,9 +23,11 @@ from nightwatch.models import (
     empty_state,
     validate_state,
 )
+from nightwatch.process_identity import pid_alive
 from nightwatch.providers import AgyProviderAdapter, CodexProviderAdapter, get_provider_adapter
 from nightwatch.storage import NightwatchStore
 from nightwatch.supervisor import Supervisor
+
 
 FAKE_AGY = Path(__file__).resolve().parents[2] / "test-artifacts" / "fake-agy" / "fake_agy.py"
 
@@ -148,6 +155,62 @@ class AgyProviderAdapterTests(unittest.TestCase):
                 self.assertEqual(result.error_kind, ErrorKind.STATE)
                 self.assertIn("mismatch", result.error_detail.lower())
 
+    def test_mismatch_immediate_abort_prevents_sentinel_side_effect(self) -> None:
+        """Mandatory side-effect boundary test: mismatch on init immediately aborts provider before side effect."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test mismatch sentinel", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "SHOULD_NOT_EXIST_AFTER_MISMATCH.txt"
+            if sentinel.exists():
+                sentinel.unlink()
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_sentinel"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertFalse(sentinel.exists(), "SENTINEL FILE MUST NOT EXIST AFTER MISMATCH ABORT")
+                self.assertTrue(len(spawned_pids) == 1, "Expected exactly 1 spawned process")
+                time.sleep(0.1)
+                self.assertFalse(pid_alive(spawned_pids[0]), "Provider child must be killed and reaped immediately")
+
+    def test_step_mismatch_immediate_abort_prevents_sentinel_side_effect(self) -> None:
+        """Mandatory side-effect boundary test: mismatch on later step immediately aborts provider before side effect."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test step mismatch sentinel", str(repo), provider="agy", thread_id="EXPECTED-CONV-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "SHOULD_NOT_EXIST_AFTER_MISMATCH.txt"
+            if sentinel.exists():
+                sentinel.unlink()
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "step_mismatch_sentinel"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="EXPECTED-CONV-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertIsNone(result.thread_id)
+                self.assertFalse(sentinel.exists(), "SENTINEL FILE MUST NOT EXIST AFTER STEP MISMATCH ABORT")
+                self.assertTrue(len(spawned_pids) == 1)
+                time.sleep(0.1)
+                self.assertFalse(pid_alive(spawned_pids[0]), "Provider child must be killed and reaped immediately")
+
     def test_stderr_conversation_not_found_fails_closed(self) -> None:
         """If stderr reports warning: conversation \"...\" not found, fail closed."""
         with tempfile.TemporaryDirectory() as td:
@@ -161,6 +224,34 @@ class AgyProviderAdapterTests(unittest.TestCase):
                 self.assertEqual(result.error_kind, ErrorKind.STATE)
                 self.assertIn("not found", result.error_detail.lower())
 
+    def test_stderr_not_found_immediate_abort_prevents_sentinel_side_effect(self) -> None:
+        """Mandatory side-effect boundary test: stderr not-found immediately aborts provider before side effect."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            _git_init(repo)
+            store = NightwatchStore(repo)
+            store.initialize("run-1", "test not found sentinel", str(repo), provider="agy", thread_id="NONEXISTENT-ID")
+
+            spawned_pids: list[int] = []
+            sentinel = repo / "SHOULD_NOT_EXIST_AFTER_MISMATCH.txt"
+            if sentinel.exists():
+                sentinel.unlink()
+
+            with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "not_found_sentinel"}):
+                result = self.adapter.run_turn(
+                    store,
+                    1,
+                    "resume prompt",
+                    thread_id="NONEXISTENT-ID",
+                    on_spawn=lambda pid, action: spawned_pids.append(pid),
+                )
+                self.assertEqual(result.error_kind, ErrorKind.STATE)
+                self.assertFalse(sentinel.exists(), "SENTINEL FILE MUST NOT EXIST AFTER NOT_FOUND ABORT")
+                self.assertTrue(len(spawned_pids) == 1)
+                time.sleep(0.1)
+                self.assertFalse(pid_alive(spawned_pids[0]), "Provider child must be killed and reaped immediately")
+
+
 
 class AgySupervisorIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -168,6 +259,7 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         self.repo = Path(self.tmp) / "repo"
         _git_init(self.repo)
         self.store = NightwatchStore(self.repo)
+        self.adapter = get_provider_adapter("agy")
 
     def tearDown(self) -> None:
         os.system(f"rm -rf {self.tmp}")
@@ -254,6 +346,139 @@ class AgySupervisorIntegrationTests(unittest.TestCase):
         self.assertEqual(final_state["quota_cycles"], 25)
         self.assertEqual(final_state["recovery_failures"], 0)
         self.assertEqual(final_state["state"], State.RUNNING.value)
+
+    def test_supervisor_mismatch_immediate_abort_e2e(self) -> None:
+        """End-to-end supervisor verification: mismatch aborts immediately, blocks run, and sentinel is absent."""
+        self.store.initialize(
+            "run-mismatch-e2e",
+            "Supervise AGY goal",
+            str(self.repo),
+            provider="agy",
+            thread_id="EXPECTED-CONV-ID",
+            verify_commands=["git diff --check"],
+        )
+
+        sentinel = self.repo / "SHOULD_NOT_EXIST_AFTER_MISMATCH.txt"
+        if sentinel.exists():
+            sentinel.unlink()
+
+        supervisor = Supervisor(self.store)
+        with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "mismatch_sentinel"}):
+            final = supervisor.execute(start=True)
+
+        self.assertEqual(final["state"], State.BLOCKED.value)
+        self.assertFalse(sentinel.exists(), "SENTINEL FILE MUST NOT EXIST AFTER SUPERVISOR MISMATCH ABORT")
+        self.assertIsNone(final.get("active_process"))
+        run_events = self.store.load_run_events(1)
+        mismatch_events = [e for e in run_events if e.get("type") == "thread_id_mismatch"]
+        self.assertTrue(len(mismatch_events) >= 1, "Expected thread_id_mismatch event recorded in run events")
+
+
+
+
+    def test_build_command_default_and_custom_print_timeout(self) -> None:
+        """Verify default 60m print timeout and explicit print timeout in build_command."""
+        args_def, _ = self.adapter.build_command(
+            repo="/tmp/test",
+            thread_id=None,
+            prompt="do task",
+        )
+        self.assertIn("--print-timeout", args_def)
+        self.assertEqual(args_def[args_def.index("--print-timeout") + 1], "60m")
+
+        args_custom, _ = self.adapter.build_command(
+            repo="/tmp/test",
+            thread_id=None,
+            prompt="do task",
+            print_timeout="15m",
+        )
+        self.assertIn("--print-timeout", args_custom)
+        self.assertEqual(args_custom[args_custom.index("--print-timeout") + 1], "15m")
+
+        with self.assertRaises(ValueError):
+            self.adapter.build_command(
+                repo="/tmp/test",
+                thread_id=None,
+                prompt="do task",
+                print_timeout="invalid",
+            )
+
+    def test_run_turn_passes_durable_print_timeout(self) -> None:
+        """Verify run_turn passes the configured durable agy_print_timeout."""
+        self.store.initialize(
+            "run-print-timeout",
+            "Test print timeout",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="45m",
+        )
+        with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "normal"}):
+            result = self.adapter.run_turn(self.store, 1, "test prompt")
+            self.assertIsNone(result.error_kind)
+
+        run_events = self.store.load_run_events(1)
+        cmd_events = [e for e in run_events if e.get("type") == "provider_command"]
+        self.assertTrue(len(cmd_events) >= 1)
+        argv = cmd_events[0].get("argv", [])
+        self.assertIn("--print-timeout", argv)
+        self.assertEqual(argv[argv.index("--print-timeout") + 1], "45m")
+
+    def test_watchdog_timeout_classified_as_crash_not_quota(self) -> None:
+        """Watchdog timeout aborts process and classifies strictly as ErrorKind.CRASH, never quota."""
+        self.store.initialize(
+            "run-watchdog-crash",
+            "Test watchdog crash",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="10s",
+        )
+        with patch.dict(os.environ, {"NIGHTWATCH_AGY_BIN": str(FAKE_AGY), "FAKE_AGY_SCENARIO": "hang"}):
+            result = self.adapter.run_turn(self.store, 1, "hang test", timeout=0.2)
+
+        self.assertEqual(result.error_kind, ErrorKind.CRASH)
+        self.assertFalse(result.aborted)
+        self.assertIsNotNone(result.error_detail)
+        self.assertIn("timed out", result.error_detail.lower())
+
+        run_events = self.store.load_run_events(1)
+        timeout_events = [e for e in run_events if e.get("type") == "agy_watchdog_timeout"]
+        self.assertTrue(len(timeout_events) >= 1)
+
+    def test_status_and_report_include_print_timeout(self) -> None:
+        """Verify build_report and _render_status include PROVIDER and PRINT TIMEOUT for AGY."""
+        from io import StringIO
+        from unittest.mock import patch as mock_patch
+        from nightwatch.supervisor import build_report
+        from nightwatch.cli import _render_status
+
+        self.store.initialize(
+            "run-report-status",
+            "Test status display",
+            str(self.repo),
+            provider="agy",
+            agy_print_timeout="2h",
+        )
+        state = self.store.load_state()
+
+        # Check build_report
+        report = build_report(self.store, state)
+        self.assertIn("- PROVIDER: agy", report)
+        self.assertIn("- PRINT TIMEOUT: 2h", report)
+
+        from nightwatch.models import plan_progress
+
+        plan = self.store.load_plan()
+        out = StringIO()
+        with mock_patch("sys.stdout", out):
+            _render_status({
+                "state": state,
+                "plan": plan,
+                "progress": plan_progress(plan),
+                "agent": {"status": "IDLE", "pid": None, "action": None, "supervisor_pid": None},
+            })
+        status_output = out.getvalue()
+        self.assertIn("PROVIDER       agy", status_output)
+        self.assertIn("PRINT TIMEOUT  2h", status_output)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ from .models import (
     ProviderResult,
     QuotaSnapshot,
     QuotaWindow,
+    parse_agy_duration_seconds,
+    validate_agy_print_timeout,
     validate_model_name,
     validate_reasoning_effort,
 )
@@ -64,6 +66,7 @@ class ProviderAdapter(ABC):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         """Construct execution argv and action ('start' or 'resume')."""
 
@@ -116,6 +119,14 @@ class ProviderAdapter(ABC):
         """Whether provider supports multi-account pool rotation."""
 
     @abstractmethod
+    def supports_live_steering(self) -> bool:
+        """Whether provider supports live mid-turn or between-turn instruction queueing."""
+
+    @abstractmethod
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        """Deliver or reject live instruction steering for this provider."""
+
+    @abstractmethod
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         """Find running provider processes associated with repository."""
 
@@ -142,6 +153,7 @@ class CodexProviderAdapter(ProviderAdapter):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         from .codex import build_command as _codex_build_command
         return _codex_build_command(repo, thread_id, prompt, model, reasoning_effort)
@@ -214,6 +226,28 @@ class CodexProviderAdapter(ProviderAdapter):
 
     def supports_auto_pool(self) -> bool:
         return True
+
+    def supports_live_steering(self) -> bool:
+        return True
+
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        binary = os.environ.get("NIGHTWATCH_CODEX_BIN", "codex")
+        try:
+            result = subprocess.run(
+                [binary, "queue", "--thread", thread_id, "--message", instruction],
+                cwd=repo,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "Codex queue transport was unavailable; no instruction was recorded as delivered."
+        if result.returncode != 0:
+            return False, "Codex did not accept the queued instruction; inspect the exact thread state."
+        return True, f"Instruction queued to exact thread {thread_id}."
 
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         if not sys_platform_linux():
@@ -307,7 +341,40 @@ def agy_model_family(model: str) -> str:
     raise ValueError(f"unknown AGY model family for model {model!r}")
 
 
+def _abort_process(process: subprocess.Popen, grace_seconds: float = 0.15) -> int:
+    """Escalate SIGINT -> SIGTERM -> SIGKILL to immediately terminate and reap child."""
+    if process.poll() is not None:
+        return process.returncode
+    try:
+        process.send_signal(signal_module.SIGINT)
+    except OSError:
+        pass
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        if process.poll() is not None:
+            return process.returncode
+        time.sleep(0.02)
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < grace_seconds:
+        if process.poll() is not None:
+            return process.returncode
+        time.sleep(0.02)
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        return process.wait(timeout=2.0)
+    except (subprocess.TimeoutExpired, OSError):
+        return process.poll() or -9
+
+
 class AgyProviderAdapter(ProviderAdapter):
+
     """Adapter for Google Antigravity (AGY) CLI provider."""
 
     DEFAULT_AGY_MODELS = [
@@ -350,6 +417,8 @@ class AgyProviderAdapter(ProviderAdapter):
         prompt: str,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        print_timeout: str | None = None,
+        **kwargs: Any,
     ) -> tuple[list[str], str]:
         # OWNER_APPROVED_UNATTENDED_AGY_PERMISSION_POLICY:
         # The repository owner has explicitly approved Nightwatch's unattended AGY policy of
@@ -361,6 +430,9 @@ class AgyProviderAdapter(ProviderAdapter):
             "--output-format",
             "stream-json",
         ]
+        timeout_val = print_timeout or "60m"
+        validate_agy_print_timeout(timeout_val)
+        args.extend(["--print-timeout", timeout_val])
         if model:
             args.extend(["--model", self.validate_model(model)])
         if reasoning_effort:
@@ -387,13 +459,17 @@ class AgyProviderAdapter(ProviderAdapter):
         **kwargs: Any,
     ) -> ProviderResult:
         state = store.load_state()
+        timeout_str = state.get("agy_print_timeout") or "60m"
         args, action = self.build_command(
             store.repo,
             thread_id,
             prompt,
             model=state.get("model"),
             reasoning_effort=state.get("reasoning_effort"),
+            print_timeout=timeout_str,
         )
+        budget_seconds = float(parse_agy_duration_seconds(timeout_str))
+        watchdog_limit = timeout if timeout is not None else (budget_seconds + 30.0)
         run_log = store.runs_path / f"generation-{generation}.stderr.log"
         store.runs_path.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Redact prompt from recorded command
@@ -422,6 +498,7 @@ class AgyProviderAdapter(ProviderAdapter):
             on_spawn(process.pid, action)
 
         stderr_queue: queue.Queue[str] = queue.Queue()
+        stderr_lines: list[str] = []
 
         def read_stderr() -> None:
             if process.stderr is None:
@@ -438,16 +515,34 @@ class AgyProviderAdapter(ProviderAdapter):
         seen_hashes: set[str] = set()
         found_thread = thread_id
         conversation_not_found = False
+        mismatch_detected = False
+        mismatch_expected: str | None = None
+        mismatch_observed: str | None = None
         has_init = False
         init_conv_id: str | None = None
         has_result_event = False
         last_result_event: dict[str, Any] | None = None
         result_status: str | None = None
+        timed_out = False
 
         stdout_selector = selectors.DefaultSelector()
         stdout_open = process.stdout is not None
         if process.stdout is not None:
             stdout_selector.register(process.stdout, selectors.EVENT_READ)
+
+        def _drain_stderr() -> None:
+            nonlocal conversation_not_found, mismatch_detected, mismatch_expected, mismatch_observed
+            while not stderr_queue.empty():
+                try:
+                    s_line = stderr_queue.get_nowait()
+                    stderr_lines.append(s_line)
+                    if thread_id and f'conversation "{thread_id.lower()}" not found' in s_line.lower():
+                        conversation_not_found = True
+                        mismatch_detected = True
+                        mismatch_expected = thread_id
+                        mismatch_observed = "(conversation not found in stderr)"
+                except queue.Empty:
+                    break
 
         while stdout_open:
             if process.poll() is not None and not stdout_open:
@@ -457,13 +552,43 @@ class AgyProviderAdapter(ProviderAdapter):
                     process.send_signal(signal_module.SIGINT)
                 except OSError:
                     pass
-            if timeout is not None and time.monotonic() - start > timeout and process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
+            if time.monotonic() - start > watchdog_limit and process.poll() is None:
+                timed_out = True
+                _abort_process(process)
+                break
+            _drain_stderr()
+            if mismatch_detected:
+                found_thread = "__MISMATCH__"
+                store.write_run_event(
+                    generation,
+                    {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                )
+                _abort_process(process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
+
             ready = stdout_selector.select(0.1)
             if not ready:
+                _drain_stderr()
+                if mismatch_detected:
+                    found_thread = "__MISMATCH__"
+                    store.write_run_event(
+                        generation,
+                        {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                    )
+                    _abort_process(process)
+                    if process.stdout is not None:
+                        try:
+                            stdout_selector.unregister(process.stdout)
+                        except (KeyError, OSError):
+                            pass
+                    stdout_open = False
+                    break
                 if process.poll() is not None and process.stdout is not None and process.stdout.closed:
                     stdout_open = False
                 continue
@@ -513,16 +638,20 @@ class AgyProviderAdapter(ProviderAdapter):
                             if on_thread:
                                 on_thread(found_thread)
                         elif found_thread != init_conv_id:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": init_conv_id})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = found_thread
+                            mismatch_observed = init_conv_id
                     elif action == "resume":
                         if thread_id and init_conv_id != thread_id:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": init_conv_id})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = thread_id
+                            mismatch_observed = init_conv_id
                 else:
                     store.write_run_event(generation, {"type": "invalid_init_event", "event": event})
                     if action == "start":
-                        found_thread = "__MISMATCH__"
+                        mismatch_detected = True
+                        mismatch_expected = "(valid conversation ID in init)"
+                        mismatch_observed = "(none)"
 
             # Check ANY event carrying conversation_id against the established identity
             explicit_cid = None
@@ -536,13 +665,30 @@ class AgyProviderAdapter(ProviderAdapter):
             if explicit_cid:
                 if action == "resume" and thread_id:
                     if explicit_cid != thread_id:
-                        store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": thread_id, "observed": explicit_cid})
-                        found_thread = "__MISMATCH__"
+                        mismatch_detected = True
+                        mismatch_expected = thread_id
+                        mismatch_observed = explicit_cid
                 elif action == "start":
                     if found_thread and found_thread != "__MISMATCH__":
                         if explicit_cid != found_thread:
-                            store.write_run_event(generation, {"type": "thread_id_mismatch", "expected": found_thread, "observed": explicit_cid})
-                            found_thread = "__MISMATCH__"
+                            mismatch_detected = True
+                            mismatch_expected = found_thread
+                            mismatch_observed = explicit_cid
+
+            if mismatch_detected:
+                found_thread = "__MISMATCH__"
+                store.write_run_event(
+                    generation,
+                    {"type": "thread_id_mismatch", "expected": mismatch_expected, "observed": mismatch_observed},
+                )
+                _abort_process(process)
+                if process.stdout is not None:
+                    try:
+                        stdout_selector.unregister(process.stdout)
+                    except (KeyError, OSError):
+                        pass
+                stdout_open = False
+                break
 
             if event_type == "result":
                 has_result_event = True
@@ -558,7 +704,12 @@ class AgyProviderAdapter(ProviderAdapter):
 
         returncode = process.wait()
         stderr_thread.join(timeout=2)
-        stderr = "".join(list(stderr_queue.queue))
+        while not stderr_queue.empty():
+            try:
+                stderr_lines.append(stderr_queue.get_nowait())
+            except queue.Empty:
+                break
+        stderr = "".join(stderr_lines)
         try:
             run_log.write_text(redact(stderr), encoding="utf-8")
             os.chmod(run_log, 0o600)
@@ -580,14 +731,19 @@ class AgyProviderAdapter(ProviderAdapter):
         except OSError:
             pass
 
-        if thread_id and f"conversation \"{thread_id.lower()}\" not found" in stderr.lower():
+        if not conversation_not_found and thread_id and f"conversation \"{thread_id.lower()}\" not found" in stderr.lower():
             conversation_not_found = True
             found_thread = "__MISMATCH__"
 
         if found_thread == "__MISMATCH__":
             kind = ErrorKind.STATE
-            detail = f"AGY conversation mismatch: expected exact thread {thread_id}" if not conversation_not_found else f"AGY conversation {thread_id} not found"
+            detail = (
+                f"AGY conversation {thread_id} not found"
+                if conversation_not_found
+                else f"AGY conversation mismatch: expected exact thread {mismatch_expected or thread_id}"
+            )
             return ProviderResult(returncode, signal_name, None, len(events), malformed, event_types, kind, detail, run_log=str(run_log))
+
 
         # Classify failures with strict precedence: Quota/Auth > Start missing init > Result status / Crash
         kind: ErrorKind | None = None
@@ -623,7 +779,14 @@ class AgyProviderAdapter(ProviderAdapter):
             or result_status != "SUCCESS"
         )
 
-        if failed_turn and is_quota:
+        if timed_out:
+            kind = ErrorKind.CRASH
+            detail = f"AGY print-mode turn timed out after {watchdog_limit:.1f}s watchdog"
+            store.write_run_event(
+                generation,
+                {"type": "agy_watchdog_timeout", "watchdog_limit": watchdog_limit, "print_timeout": timeout_str},
+            )
+        elif failed_turn and is_quota:
             try:
                 snap = self.probe_quota(store, store.repo, model=selected_model)
                 windows = snap.windows()
@@ -699,12 +862,12 @@ class AgyProviderAdapter(ProviderAdapter):
             res = subprocess.run(
                 [bin_path, "--output-format", "stream-json", "-p", "/usage"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=15,
                 check=False,
             )
-            return res.returncode == 0
+            return res.returncode == 0 and any("command_result" in line for line in res.stdout.splitlines())
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -732,7 +895,7 @@ class AgyProviderAdapter(ProviderAdapter):
             res = subprocess.run(
                 [binary, "--output-format", "stream-json", "-p", "/usage"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=15,
                 check=False,
@@ -740,7 +903,12 @@ class AgyProviderAdapter(ProviderAdapter):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY quota probe timed out or failed: {type(exc).__name__}")
         if res.returncode != 0:
-            return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage command failed with code {res.returncode}")
+            err_msg = (res.stderr or res.stdout or "").strip()
+            err_msg_lower = err_msg.lower()
+            if any(k in err_msg_lower for k in ("unauthorized", "authentication", "not authenticated", "login", "401", "403")) or " auth " in f" {err_msg_lower} ":
+                return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage authentication failure: {err_msg}")
+            return QuotaSnapshot("AGY_CLI", read_at, error=f"AGY /usage command failed with code {res.returncode}: {err_msg}")
+
 
         parsed_data = None
         for line in res.stdout.splitlines():
@@ -849,6 +1017,12 @@ class AgyProviderAdapter(ProviderAdapter):
 
     def supports_auto_pool(self) -> bool:
         return False
+
+    def supports_live_steering(self) -> bool:
+        return False
+
+    def steer(self, repo: str | Path, thread_id: str, instruction: str) -> tuple[bool, str]:
+        return False, "AGY live steering is not supported by the current upstream CLI; no instruction was sent."
 
     def find_active_processes(self, repo: str | Path, exclude_pid: int | None = None) -> list[dict[str, Any]]:
         if not sys_platform_linux():
