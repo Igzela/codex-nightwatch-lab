@@ -67,6 +67,35 @@ def validate_reasoning_effort(value: str) -> str:
     return value
 
 
+_AGY_PRINT_TIMEOUT = re.compile(r"^([1-9][0-9]*)(s|m|h)$")
+
+
+def validate_agy_print_timeout(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("agy_print_timeout must be a string")
+    m = _AGY_PRINT_TIMEOUT.fullmatch(value.strip())
+    if not m:
+        raise ValueError(f"invalid agy_print_timeout: {value!r}; must match [1-9][0-9]*(s|m|h)")
+    count = int(m.group(1))
+    unit = m.group(2)
+    seconds = count if unit == "s" else count * 60 if unit == "m" else count * 3600
+    if seconds < 5:
+        raise ValueError(f"agy_print_timeout too short: {value!r} ({seconds}s < 5s)")
+    if seconds > 86400:
+        raise ValueError(f"agy_print_timeout too long: {value!r} ({seconds}s > 24h)")
+    return value.strip()
+
+
+def parse_agy_duration_seconds(value: str) -> float:
+    valid = validate_agy_print_timeout(value)
+    m = _AGY_PRINT_TIMEOUT.fullmatch(valid)
+    assert m is not None
+    count = int(m.group(1))
+    unit = m.group(2)
+    return float(count if unit == "s" else count * 60 if unit == "m" else count * 3600)
+
+
+
 class State(StrEnum):
     NEW = "NEW"
     PREFLIGHT = "PREFLIGHT"

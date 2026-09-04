@@ -14,7 +14,7 @@ from typing import Any
 
 from . import __version__
 from .git import GitError, repo_root, snapshot
-from .models import TERMINAL_STATES, State, plan_progress, validate_model_name, validate_reasoning_effort
+from .models import TERMINAL_STATES, State, plan_progress, validate_agy_print_timeout, validate_model_name, validate_reasoning_effort
 from .operations import (
     atomic_write as _atomic_write,
     backup_marked_install as _backup_marked_install,
@@ -53,6 +53,14 @@ def _reasoning_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _agy_timeout_arg(value: str) -> str:
+    try:
+        return validate_agy_print_timeout(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+
 def _interval_arg(value: str) -> float:
     try:
         interval = float(value)
@@ -87,6 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--no-inhibit", action="store_true", help="do not wrap the foreground supervisor in systemd-inhibit")
     run.add_argument("--service", action="store_true", help="persist the new goal, then start the repo-bound user systemd service")
     run.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted final verification command; frozen before Codex starts (repeatable)")
+    run.add_argument("--agy-print-timeout", type=_agy_timeout_arg, default=None, help="bounded print-mode timeout for AGY provider (e.g. 60m, 30m, 1h; default 60m)")
     _add_model_options(run)
     _add_account_options(run)
 
@@ -105,9 +114,11 @@ def _parser() -> argparse.ArgumentParser:
     adopt.add_argument("goal", nargs="?", default="Supervise adopted conversation", help="goal description")
     adopt.add_argument("--repo", default=None)
     adopt.add_argument("--provider", choices=["codex", "agy"], default=None, help="model provider CLI (codex, agy)")
+    adopt.add_argument("--agy-print-timeout", type=_agy_timeout_arg, default=None, help="bounded print-mode timeout for AGY provider (default 60m)")
     adopt.add_argument("--verify", action="append", default=[], metavar="COMMAND", help="trusted verification commands")
     _add_model_options(adopt)
     _add_account_options(adopt)
+
 
     for name, help_text in (("status", "show current durable status"), ("log", "show human-readable supervisor log"), ("report", "write/show a durable report"), ("stop", "stop automatic work and preserve state"), ("resume", "resume the existing exact-thread goal")):
         cmd = sub.add_parser(name, help=help_text)
@@ -182,6 +193,10 @@ def _maybe_inhibit(args: argparse.Namespace, root: Path) -> None:
     child_args = [sys.executable, "-m", "nightwatch.cli", args.command]
     if args.command == "run":
         child_args.append(args.goal)
+        if getattr(args, "provider", None):
+            child_args.extend(["--provider", args.provider])
+        if getattr(args, "agy_print_timeout", None):
+            child_args.extend(["--agy-print-timeout", args.agy_print_timeout])
         if args.thread:
             child_args.extend(["--thread", args.thread])
         if args.model:
