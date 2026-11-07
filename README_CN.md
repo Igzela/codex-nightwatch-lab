@@ -98,9 +98,24 @@ systemd-inhibit: available
 
 ---
 
+## 浏览器控制台
+
+不带参数运行 `nightwatch` 会在 http://127.0.0.1:8765 提供页面并打开浏览器。`nightwatch web` 打开同一个本地控制台。
+
+```bash
+nightwatch
+nightwatch web
+nightwatch web --host 127.0.0.1 --port 8765 --no-browser
+nightwatch ui
+```
+
+页面列出各个运行。可以在页面上用冻结的验证命令启动一个目标，然后停止、恢复和 steer 该运行。服务只监听回环地址（`127.0.0.1`）。`nightwatch ui` 仍是终端界面。真正完成目标仍需要 Codex 或 AGY。
+
+---
+
 ## 📖 核心使用模式
 
-### 交互式 TUI（推荐）
+### 交互式 TUI
 
 在终端里不带子命令运行 Nightwatch：
 

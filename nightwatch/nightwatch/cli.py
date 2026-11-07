@@ -149,6 +149,11 @@ def _parser() -> argparse.ArgumentParser:
     ui = sub.add_parser("ui", help="open the interactive multi-thread terminal control plane")
     ui.add_argument("--repo", default=None)
 
+    web = sub.add_parser("web", help="open the local browser control plane")
+    web.add_argument("--host", default="127.0.0.1", help="loopback address to bind")
+    web.add_argument("--port", type=int, default=8765, help="port to bind")
+    web.add_argument("--no-browser", action="store_true", help="do not open a browser")
+
     install = sub.add_parser("install", help="install a user-local launcher")
     install.add_argument("--service", action="store_true", help="also install a marked user-level systemd unit")
     install.add_argument("--repo", default=None, help="Git repository to bind when installing the user service")
@@ -655,6 +660,15 @@ def _ui(args: argparse.Namespace) -> int:
     return _launch_tui(args.repo)
 
 
+def _web(args: argparse.Namespace) -> int:
+    from .web import serve
+
+    code = serve(host=args.host, port=args.port, open_browser=not args.no_browser)
+    if code:
+        return code
+    return 0
+
+
 def _test(args: argparse.Namespace) -> int:
     if args.test_name == "app-server":
         try:
@@ -832,7 +846,12 @@ def main(argv: list[str] | None = None) -> int:
     effective = list(sys.argv[1:] if argv is None else argv)
     if not effective:
         if sys.stdin.isatty() and sys.stdout.isatty():
-            return _launch_tui()
+            from .web import serve
+
+            code = serve(open_browser=True)
+            if code:
+                return code
+            return 0
         _parser().print_help()
         return 2
     args = _parser().parse_args(effective)
@@ -848,6 +867,7 @@ def main(argv: list[str] | None = None) -> int:
             "doctor": _doctor,
             "models": _models,
             "ui": _ui,
+            "web": _web,
             "install": _install,
             "uninstall": _uninstall,
             "test": _test,

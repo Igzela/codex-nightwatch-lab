@@ -98,9 +98,24 @@ systemd-inhibit: available
 
 ---
 
+## Web control plane
+
+`nightwatch` with no arguments serves http://127.0.0.1:8765 and opens a browser. `nightwatch web` opens the same local control plane.
+
+```bash
+nightwatch
+nightwatch web
+nightwatch web --host 127.0.0.1 --port 8765 --no-browser
+nightwatch ui
+```
+
+The page lists runs. It starts a goal with frozen verify commands, and it can stop, resume, and steer a run. The server listens on loopback only (`127.0.0.1`). `nightwatch ui` remains the terminal UI. Codex or AGY is still required to actually finish a goal.
+
+---
+
 ## 📖 Usage Modes
 
-### Interactive TUI (Recommended)
+### Interactive TUI
 
 Run Nightwatch without a subcommand inside a terminal:
 

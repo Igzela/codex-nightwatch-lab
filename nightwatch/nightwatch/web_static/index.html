@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<title>Nightwatch</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14171c;
+    --text: #e7e1d6;
+    --muted: #b7b0a4;
+    --amber: #e0a45a;
+    --ok: #7dcea0;
+    --fail: #e07a6b;
+    --warn: #e0a45a;
+    --line: #2c333c;
+    --inset: #1b2027;
+    --well: #101318;
+    --serif: Georgia, "Iowan Old Style", Palatino, "Palatino Linotype", serif;
+    --sans: ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  h1, h2, h3, .goal, #detail-goal {
+    font-family: var(--serif);
+    font-weight: 500;
+  }
+
+  h1, h2, h3, p { margin: 0; }
+
+  button, input, textarea, select { font: inherit; color: inherit; }
+
+  button { cursor: pointer; }
+
+  button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+  :focus-visible {
+    outline: 2px solid var(--amber);
+    outline-offset: 2px;
+  }
+
+  ::selection { background: var(--amber); color: #1a140c; }
+
+  ::placeholder { color: #8a8378; }
+
+  .topbar {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .topbar-inner {
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 32px 36px 22px;
+  }
+
+  .wordmark {
+    display: inline-block;
+    font-size: 40px;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    border-bottom: 2px solid var(--amber);
+    padding-bottom: 4px;
+  }
+
+  .tagline {
+    margin-top: 14px;
+    max-width: 46rem;
+    color: var(--text);
+  }
+
+  .shell {
+    max-width: 1440px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: minmax(300px, 390px) minmax(0, 1fr);
+    align-items: stretch;
+    min-height: calc(100vh - 128px);
+  }
+
+  .side {
+    border-right: 1px solid var(--line);
+    padding: 32px 32px 56px;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+  }
+
+  .main {
+    min-width: 0;
+    padding: 32px 36px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 36px;
+  }
+
+  h2 {
+    font-size: 26px;
+    line-height: 1.2;
+    margin-bottom: 16px;
+  }
+
+  h3 {
+    font-size: 20px;
+    line-height: 1.3;
+    margin: 22px 0 10px;
+  }
+
+  .summary {
+    font-family: var(--serif);
+    font-size: 18px;
+    line-height: 1.4;
+    margin-bottom: 8px;
+  }
+
+  .summary-ok { color: var(--ok); }
+  .summary-warn { color: var(--warn); }
+  .summary-fail { color: var(--fail); }
+
+  .checks, .milestones, .run-errors {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .check {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .check-row, .run-top, .milestone {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: baseline;
+  }
+
+  .check-label { font-size: 15px; }
+
+  .check-detail {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .level, .state {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+  }
+
+  .state::before {
+    content: "";
+    display: inline-block;
+    width: 0.55em;
+    height: 0.55em;
+    margin-right: 0.45em;
+    border-radius: 50%;
+    background: currentColor;
+    transform: translateY(-0.05em);
+  }
+
+  .level-ok, .state-DONE, .state-verified { color: var(--ok); }
+  .level-warn, .state-warn,
+  .state-RUNNING, .state-PREFLIGHT, .state-VERIFYING, .state-RECOVERING,
+  .state-WAIT_QUOTA, .state-RETRY_BACKOFF, .state-working { color: var(--amber); }
+  .level-fail, .state-FAILED, .state-BLOCKED, .state-blocked { color: var(--fail); }
+  .level-unknown, .state-NEW, .state-STOPPED, .state-pending,
+  .state-AWAITING_ACCEPTANCE, .state-OTHER { color: var(--muted); }
+  .state-implemented { color: #c5d4c2; }
+
+  .field { margin-bottom: 16px; }
+
+  label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 14px;
+    color: #c9c1b6;
+  }
+
+  input, textarea, select {
+    width: 100%;
+    background: var(--inset);
+    border: 1px solid #3c4450;
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+
+  textarea { resize: vertical; min-height: 88px; }
+
+  #goal { min-height: 112px; }
+
+  .hint {
+    color: var(--muted);
+    font-size: 14px;
+    margin-top: 8px;
+  }
+
+  .error {
+    color: var(--fail);
+    font-size: 14px;
+    margin-top: 8px;
+    overflow-wrap: anywhere;
+  }
+
+  .error:empty, .hint:empty, #action-message:empty { display: none; }
+
+  button.primary, button.danger, button.quiet {
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-weight: 600;
+  }
+
+  button.primary {
+    background: var(--amber);
+    color: #1a140c;
+    border: 1px solid var(--amber);
+  }
+
+  button.primary:hover:not(:disabled) { background: #e8b56e; }
+
+  button.danger {
+    background: transparent;
+    color: var(--fail);
+    border: 1px solid #8d4e46;
+  }
+
+  button.danger:hover:not(:disabled) { background: rgba(224, 122, 107, 0.12); }
+
+  button.quiet {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid #4a5360;
+  }
+
+  button.quiet:hover:not(:disabled) { border-color: var(--amber); }
+
+  #create-btn { margin-top: 4px; }
+
+  #run-list {
+    max-height: min(480px, 52vh);
+    overflow: auto;
+    padding-right: 4px;
+  }
+
+  button.run {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    padding: 16px 8px 16px 12px;
+    font-weight: 400;
+  }
+
+  button.run:hover { background: #1a1f26; }
+
+  button.run.is-selected {
+    background: #1b2027;
+    box-shadow: inset 3px 0 0 var(--amber);
+  }
+
+  .run-top, .goal, .repo, .thread { display: block; }
+
+  .run-top { display: flex; }
+
+  .goal {
+    font-size: 20px;
+    line-height: 1.35;
+    margin: 6px 0 4px;
+    overflow-wrap: anywhere;
+  }
+
+  .repo, .thread, #detail-repo, #detail-thread, #detail-meta, #detail-quota {
+    color: var(--muted);
+    font-size: 14px;
+    overflow-wrap: anywhere;
+  }
+
+  .thread { margin-top: 8px; }
+
+  .pct { color: var(--amber); font-variant-numeric: tabular-nums; }
+
+  .bar-track {
+    display: block;
+    width: 100%;
+    height: 8px;
+    margin-top: 10px;
+    background: #2a313a;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .bar-fill {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--amber);
+  }
+
+  .fill-DONE, .fill-verified { background: var(--ok); }
+  .fill-FAILED, .fill-BLOCKED { background: var(--fail); }
+  .fill-STOPPED, .fill-NEW { background: #8d877c; }
+
+  #detail-progress { margin-top: 8px; color: var(--muted); font-size: 14px; }
+
+  .milestone {
+    justify-content: flex-start;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .ms-title { overflow-wrap: anywhere; }
+
+  .milestone.empty {
+    color: var(--muted);
+    border-bottom: 0;
+  }
+
+  #log-tail {
+    margin: 0;
+    padding: 14px 16px;
+    background: var(--well);
+    color: var(--text);
+    border-radius: 6px;
+    max-height: 320px;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 12px;
+  }
+
+  .run-errors { margin-top: 12px; }
+
+  .run-errors li { color: var(--fail); margin-top: 4px; overflow-wrap: anywhere; }
+
+  #detail-placeholder { color: var(--muted); }
+
+  .kicker {
+    margin: 0 0 8px;
+    color: var(--amber);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+  }
+
+  .steer-field { margin-top: 18px; }
+
+  [hidden] { display: none !important; }
+
+  .noscript {
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 12px 36px 0;
+    color: var(--fail);
+  }
+
+  @media (max-width: 800px) {
+    .topbar-inner { padding: 24px 16px 18px; }
+    .wordmark { font-size: 32px; }
+    .shell { grid-template-columns: 1fr; min-height: 0; }
+    .side {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+      padding: 22px 16px 28px;
+      gap: 32px;
+    }
+    .main { padding: 22px 16px 40px; gap: 28px; }
+    .noscript { padding-left: 16px; padding-right: 16px; }
+    #run-list { max-height: none; }
+    .actions { flex-direction: column; }
+    #create-btn, .actions button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <h1 class="wordmark">Nightwatch</h1>
+    <p class="tagline" id="tagline">监管编码代理。完成只认验证命令，不认模型自己说完成。</p>
+  </div>
+</header>
+<noscript class="noscript">需要启用 JavaScript 才能使用这个页面。</noscript>
+<div class="shell">
+  <aside class="side">
+    <section id="doctor" aria-labelledby="doctor-heading">
+      <h2 id="doctor-heading">环境</h2>
+      <p id="doctor-summary" class="summary"></p>
+      <ul id="doctor-checks" class="checks"></ul>
+    </section>
+    <section aria-labelledby="create-heading">
+      <h2 id="create-heading">新任务</h2>
+      <form id="create-form" autocomplete="off">
+        <div class="field">
+          <label for="repo">仓库路径</label>
+          <input id="repo" name="repo" type="text" placeholder="/path/to/repo" spellcheck="false" autocapitalize="off">
+        </div>
+        <div class="field">
+          <label for="goal">目标</label>
+          <textarea id="goal" name="goal" placeholder="用一句话写下要完成的事"></textarea>
+        </div>
+        <div class="field">
+          <label for="verify">验证命令</label>
+          <textarea id="verify" name="verify" placeholder="pytest -q" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label for="provider">提供方</label>
+          <select id="provider" name="provider">
+            <option value="codex" selected>codex</option>
+            <option value="agy">agy</option>
+          </select>
+        </div>
+        <p id="create-error" class="error" role="alert"></p>
+        <button type="submit" class="primary" id="create-btn">开始监管</button>
+      </form>
+    </section>
+  </aside>
+  <main class="main">
+    <section aria-labelledby="runs-heading">
+      <h2 id="runs-heading">任务</h2>
+      <ul id="run-errors" class="run-errors" hidden></ul>
+      <p id="run-empty" hidden>还没有监管任务。写下目标和验证命令，Nightwatch 会在后台盯着。</p>
+      <div id="run-list"></div>
+    </section>
+    <p id="detail-placeholder" hidden>选择一个任务，查看里程碑、日志，并发送指令。</p>
+    <section id="detail" hidden aria-labelledby="detail-goal">
+      <p class="kicker">任务详情</p>
+      <p id="detail-state" class="state"></p>
+      <h2 id="detail-goal"></h2>
+      <p id="detail-repo"></p>
+      <p id="detail-thread"></p>
+      <p id="detail-meta"></p>
+      <div class="bar-track" id="detail-track"><div class="bar-fill" id="detail-fill"></div></div>
+      <p id="detail-progress"></p>
+      <p id="detail-quota" hidden></p>
+      <h3>里程碑</h3>
+      <ul id="milestones" class="milestones"></ul>
+      <h3 id="last-error-heading" hidden>最近的错误</h3>
+      <p id="last-error" class="error" hidden></p>
+      <h3>日志</h3>
+      <pre id="log-tail" tabindex="0"></pre>
+      <form id="steer-form">
+        <div class="field steer-field">
+          <label for="steer">指令</label>
+          <textarea id="steer" name="instruction" placeholder="补充约束，或指出下一步"></textarea>
+        </div>
+        <p id="action-message" role="alert"></p>
+        <div class="actions">
+          <button type="submit" class="primary" id="steer-btn">发送指令</button>
+          <button type="button" class="danger" id="stop-btn">停止</button>
+          <button type="button" class="quiet" id="resume-btn" hidden>继续</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</div>
+<script>
+"use strict";
+
+var LABELS = {
+  codex: "代理程序",
+  auth: "登录",
+  quota: "配额",
+  systemd: "休眠锁",
+  agy: "AGY"
+};
+
+var FAILURE_PHRASE = {
+  codex: { fail: "代理程序检查失败", warn: "代理程序检查有警告" },
+  auth: { fail: "登录检查失败", warn: "登录检查有警告" },
+  quota: { fail: "配额检查失败", warn: "配额检查有警告" },
+  systemd: { fail: "休眠锁检查失败", warn: "休眠锁检查有警告" },
+  agy: { fail: "AGY 检查失败", warn: "AGY 检查有警告" }
+};
+
+var doctorSummary = document.getElementById("doctor-summary");
+var doctorList = document.getElementById("doctor-checks");
+var createForm = document.getElementById("create-form");
+var repoInput = document.getElementById("repo");
+var goalInput = document.getElementById("goal");
+var verifyInput = document.getElementById("verify");
+var providerInput = document.getElementById("provider");
+var createError = document.getElementById("create-error");
+var createBtn = document.getElementById("create-btn");
+var runEmpty = document.getElementById("run-empty");
+var runList = document.getElementById("run-list");
+var runErrors = document.getElementById("run-errors");
+var detailPlaceholder = document.getElementById("detail-placeholder");
+var detail = document.getElementById("detail");
+var detailState = document.getElementById("detail-state");
+var detailGoal = document.getElementById("detail-goal");
+var detailRepo = document.getElementById("detail-repo");
+var detailThread = document.getElementById("detail-thread");
+var detailMeta = document.getElementById("detail-meta");
+var detailTrack = document.getElementById("detail-track");
+var detailFill = document.getElementById("detail-fill");
+var detailProgress = document.getElementById("detail-progress");
+var detailQuota = document.getElementById("detail-quota");
+var milestones = document.getElementById("milestones");
+var lastErrorHeading = document.getElementById("last-error-heading");
+var lastError = document.getElementById("last-error");
+var logTail = document.getElementById("log-tail");
+var steerForm = document.getElementById("steer-form");
+var steerInput = document.getElementById("steer");
+var actionMessage = document.getElementById("action-message");
+var steerBtn = document.getElementById("steer-btn");
+var stopBtn = document.getElementById("stop-btn");
+var resumeBtn = document.getElementById("resume-btn");
+
+var currentRuns = [];
+var selectedId = "";
+var loadedFor = "";
+var lastRunSig = "";
+var lastMilestoneHtml = null;
+var listSeq = 0;
+var detailSeq = 0;
+var doctorSeq = 0;
+var ticking = false;
+var tickAgain = false;
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+    return ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    })[ch];
+  });
+}
+
+function isField(target) {
+  return !!(target && target.matches && target.matches("input, textarea, select"));
+}
+
+function editing() {
+  return isField(document.activeElement);
+}
+
+function tokenClass(value) {
+  var token = String(value == null ? "" : value);
+  return /^[A-Za-z0-9_-]+$/.test(token) ? token : "OTHER";
+}
+
+function clampPercent(value) {
+  var n = typeof value === "number" ? value : Number(value);
+  if (!isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return Math.round(n * 100) / 100;
+}
+
+function formatPercent(pct) {
+  if (Math.round(pct) === pct) return String(pct) + "%";
+  return pct.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") + "%";
+}
+
+function basename(repo) {
+  var text = String(repo || "").replace(/\/+$/, "");
+  var idx = text.lastIndexOf("/");
+  if (idx === -1) return text;
+  var base = text.slice(idx + 1);
+  return base || text;
+}
+
+function runKey(run) {
+  if (!run || typeof run !== "object") return "";
+  if (run.id != null && String(run.id) !== "") return String(run.id);
+  if (run.run_id != null && String(run.run_id) !== "") return String(run.run_id);
+  return "";
+}
+
+function resolveKey(runId) {
+  var want = String(runId);
+  var i;
+  for (i = 0; i < currentRuns.length; i += 1) {
+    var run = currentRuns[i];
+    if (String(run.id) === want || String(run.run_id) === want) return runKey(run);
+  }
+  return want;
+}
+
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setActionMessage(text, isError) {
+  actionMessage.textContent = text || "";
+  actionMessage.className = text ? (isError ? "error" : "hint") : "";
+}
+
+function asCount(value) {
+  if (value == null || value === "") return null;
+  var n = Number(value);
+  return isFinite(n) ? n : null;
+}
+
+function progressValue(run, name) {
+  var progress = run.progress;
+  if (progress && typeof progress === "object" && progress[name] != null) return progress[name];
+  return run[name];
+}
+
+function formatTime(value) {
+  if (value == null || value === "") return "";
+  var date = new Date(value);
+  if (isNaN(date.getTime())) return String(value);
+  try {
+    return new Intl.DateTimeFormat("zh-CN", {
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(date);
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function asText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return "";
+  }
+}
+
+function verifyLines(value) {
+  return String(value || "").split(/\r?\n/).map(function (line) {
+    return line.trim();
+  }).filter(function (line) {
+    return line.length > 0;
+  });
+}
+
+function translatedSummary(checks) {
+  var problems = [];
+  var i;
+  for (i = 0; i < checks.length; i += 1) {
+    var level = checks[i] && checks[i].level;
+    if (level === "fail" || level === "warn") problems.push(checks[i]);
+  }
+  if (!problems.length) return null;
+  var phrases = [];
+  for (i = 0; i < problems.length; i += 1) {
+    var table = FAILURE_PHRASE[problems[i].id];
+    var phrase = table && table[problems[i].level];
+    if (!phrase) return null;
+    phrases.push(phrase);
+  }
+  return phrases.join("；");
+}
+
+function summaryTone(data, checks) {
+  var worst = "unknown";
+  function consider(level) {
+    if (level === "fail") worst = "fail";
+    else if (level === "warn" && worst !== "fail") worst = "warn";
+    else if (level === "ok" && worst === "unknown") worst = "ok";
+  }
+  var i;
+  for (i = 0; i < checks.length; i += 1) consider(checks[i] && checks[i].level);
+  consider(data && data.status);
+  return worst;
+}
+
+function renderDoctor(data) {
+  var checks = Array.isArray(data.checks) ? data.checks.filter(function (item) {
+    return item && typeof item === "object";
+  }) : [];
+  var translated = translatedSummary(checks);
+  var text = translated != null ? translated : (typeof data.summary === "string" ? data.summary : (data.summary == null ? "" : String(data.summary)));
+  setText(doctorSummary, text);
+  doctorSummary.className = "summary summary-" + summaryTone(data, checks);
+  var html = checks.map(function (check) {
+    var id = check.id == null ? "" : String(check.id);
+    var label = Object.prototype.hasOwnProperty.call(LABELS, id) ? LABELS[id] : (check.title ? String(check.title) : (id || "检查"));
+    var level = check.level == null ? "" : String(check.level);
+    var levelCls = level === "ok" || level === "warn" || level === "fail" ? level : "unknown";
+    var detailHtml = check.detail ? '<p class="check-detail">' + escapeHtml(check.detail) + "</p>" : "";
+    return '<li class="check" data-check="' + escapeHtml(id) + '">' +
+      '<div class="check-row"><span class="check-label">' + escapeHtml(label) + "</span>" +
+      '<span class="level level-' + levelCls + '">' + escapeHtml(level) + "</span></div>" +
+      detailHtml + "</li>";
+  }).join("");
+  if (doctorList.innerHTML !== html) doctorList.innerHTML = html;
+}
+
+function formatQuota(quota) {
+  if (quota == null || quota === "") return "";
+  if (typeof quota === "string") return quota;
+  if (typeof quota !== "object") return String(quota);
+  var windows = [];
+  if (quota.primary || quota.secondary) {
+    if (quota.primary) windows.push(quota.primary);
+    if (quota.secondary) windows.push(quota.secondary);
+  } else if (Array.isArray(quota.windows)) {
+    windows = quota.windows;
+  }
+  var parts = [];
+  var i;
+  for (i = 0; i < windows.length; i += 1) {
+    var window = windows[i];
+    if (!window || typeof window !== "object") continue;
+    var name = window.name ? String(window.name) : "";
+    if (name && window.used_percent != null) parts.push(name + " " + window.used_percent + "%");
+    else if (name) parts.push(name);
+  }
+  if (quota.error) parts.push(String(quota.error));
+  if (!parts.length && quota.status) parts.push(String(quota.status));
+  return parts.join(" · ");
+}
+
+function buildRun(run) {
+  var key = runKey(run);
+  var button = document.createElement("button");
+  button.type = "button";
+  button.className = "run" + (key === selectedId ? " is-selected" : "");
+  button.dataset.id = key;
+  if (key === selectedId) button.setAttribute("aria-current", "true");
+  var state = run.state == null ? "" : String(run.state);
+  var percent = clampPercent(run.verified_percent);
+  var top = document.createElement("span");
+  top.className = "run-top";
+  var stateEl = document.createElement("span");
+  stateEl.className = "state state-" + tokenClass(state);
+  stateEl.textContent = state;
+  var pct = document.createElement("span");
+  pct.className = "pct";
+  pct.textContent = formatPercent(percent);
+  top.appendChild(stateEl);
+  top.appendChild(pct);
+  var goal = document.createElement("span");
+  goal.className = "goal";
+  goal.textContent = run.goal == null ? "" : String(run.goal);
+  var repo = document.createElement("span");
+  repo.className = "repo";
+  repo.textContent = basename(run.repo);
+  if (run.repo) repo.title = String(run.repo);
+  var track = document.createElement("div");
+  track.className = "bar-track";
+  var fill = document.createElement("div");
+  fill.className = "bar-fill fill-" + tokenClass(state);
+  fill.style.width = percent + "%";
+  track.appendChild(fill);
+  var thread = document.createElement("span");
+  thread.className = "thread";
+  thread.textContent = run.thread_id ? String(run.thread_id) : "尚未建立线程";
+  button.appendChild(top);
+  button.appendChild(goal);
+  button.appendChild(repo);
+  button.appendChild(track);
+  button.appendChild(thread);
+  return button;
+}
+
+function syncPlaceholder() {
+  var open = selectedId !== "";
+  detail.hidden = !open;
+  detailPlaceholder.hidden = open || currentRuns.length === 0;
+}
+
+function renderRunErrors(errors) {
+  runErrors.replaceChildren();
+  if (!Array.isArray(errors) || !errors.length) {
+    runErrors.hidden = true;
+    return;
+  }
+  var shown = 0;
+  var i;
+  for (i = 0; i < errors.length; i += 1) {
+    var text = asText(errors[i]);
+    if (!text) continue;
+    var li = document.createElement("li");
+    li.textContent = text;
+    runErrors.appendChild(li);
+    shown += 1;
+  }
+  runErrors.hidden = shown === 0;
+}
+
+function renderRuns(runs) {
+  var sig = JSON.stringify(runs.map(function (run) {
+    return {
+      k: runKey(run),
+      state: run.state == null ? null : run.state,
+      goal: run.goal == null ? null : run.goal,
+      repo: run.repo == null ? null : run.repo,
+      verified_percent: run.verified_percent == null ? null : run.verified_percent,
+      thread_id: run.thread_id == null ? null : run.thread_id,
+      on: runKey(run) === selectedId
+    };
+  }));
+  runEmpty.hidden = runs.length !== 0;
+  if (sig !== lastRunSig) {
+    lastRunSig = sig;
+    var frag = document.createDocumentFragment();
+    var i;
+    for (i = 0; i < runs.length; i += 1) frag.appendChild(buildRun(runs[i]));
+    runList.replaceChildren(frag);
+  }
+  syncPlaceholder();
+}
+
+function renderMilestones(items) {
+  var list = Array.isArray(items) ? items : [];
+  var html;
+  if (!list.length) {
+    html = '<li class="milestone empty">还没有里程碑。</li>';
+  } else {
+    html = list.map(function (item) {
+      var status = item && item.status != null ? String(item.status) : "";
+      var title = item && item.title != null ? String(item.title) : "";
+      var id = item && item.id != null ? String(item.id) : "";
+      return '<li class="milestone"><span class="state state-' + tokenClass(status) + '">' +
+        escapeHtml(status) + '</span><span class="ms-title">' + escapeHtml(title || id) + "</span></li>";
+    }).join("");
+  }
+  if (html !== lastMilestoneHtml) {
+    lastMilestoneHtml = html;
+    milestones.innerHTML = html;
+  }
+}
+
+function renderLastError(value) {
+  var text = asText(value);
+  var show = text.trim().length > 0;
+  lastError.hidden = !show;
+  lastErrorHeading.hidden = !show;
+  if (show) setText(lastError, text);
+}
+
+function renderLog(lines) {
+  var text = "还没有日志。";
+  if (Array.isArray(lines) && lines.length) {
+    text = lines.map(function (line) {
+      return line == null ? "" : String(line);
+    }).join("\n");
+  }
+  setText(logTail, text);
+}
+
+function isTerminal(run) {
+  if (run && typeof run.terminal === "boolean") return run.terminal;
+  var key = runKey(run);
+  var i;
+  for (i = 0; i < currentRuns.length; i += 1) {
+    var item = currentRuns[i];
+    if ((key && runKey(item) === key) || runKey(item) === selectedId) {
+      return item.terminal === true;
+    }
+  }
+  return false;
+}
+
+function metaLine(run) {
+  var bits = [];
+  if (run.provider) bits.push("提供方 " + run.provider);
+  if (run.model) bits.push("模型 " + run.model);
+  var when = formatTime(run.updated_at);
+  if (when) bits.push(when);
+  return bits.join(" · ");
+}
+
+function progressLabel(run, pct) {
+  var verified = asCount(progressValue(run, "verified_count"));
+  var total = asCount(progressValue(run, "total_count"));
+  var pctText = formatPercent(pct);
+  if (verified != null && total != null) return "已验证 " + verified + "/" + total + " · " + pctText;
+  return "已验证 " + pctText;
+}
+
+function renderDetail(run) {
+  var state = run.state == null ? "" : String(run.state);
+  setText(detailState, state);
+  detailState.className = "state state-" + tokenClass(state);
+  setText(detailGoal, run.goal == null ? "" : String(run.goal));
+  var repo = run.repo == null ? "" : String(run.repo);
+  setText(detailRepo, repo ? "仓库 " + repo : "");
+  setText(detailThread, "线程 " + (run.thread_id ? String(run.thread_id) : "尚未建立线程"));
+  setText(detailMeta, metaLine(run));
+  var pct = clampPercent(progressValue(run, "verified_percent"));
+  detailFill.className = "bar-fill fill-" + tokenClass(state);
+  detailFill.style.width = pct + "%";
+  detailTrack.setAttribute("aria-label", progressLabel(run, pct));
+  setText(detailProgress, progressLabel(run, pct));
+  var quota = formatQuota(run.quota);
+  detailQuota.hidden = quota === "";
+  setText(detailQuota, quota ? "配额 " + quota : "");
+  renderMilestones(run.milestones);
+  renderLastError(run.last_error);
+  renderLog(run.log_tail);
+  var terminal = isTerminal(run);
+  stopBtn.hidden = terminal;
+  stopBtn.disabled = terminal;
+  var canResume = state === "NEW" || state === "STOPPED" || state === "FAILED" || state === "BLOCKED";
+  resumeBtn.hidden = !canResume;
+  resumeBtn.disabled = !canResume;
+  detail.hidden = false;
+  detailPlaceholder.hidden = true;
+}
+
+function paintDetailPending() {
+  detail.hidden = false;
+  detailPlaceholder.hidden = true;
+  setText(detailState, "");
+  detailState.className = "state";
+  setText(detailGoal, "正在读取任务…");
+  setText(detailRepo, "");
+  setText(detailThread, "");
+  setText(detailMeta, "");
+  detailFill.className = "bar-fill";
+  detailFill.style.width = "0%";
+  setText(detailProgress, "");
+  detailQuota.hidden = true;
+  setText(detailQuota, "");
+  lastMilestoneHtml = null;
+  milestones.replaceChildren();
+  lastError.hidden = true;
+  lastErrorHeading.hidden = true;
+  setText(lastError, "");
+  setText(logTail, "");
+  stopBtn.hidden = true;
+  stopBtn.disabled = true;
+  resumeBtn.hidden = true;
+  resumeBtn.disabled = true;
+}
+
+async function readBody(response) {
+  var text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return { ok: false, message: "响应无法解析" };
+  }
+}
+
+async function getJson(url) {
+  var response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    cache: "no-store"
+  });
+  var data = await readBody(response);
+  return { response: response, data: data };
+}
+
+async function postJson(url, body) {
+  var response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  var data = await readBody(response);
+  return { response: response, data: data };
+}
+
+async function loadDoctor() {
+  var seq = ++doctorSeq;
+  try {
+    var result = await getJson("/api/doctor");
+    if (seq !== doctorSeq) return;
+    if (!result.response.ok || !result.data || typeof result.data !== "object" || Array.isArray(result.data)) {
+      setText(doctorSummary, (result.data && result.data.message) || "环境检查没有返回");
+      doctorSummary.className = "summary summary-fail";
+      return;
+    }
+    renderDoctor(result.data);
+  } catch (err) {
+    if (seq !== doctorSeq) return;
+    setText(doctorSummary, "环境检查没有返回");
+    doctorSummary.className = "summary summary-fail";
+  }
+}
+
+async function loadRuns() {
+  var seq = ++listSeq;
+  try {
+    var result = await getJson("/api/runs");
+    if (seq !== listSeq) return;
+    if (!result.response.ok || !result.data || !Array.isArray(result.data.runs)) {
+      renderRunErrors([(result.data && result.data.message) || "无法读取任务列表"]);
+      return;
+    }
+    currentRuns = result.data.runs;
+    renderRuns(currentRuns);
+    renderRunErrors(result.data.errors);
+  } catch (err) {
+    if (seq !== listSeq) return;
+    renderRunErrors(["网络错误，请稍后再试"]);
+  }
+}
+
+async function loadDetail(id) {
+  var seq = ++detailSeq;
+  var result;
+  try {
+    result = await getJson("/api/runs/" + encodeURIComponent(id));
+  } catch (err) {
+    if (seq !== detailSeq || selectedId !== id) return;
+    if (loadedFor !== id) {
+      setText(detailGoal, "无法读取任务");
+      setActionMessage("网络错误，请稍后再试", true);
+    }
+    return;
+  }
+  if (seq !== detailSeq || selectedId !== id) return;
+  var data = result.data;
+  if (!result.response.ok || !data || typeof data !== "object" || Array.isArray(data) || (data.ok === false && data.goal == null && data.state == null)) {
+    if (loadedFor !== id) setText(detailGoal, "无法读取任务");
+    setActionMessage((data && data.message) || "无法读取任务", true);
+    return;
+  }
+  loadedFor = id;
+  try {
+    renderDetail(data);
+  } catch (err) {
+    setActionMessage("无法读取任务", true);
+  }
+}
+
+function selectRun(id) {
+  var next = String(id || "");
+  if (!next) return;
+  var changed = next !== selectedId;
+  selectedId = next;
+  if (changed) {
+    steerInput.value = "";
+    setActionMessage("");
+    paintDetailPending();
+  }
+  renderRuns(currentRuns);
+  var selected = runList.querySelector(".run.is-selected");
+  if (selected && selected.scrollIntoView) selected.scrollIntoView({ block: "nearest" });
+  loadDetail(next);
+}
+
+async function submitCreate() {
+  createBtn.disabled = true;
+  setText(createError, "");
+  var payload = {
+    repo: repoInput.value,
+    goal: goalInput.value,
+    verify: verifyLines(verifyInput.value),
+    provider: providerInput.value
+  };
+  try {
+    var result = await postJson("/api/runs", payload);
+    if (result.response.status === 201) {
+      goalInput.value = "";
+      setText(createError, "");
+      await loadDoctor();
+      await loadRuns();
+      if (result.data && result.data.run_id != null && String(result.data.run_id) !== "") {
+        selectRun(resolveKey(String(result.data.run_id)));
+      }
+      return;
+    }
+    setText(createError, result.data && result.data.message ? String(result.data.message) : "无法开始监管");
+  } catch (err) {
+    setText(createError, "网络错误，请稍后再试");
+  } finally {
+    createBtn.disabled = false;
+  }
+}
+
+async function mutate(kind) {
+  if (!selectedId) return;
+  if (kind === "stop" && stopBtn.hidden) return;
+  if (kind === "resume" && resumeBtn.hidden) return;
+  var id = selectedId;
+  var sent = steerInput.value;
+  steerBtn.disabled = true;
+  stopBtn.disabled = true;
+  resumeBtn.disabled = true;
+  try {
+    var result;
+    if (kind === "steer") {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/steer", { instruction: steerInput.value });
+    } else if (kind === "stop") {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/stop", {});
+    } else {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/resume", {});
+    }
+    var ok = !!(result.response.ok && result.data && result.data.ok !== false);
+    if (ok && kind === "steer" && steerInput.value === sent) steerInput.value = "";
+    if (result.data && result.data.message) setActionMessage(String(result.data.message), !ok);
+    else setActionMessage(ok ? "" : "操作失败", !ok);
+    await loadRuns();
+    if (selectedId === id) await loadDetail(id);
+  } catch (err) {
+    setActionMessage("网络错误，请稍后再试", true);
+    try {
+      await loadRuns();
+      if (selectedId === id) await loadDetail(id);
+    } catch (ignore) {
+      /* leave the visible error */
+    }
+  } finally {
+    steerBtn.disabled = false;
+    stopBtn.disabled = stopBtn.hidden;
+    resumeBtn.disabled = resumeBtn.hidden;
+  }
+}
+
+async function tick() {
+  if (editing()) return;
+  if (ticking) {
+    tickAgain = true;
+    return;
+  }
+  ticking = true;
+  try {
+    do {
+      tickAgain = false;
+      if (editing()) break;
+      await loadRuns();
+      if (editing()) break;
+      if (selectedId) await loadDetail(selectedId);
+    } while (tickAgain && !editing());
+  } catch (err) {
+    /* polling must not surface as an uncaught error */
+  } finally {
+    ticking = false;
+  }
+}
+
+createForm.addEventListener("submit", function (event) {
+  event.preventDefault();
+  submitCreate();
+});
+
+steerForm.addEventListener("submit", function (event) {
+  event.preventDefault();
+  mutate("steer");
+});
+
+stopBtn.addEventListener("click", function () { mutate("stop"); });
+resumeBtn.addEventListener("click", function () { mutate("resume"); });
+
+runList.addEventListener("click", function (event) {
+  var button = event.target && event.target.closest ? event.target.closest("button.run") : null;
+  if (!button || !runList.contains(button)) return;
+  if (button.dataset.id) selectRun(button.dataset.id);
+});
+
+document.addEventListener("focusout", function (event) {
+  if (!isField(event.target)) return;
+  window.setTimeout(function () {
+    if (!editing()) tick();
+  }, 0);
+});
+
+async function boot() {
+  try {
+    await loadDoctor();
+    await loadRuns();
+  } catch (err) {
+    /* loaders record their own failure text */
+  }
+  window.setInterval(function () { tick(); }, 2000);
+}
+
+boot();
+</script>
+</body>
+</html>

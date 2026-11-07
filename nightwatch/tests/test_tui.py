@@ -395,14 +395,16 @@ class TuiTests(unittest.TestCase):
             self.assertIn(f"WorkingDirectory={repos[0]}", service_a.read_text())
             self.assertIn(f"WorkingDirectory={repos[1]}", service_b.read_text())
 
-    def test_zero_argument_cli_launches_tui_only_on_a_tty(self):
-        with patch("nightwatch.cli._launch_tui", return_value=0) as launch, patch("nightwatch.cli.sys.stdin.isatty", return_value=True), patch("nightwatch.cli.sys.stdout.isatty", return_value=True):
+    def test_zero_argument_cli_serves_web_only_on_a_tty(self):
+        with patch("nightwatch.web.serve", return_value=0) as serve, patch("nightwatch.cli._launch_tui") as launch, patch("nightwatch.cli.sys.stdin.isatty", return_value=True), patch("nightwatch.cli.sys.stdout.isatty", return_value=True):
             self.assertEqual(cli.main([]), 0)
-        launch.assert_called_once()
+        serve.assert_called_once_with(open_browser=True)
+        launch.assert_not_called()
 
-        with patch("nightwatch.cli._launch_tui") as launch, patch("nightwatch.cli.sys.stdin.isatty", return_value=False), patch("nightwatch.cli.sys.stdout.isatty", return_value=False), patch("nightwatch.cli._parser") as parser:
+        with patch("nightwatch.web.serve") as serve, patch("nightwatch.cli._launch_tui") as launch, patch("nightwatch.cli.sys.stdin.isatty", return_value=False), patch("nightwatch.cli.sys.stdout.isatty", return_value=False), patch("nightwatch.cli._parser") as parser:
             parser.return_value.print_help.return_value = None
             self.assertEqual(cli.main([]), 2)
+        serve.assert_not_called()
         launch.assert_not_called()
         parser.return_value.print_help.assert_called_once()
 
