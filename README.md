@@ -3,12 +3,12 @@
 <div align="center">
 
 **A fail-closed, quota-aware, exact-thread Linux supervisor for OpenAI Codex CLI.**  
-*Zero external dependencies • Direct App Server JSON-RPC • Frozen verification gates • Native systemd integration*
+*TypeScript / Node 22+ • Direct App Server JSON-RPC • Frozen verification gates • Local web control plane*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#installation)
+[![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-brightgreen.svg)](#installation)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#system-requirements)
-[![Tests: 245 Passing](https://img.shields.io/badge/Tests-245%20Passing-success.svg)](#validation)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5%2B-blue.svg)](#installation)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
 
 [**English**](README.md) | [**中文说明**](README_CN.md)
@@ -62,7 +62,7 @@ You give your AI coding agent a complex milestone before going to sleep. You wak
 - 🔒 **Tamper-Proof Trust Boundary**: State lives outside the Git workspace in `~/.local/state/codex-nightwatch/` (0700 permissions). Model-proposed verification scripts are strictly rejected.
 - 🧪 **Frozen Verification Gate**: Goal completion (`DONE`) strictly requires your frozen `--verify` commands (e.g. `pytest`, `cargo test`, `git diff --check`) to exit `0`.
 - 🛡️ **Zero-Interruption Live Watching (`nightwatch watch`)**: Passively monitors existing interactive terminal sessions without collision or interruption. With `--auto-takeover`, seamlessly takes over overnight when quota runs out.
-- 🔋 **Linux-Native Resilience**: Zero external Python packages (standard library only). Built-in `systemd-inhibit` sleep lock and `systemctl --user` daemonization.
+- 🔋 **Linux-Native Resilience**: TypeScript on Node 22+ with a loopback web control plane. Built-in `systemd-inhibit` sleep lock and `systemctl --user` daemonization.
 
 ---
 
@@ -78,7 +78,8 @@ curl -fsSL https://raw.githubusercontent.com/Igzela/codex-nightwatch-lab/master/
 
 ```bash
 git clone https://github.com/Igzela/codex-nightwatch-lab.git ~/.local/share/codex-nightwatch
-~/.local/share/codex-nightwatch/nightwatch/bin/nightwatch install
+cd ~/.local/share/codex-nightwatch && npm install && npm run build
+ln -sfn "$PWD/dist/cli.js" ~/.local/bin/nightwatch
 ```
 
 ### Verify Environment
@@ -98,9 +99,24 @@ systemd-inhibit: available
 
 ---
 
+## Web control plane
+
+`nightwatch` with no arguments serves http://127.0.0.1:8765 and opens a browser. `nightwatch web` opens the same local control plane.
+
+```bash
+nightwatch
+nightwatch web
+nightwatch web --host 127.0.0.1 --port 8765 --no-browser
+nightwatch ui
+```
+
+The page lists runs. It starts a goal with frozen verify commands, and it can stop, resume, and steer a run. The server listens on loopback only (`127.0.0.1`). `nightwatch ui` remains the terminal UI. Codex or AGY is still required to actually finish a goal.
+
+---
+
 ## 📖 Usage Modes
 
-### Interactive TUI (Recommended)
+### Interactive TUI
 
 Run Nightwatch without a subcommand inside a terminal:
 
@@ -290,7 +306,7 @@ The TUI is an adapter over the same durable interfaces. Every operation remains 
 | **Verification Gate** | ❌ Model self-reports | ❌ None | **✅ User-frozen commands only** |
 | **Security Sandbox** | ⚠️ Model can edit tests | ❌ Control inside repo | **✅ External 0700 trusted control plane** |
 | **Process Model** | ❌ Foreground only | ⚠️ PTY injection | **✅ systemd user service + sleep inhibit** |
-| **External Dependencies** | — | Node / pnpm / Tmux | **✅ Zero (Python Standard Library)** |
+| **External Dependencies** | — | Node / pnpm / Tmux | **✅ TypeScript / Node 22+** |
 
 ---
 

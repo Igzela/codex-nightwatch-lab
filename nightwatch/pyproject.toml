@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nightwatch"
-version = "0.5.4"
+version = "0.6.0"
 description = "Linux-first, fail-closed unattended supervisor (Codex, AGY)"
 requires-python = ">=3.11"
 dependencies = []
@@ -13,7 +13,7 @@ dependencies = []
 packages = ["nightwatch"]
 
 [tool.setuptools.package-data]
-nightwatch = ["nightwatch.service"]
+nightwatch = ["nightwatch.service", "web_static/*"]
 
 [project.scripts]
 nightwatch = "nightwatch.cli:main"

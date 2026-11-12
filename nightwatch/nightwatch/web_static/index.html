@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<link rel="icon" href="data:,">
+<title>Nightwatch</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafafa;
+    --text: #1a1a1a;
+    --muted: #737373;
+    --line: #ececec;
+    --fail: #9f2d20;
+    --warn: #8a5a00;
+    --sans: ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+  body { font-family: var(--sans); font-size: 15px; line-height: 1.45; }
+  h1, h2, p { margin: 0; }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; background: none; border: 0; }
+  button:disabled { cursor: default; opacity: 0.4; }
+  :focus-visible { outline: 2px solid #1a1a1a; outline-offset: 2px; }
+  ::placeholder { color: #a3a3a3; }
+  .page { max-width: 36rem; margin: 0 auto; padding: 56px 20px 80px; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: 0; }
+  .status { margin-top: 4px; color: var(--muted); font-size: 13px; }
+  .status-ok { color: var(--muted); }
+  .status-warn { color: var(--warn); }
+  .status-fail, .status-unknown { color: var(--fail); }
+  details { margin-top: 8px; }
+  summary { color: var(--muted); font-size: 13px; cursor: pointer; }
+  .checks, .milestones, .run-errors { list-style: none; margin: 8px 0 0; padding: 0; }
+  .check { padding: 8px 0; border-top: 1px solid var(--line); }
+  .check-row { display: flex; justify-content: space-between; gap: 12px; }
+  .check-label { font-size: 14px; }
+  .check-detail { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .level { font-size: 12px; color: var(--muted); }
+  .level-fail { color: var(--fail); }
+  .level-warn { color: var(--warn); }
+  form.create { margin-top: 28px; display: grid; gap: 8px; }
+  .compose { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+  .subrow { display: grid; grid-template-columns: 1.4fr 1fr auto; gap: 8px; }
+  input, textarea, select {
+    width: 100%;
+    border: 1px solid var(--line);
+    background: #fff;
+    border-radius: 8px;
+    padding: 8px 12px;
+    line-height: 22px;
+  }
+  textarea { resize: none; min-height: 40px; }
+  #goal, #verify, #steer { height: 40px; overflow: auto; }
+  button.primary {
+    background: #1a1a1a;
+    color: #fff;
+    border-radius: 8px;
+    padding: 0 16px;
+    white-space: nowrap;
+  }
+  .error { color: var(--fail); font-size: 13px; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .error:empty, .hint:empty, #action-message:empty { display: none; }
+  .runs { margin-top: 36px; }
+  #run-empty { color: var(--muted); font-size: 14px; }
+  button.run {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 14px 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+  }
+  button.run.is-selected .goal { font-weight: 600; }
+  .goal { display: block; font-size: 15px; line-height: 1.4; overflow-wrap: anywhere; }
+  .meta, #detail-repo, #detail-thread, #detail-meta, #detail-progress, #detail-quota {
+    display: block;
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  #detail { margin-top: 4px; padding: 0 0 8px; }
+  #detail-state, #detail-goal { display: none; }
+  #detail-state:empty, #detail-repo:empty, #detail-thread:empty, #detail-meta:empty, #detail-progress:empty { display: none; }
+  .run-errors li { color: var(--fail); font-size: 13px; padding: 4px 0; }
+  .steer-row { margin-top: 16px; }
+  .state { font-size: 13px; color: var(--muted); }
+  .state-FAILED, .state-BLOCKED, .level-fail { color: var(--fail); }
+  .bar-track, .kicker, #detail-placeholder, #doctor-heading, #runs-heading, #create-heading { display: none; }
+  .milestone { display: flex; gap: 10px; padding: 6px 0; color: var(--text); font-size: 14px; }
+  .milestone .state { min-width: 4.5rem; }
+  #log-tail {
+    margin: 8px 0 0;
+    max-height: 180px;
+    overflow: auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+  .actions { display: flex; gap: 16px; align-items: center; margin-top: 8px; }
+  button.quiet, #stop-btn, #resume-btn { color: var(--muted); padding: 8px 0; }
+  #stop-btn { color: var(--fail); }
+  .noscript { max-width: 36rem; margin: 12px auto 0; padding: 0 20px; color: var(--fail); }
+  [hidden] { display: none !important; }
+  @media (max-width: 640px) {
+    .compose, .subrow { grid-template-columns: 1fr; }
+    button.primary { height: 40px; }
+  }
+</style>
+</head>
+<body>
+<main class="page">
+  <h1>Nightwatch</h1>
+  <p id="doctor-summary" class="status"></p>
+  <details id="doctor-details" hidden>
+    <summary>环境</summary>
+    <ul id="doctor-checks" class="checks"></ul>
+  </details>
+  <form id="create-form" class="create" autocomplete="off">
+    <div class="compose">
+      <textarea id="goal" name="goal" rows="1" placeholder="要完成的事"></textarea>
+      <button type="submit" class="primary" id="create-btn">开始</button>
+    </div>
+    <div class="subrow">
+      <input id="repo" name="repo" type="text" placeholder="仓库路径" spellcheck="false" autocapitalize="off">
+      <textarea id="verify" name="verify" rows="1" placeholder="验证命令" spellcheck="false"></textarea>
+      <select id="provider" name="provider" aria-label="提供方">
+        <option value="codex" selected>codex</option>
+        <option value="agy">agy</option>
+      </select>
+    </div>
+    <p id="create-error" class="error" role="alert"></p>
+  </form>
+  <section class="runs">
+    <ul id="run-errors" class="run-errors" hidden></ul>
+    <p id="run-empty" hidden>还没有任务</p>
+    <div id="run-list"></div>
+    <p id="detail-placeholder" hidden></p>
+    <section id="detail" hidden>
+      <p id="detail-state" class="state"></p>
+      <h2 id="detail-goal"></h2>
+      <p id="detail-repo"></p>
+      <p id="detail-thread"></p>
+      <p id="detail-meta"></p>
+      <p id="detail-progress"></p>
+      <p id="detail-quota" hidden></p>
+      <div class="bar-track" id="detail-track" hidden><div class="bar-fill" id="detail-fill"></div></div>
+      <details id="milestone-block" hidden>
+        <summary>里程碑</summary>
+        <ul id="milestones" class="milestones"></ul>
+      </details>
+      <h3 id="last-error-heading" hidden>错误</h3>
+      <p id="last-error" class="error" hidden></p>
+      <details id="log-block" hidden>
+        <summary>日志</summary>
+        <pre id="log-tail"></pre>
+      </details>
+      <form id="steer-form">
+        <div class="compose steer-row">
+          <textarea id="steer" name="instruction" rows="1" placeholder="补充一句"></textarea>
+          <button type="submit" class="primary" id="steer-btn">发送</button>
+        </div>
+        <p id="action-message" role="alert"></p>
+        <div class="actions">
+          <button type="button" id="stop-btn">停止</button>
+          <button type="button" id="resume-btn" hidden>继续</button>
+        </div>
+      </form>
+    </section>
+  </section>
+</main>
+<noscript class="noscript">需要启用 JavaScript。</noscript>
+
+<script>
+"use strict";
+
+var LABELS = {
+  codex: "代理程序",
+  auth: "登录",
+  quota: "配额",
+  systemd: "休眠锁",
+  agy: "AGY"
+};
+
+var FAILURE_PHRASE = {
+  codex: { fail: "代理程序检查失败", warn: "代理程序检查有警告" },
+  auth: { fail: "登录检查失败", warn: "登录检查有警告" },
+  quota: { fail: "配额检查失败", warn: "配额检查有警告" },
+  systemd: { fail: "休眠锁检查失败", warn: "休眠锁检查有警告" },
+  agy: { fail: "AGY 检查失败", warn: "AGY 检查有警告" }
+};
+
+var doctorSummary = document.getElementById("doctor-summary");
+var doctorDetails = document.getElementById("doctor-details");
+var doctorList = document.getElementById("doctor-checks");
+var createForm = document.getElementById("create-form");
+var repoInput = document.getElementById("repo");
+var goalInput = document.getElementById("goal");
+var verifyInput = document.getElementById("verify");
+var providerInput = document.getElementById("provider");
+var createError = document.getElementById("create-error");
+var createBtn = document.getElementById("create-btn");
+var runEmpty = document.getElementById("run-empty");
+var runList = document.getElementById("run-list");
+var runErrors = document.getElementById("run-errors");
+var detailPlaceholder = document.getElementById("detail-placeholder");
+var detail = document.getElementById("detail");
+var detailState = document.getElementById("detail-state");
+var detailGoal = document.getElementById("detail-goal");
+var detailRepo = document.getElementById("detail-repo");
+var detailThread = document.getElementById("detail-thread");
+var detailMeta = document.getElementById("detail-meta");
+var detailTrack = document.getElementById("detail-track");
+var detailFill = document.getElementById("detail-fill");
+var detailProgress = document.getElementById("detail-progress");
+var detailQuota = document.getElementById("detail-quota");
+var milestoneBlock = document.getElementById("milestone-block");
+var milestones = document.getElementById("milestones");
+var lastErrorHeading = document.getElementById("last-error-heading");
+var lastError = document.getElementById("last-error");
+var logBlock = document.getElementById("log-block");
+var logTail = document.getElementById("log-tail");
+var steerForm = document.getElementById("steer-form");
+var steerInput = document.getElementById("steer");
+var actionMessage = document.getElementById("action-message");
+var steerBtn = document.getElementById("steer-btn");
+var stopBtn = document.getElementById("stop-btn");
+var resumeBtn = document.getElementById("resume-btn");
+
+var currentRuns = [];
+var selectedId = "";
+var loadedFor = "";
+var lastRunSig = "";
+var lastMilestoneHtml = null;
+var listSeq = 0;
+var detailSeq = 0;
+var doctorSeq = 0;
+var ticking = false;
+var tickAgain = false;
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+    return ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;"
+    })[ch];
+  });
+}
+
+function isField(target) {
+  return !!(target && target.matches && target.matches("input, textarea, select"));
+}
+
+function editing() {
+  return isField(document.activeElement);
+}
+
+function tokenClass(value) {
+  var token = String(value == null ? "" : value);
+  return /^[A-Za-z0-9_-]+$/.test(token) ? token : "OTHER";
+}
+
+function clampPercent(value) {
+  var n = typeof value === "number" ? value : Number(value);
+  if (!isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return Math.round(n * 100) / 100;
+}
+
+function formatPercent(pct) {
+  if (Math.round(pct) === pct) return String(pct) + "%";
+  return pct.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") + "%";
+}
+
+function basename(repo) {
+  var text = String(repo || "").replace(/\/+$/, "");
+  var idx = text.lastIndexOf("/");
+  if (idx === -1) return text;
+  var base = text.slice(idx + 1);
+  return base || text;
+}
+
+function runKey(run) {
+  if (!run || typeof run !== "object") return "";
+  if (run.id != null && String(run.id) !== "") return String(run.id);
+  if (run.run_id != null && String(run.run_id) !== "") return String(run.run_id);
+  return "";
+}
+
+function resolveKey(runId) {
+  var want = String(runId);
+  var i;
+  for (i = 0; i < currentRuns.length; i += 1) {
+    var run = currentRuns[i];
+    if (String(run.id) === want || String(run.run_id) === want) return runKey(run);
+  }
+  return want;
+}
+
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function setActionMessage(text, isError) {
+  actionMessage.textContent = text || "";
+  actionMessage.className = text ? (isError ? "error" : "hint") : "";
+}
+
+function asCount(value) {
+  if (value == null || value === "") return null;
+  var n = Number(value);
+  return isFinite(n) ? n : null;
+}
+
+function progressValue(run, name) {
+  var progress = run.progress;
+  if (progress && typeof progress === "object" && progress[name] != null) return progress[name];
+  return run[name];
+}
+
+function formatTime(value) {
+  if (value == null || value === "") return "";
+  var date = new Date(value);
+  if (isNaN(date.getTime())) return String(value);
+  try {
+    return new Intl.DateTimeFormat("zh-CN", {
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(date);
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function asText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return "";
+  }
+}
+
+function verifyLines(value) {
+  return String(value || "").split(/\r?\n/).map(function (line) {
+    return line.trim();
+  }).filter(function (line) {
+    return line.length > 0;
+  });
+}
+
+function translatedSummary(checks) {
+  var problems = [];
+  var i;
+  for (i = 0; i < checks.length; i += 1) {
+    var level = checks[i] && checks[i].level;
+    if (level === "fail" || level === "warn") problems.push(checks[i]);
+  }
+  if (!problems.length) return "环境正常";
+  var phrases = [];
+  for (i = 0; i < problems.length; i += 1) {
+    var table = FAILURE_PHRASE[problems[i].id];
+    var phrase = table && table[problems[i].level];
+    if (!phrase) return null;
+    phrases.push(phrase);
+  }
+  return phrases.join("；");
+}
+
+function summaryTone(data, checks) {
+  var worst = "unknown";
+  function consider(level) {
+    if (level === "fail") worst = "fail";
+    else if (level === "warn" && worst !== "fail") worst = "warn";
+    else if (level === "ok" && worst === "unknown") worst = "ok";
+  }
+  var i;
+  for (i = 0; i < checks.length; i += 1) consider(checks[i] && checks[i].level);
+  consider(data && data.status);
+  return worst;
+}
+
+function renderDoctor(data) {
+  var checks = Array.isArray(data.checks) ? data.checks.filter(function (item) {
+    return item && typeof item === "object";
+  }) : [];
+  var translated = translatedSummary(checks);
+  var text = translated != null ? translated : (typeof data.summary === "string" ? data.summary : (data.summary == null ? "" : String(data.summary)));
+  setText(doctorSummary, text);
+  doctorSummary.className = "status status-" + summaryTone(data, checks);
+  var problems = checks.filter(function (check) {
+    return check.level === "fail" || check.level === "warn";
+  });
+  doctorDetails.hidden = problems.length === 0;
+  var html = problems.map(function (check) {
+    var id = check.id == null ? "" : String(check.id);
+    var label = Object.prototype.hasOwnProperty.call(LABELS, id) ? LABELS[id] : (check.title ? String(check.title) : (id || "检查"));
+    var level = check.level == null ? "" : String(check.level);
+    var levelCls = level === "ok" || level === "warn" || level === "fail" ? level : "unknown";
+    var detailHtml = check.detail ? '<p class="check-detail">' + escapeHtml(check.detail) + "</p>" : "";
+    return '<li class="check" data-check="' + escapeHtml(id) + '">' +
+      '<div class="check-row"><span class="check-label">' + escapeHtml(label) + "</span>" +
+      '<span class="level level-' + levelCls + '">' + escapeHtml(level) + "</span></div>" +
+      detailHtml + "</li>";
+  }).join("");
+  if (doctorList.innerHTML !== html) doctorList.innerHTML = html;
+}
+
+function quotaIsNotable(quota) {
+  if (!quota || typeof quota !== "object") return false;
+  if (quota.error) return true;
+  if (quota.status && quota.status !== "ok") return true;
+  var windows = [];
+  if (quota.primary) windows.push(quota.primary);
+  if (quota.secondary) windows.push(quota.secondary);
+  if (Array.isArray(quota.windows)) windows = windows.concat(quota.windows);
+  var i;
+  for (i = 0; i < windows.length; i += 1) {
+    var used = windows[i] && windows[i].used_percent;
+    if (used != null && Number(used) >= 80) return true;
+  }
+  return false;
+}
+
+function formatQuota(quota) {
+  if (quota == null || quota === "") return "";
+  if (typeof quota === "string") return quota;
+  if (typeof quota !== "object") return String(quota);
+  var windows = [];
+  if (quota.primary || quota.secondary) {
+    if (quota.primary) windows.push(quota.primary);
+    if (quota.secondary) windows.push(quota.secondary);
+  } else if (Array.isArray(quota.windows)) {
+    windows = quota.windows;
+  }
+  var parts = [];
+  var i;
+  for (i = 0; i < windows.length; i += 1) {
+    var window = windows[i];
+    if (!window || typeof window !== "object") continue;
+    var name = window.name ? String(window.name) : "";
+    if (name && window.used_percent != null) parts.push(name + " " + window.used_percent + "%");
+    else if (name) parts.push(name);
+  }
+  if (quota.error) parts.push(String(quota.error));
+  if (!parts.length && quota.status) parts.push(String(quota.status));
+  return parts.join(" · ");
+}
+
+function buildRun(run) {
+  var key = runKey(run);
+  var button = document.createElement("button");
+  button.type = "button";
+  button.className = "run" + (key === selectedId ? " is-selected" : "");
+  button.dataset.id = key;
+  if (key === selectedId) button.setAttribute("aria-current", "true");
+  var goal = document.createElement("span");
+  goal.className = "goal";
+  goal.textContent = run.goal == null ? "" : String(run.goal);
+  var meta = document.createElement("span");
+  meta.className = "meta";
+  var bits = [];
+  var state = run.state == null ? "" : String(run.state);
+  if (state) bits.push(state);
+  var base = basename(run.repo);
+  if (base) bits.push(base);
+  meta.textContent = bits.join(" · ");
+  if (run.repo) button.title = String(run.repo);
+  button.appendChild(goal);
+  button.appendChild(meta);
+  return button;
+}
+
+function syncPlaceholder() {
+  var open = selectedId !== "";
+  detail.hidden = !open;
+  detailPlaceholder.hidden = open || currentRuns.length === 0;
+}
+
+function renderRunErrors(errors) {
+  runErrors.replaceChildren();
+  if (!Array.isArray(errors) || !errors.length) {
+    runErrors.hidden = true;
+    return;
+  }
+  var shown = 0;
+  var i;
+  for (i = 0; i < errors.length; i += 1) {
+    var text = asText(errors[i]);
+    if (!text) continue;
+    var li = document.createElement("li");
+    li.textContent = text;
+    runErrors.appendChild(li);
+    shown += 1;
+  }
+  runErrors.hidden = shown === 0;
+}
+
+function renderRuns(runs) {
+  var sig = JSON.stringify(runs.map(function (run) {
+    return {
+      k: runKey(run),
+      state: run.state == null ? null : run.state,
+      goal: run.goal == null ? null : run.goal,
+      repo: run.repo == null ? null : run.repo,
+      verified_percent: run.verified_percent == null ? null : run.verified_percent,
+      thread_id: run.thread_id == null ? null : run.thread_id,
+      on: runKey(run) === selectedId
+    };
+  }));
+  runEmpty.hidden = runs.length !== 0;
+  if (sig !== lastRunSig) {
+    lastRunSig = sig;
+    var frag = document.createDocumentFragment();
+    var i;
+    for (i = 0; i < runs.length; i += 1) frag.appendChild(buildRun(runs[i]));
+    runList.replaceChildren(frag);
+  }
+  syncPlaceholder();
+}
+
+function renderMilestones(items) {
+  var list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    milestoneBlock.hidden = true;
+    if (lastMilestoneHtml !== "") {
+      lastMilestoneHtml = "";
+      milestones.replaceChildren();
+    }
+    return;
+  }
+  milestoneBlock.hidden = false;
+  var html = list.map(function (item) {
+    var rawStatus = item && item.status != null ? String(item.status) : "";
+    var status = Object.prototype.hasOwnProperty.call(MILESTONE_STATUS, rawStatus) ? MILESTONE_STATUS[rawStatus] : rawStatus;
+    var title = item && item.title != null ? String(item.title) : "";
+    var id = item && item.id != null ? String(item.id) : "";
+    return '<li class="milestone"><span class="state state-' + tokenClass(rawStatus) + '">' +
+      escapeHtml(status) + '</span><span class="ms-title">' + escapeHtml(title || id) + "</span></li>";
+  }).join("");
+  if (html !== lastMilestoneHtml) {
+    lastMilestoneHtml = html;
+    milestones.innerHTML = html;
+  }
+}
+
+function renderLastError(value) {
+  var text = asText(value);
+  var show = text.trim().length > 0;
+  lastError.hidden = !show;
+  lastErrorHeading.hidden = !show;
+  if (show) setText(lastError, text);
+}
+
+function renderLog(lines) {
+  if (!Array.isArray(lines) || !lines.length) {
+    logBlock.hidden = true;
+    setText(logTail, "");
+    return;
+  }
+  logBlock.hidden = false;
+  setText(logTail, lines.map(function (line) {
+    return line == null ? "" : String(line);
+  }).join("\n"));
+}
+
+function isTerminal(run) {
+  if (run && typeof run.terminal === "boolean") return run.terminal;
+  var key = runKey(run);
+  var i;
+  for (i = 0; i < currentRuns.length; i += 1) {
+    var item = currentRuns[i];
+    if ((key && runKey(item) === key) || runKey(item) === selectedId) {
+      return item.terminal === true;
+    }
+  }
+  return false;
+}
+
+var MILESTONE_STATUS = { verified: "已验证", pending: "待验证", failed: "失败", blocked: "受阻" };
+
+function metaLine(run, pct) {
+  var bits = [];
+  if (run.repo) bits.push(String(run.repo));
+  if (run.thread_id) bits.push(String(run.thread_id));
+  var progress = progressLabel(run, pct);
+  if (progress) bits.push(progress);
+  if (run.model) bits.push(String(run.model));
+  var when = formatTime(run.updated_at);
+  if (when) bits.push(when);
+  return bits.join(" · ");
+}
+
+function progressLabel(run, pct) {
+  var verified = asCount(progressValue(run, "verified_count"));
+  var total = asCount(progressValue(run, "total_count"));
+  if (verified != null && total != null && total > 0) return verified + "/" + total;
+  if (pct > 0) return formatPercent(pct);
+  return "";
+}
+
+function renderDetail(run) {
+  var state = run.state == null ? "" : String(run.state);
+  setText(detailState, state);
+  detailState.className = "state state-" + tokenClass(state);
+  setText(detailGoal, run.goal == null ? "" : String(run.goal));
+  setText(detailRepo, "");
+  setText(detailThread, "");
+  var pct = clampPercent(progressValue(run, "verified_percent"));
+  setText(detailMeta, metaLine(run, pct));
+  detailFill.className = "bar-fill fill-" + tokenClass(state);
+  detailFill.style.width = pct + "%";
+  detailTrack.setAttribute("aria-label", progressLabel(run, pct) || state);
+  setText(detailProgress, "");
+  var quota = quotaIsNotable(run.quota) ? formatQuota(run.quota) : "";
+  detailQuota.hidden = quota === "";
+  setText(detailQuota, quota);
+  renderMilestones(run.milestones);
+  renderLastError(run.last_error);
+  renderLog(run.log_tail);
+  var terminal = isTerminal(run);
+  stopBtn.hidden = terminal;
+  stopBtn.disabled = terminal;
+  var canResume = state === "NEW" || state === "STOPPED" || state === "FAILED" || state === "BLOCKED";
+  resumeBtn.hidden = !canResume;
+  resumeBtn.disabled = !canResume;
+  detail.hidden = false;
+  detailPlaceholder.hidden = true;
+}
+
+function paintDetailPending() {
+  detail.hidden = false;
+  detailPlaceholder.hidden = true;
+  setText(detailState, "");
+  detailState.className = "state";
+  setText(detailGoal, "正在读取任务…");
+  setText(detailRepo, "");
+  setText(detailThread, "");
+  setText(detailMeta, "");
+  detailFill.className = "bar-fill";
+  detailFill.style.width = "0%";
+  setText(detailProgress, "");
+  detailQuota.hidden = true;
+  setText(detailQuota, "");
+  lastMilestoneHtml = "";
+  milestoneBlock.hidden = true;
+  milestones.replaceChildren();
+  lastError.hidden = true;
+  lastErrorHeading.hidden = true;
+  setText(lastError, "");
+  logBlock.hidden = true;
+  setText(logTail, "");
+  stopBtn.hidden = true;
+  stopBtn.disabled = true;
+  resumeBtn.hidden = true;
+  resumeBtn.disabled = true;
+}
+
+async function readBody(response) {
+  var text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return { ok: false, message: "响应无法解析" };
+  }
+}
+
+async function getJson(url) {
+  var response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    cache: "no-store"
+  });
+  var data = await readBody(response);
+  return { response: response, data: data };
+}
+
+async function postJson(url, body) {
+  var response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  var data = await readBody(response);
+  return { response: response, data: data };
+}
+
+async function loadDoctor() {
+  var seq = ++doctorSeq;
+  try {
+    var result = await getJson("/api/doctor");
+    if (seq !== doctorSeq) return;
+    if (!result.response.ok || !result.data || typeof result.data !== "object" || Array.isArray(result.data)) {
+      setText(doctorSummary, (result.data && result.data.message) || "环境检查没有返回");
+      doctorSummary.className = "status status-fail";
+      doctorDetails.hidden = true;
+      return;
+    }
+    renderDoctor(result.data);
+  } catch (err) {
+    if (seq !== doctorSeq) return;
+    setText(doctorSummary, "环境检查没有返回");
+    doctorSummary.className = "status status-fail";
+    doctorDetails.hidden = true;
+  }
+}
+
+async function loadRuns() {
+  var seq = ++listSeq;
+  try {
+    var result = await getJson("/api/runs");
+    if (seq !== listSeq) return;
+    if (!result.response.ok || !result.data || !Array.isArray(result.data.runs)) {
+      renderRunErrors([(result.data && result.data.message) || "无法读取任务列表"]);
+      return;
+    }
+    currentRuns = result.data.runs;
+    renderRuns(currentRuns);
+    renderRunErrors(result.data.errors);
+  } catch (err) {
+    if (seq !== listSeq) return;
+    renderRunErrors(["网络错误，请稍后再试"]);
+  }
+}
+
+async function loadDetail(id) {
+  var seq = ++detailSeq;
+  var result;
+  try {
+    result = await getJson("/api/runs/" + encodeURIComponent(id));
+  } catch (err) {
+    if (seq !== detailSeq || selectedId !== id) return;
+    if (loadedFor !== id) {
+      setText(detailGoal, "无法读取任务");
+      setActionMessage("网络错误，请稍后再试", true);
+    }
+    return;
+  }
+  if (seq !== detailSeq || selectedId !== id) return;
+  var data = result.data;
+  if (!result.response.ok || !data || typeof data !== "object" || Array.isArray(data) || (data.ok === false && data.goal == null && data.state == null)) {
+    if (loadedFor !== id) setText(detailGoal, "无法读取任务");
+    setActionMessage((data && data.message) || "无法读取任务", true);
+    return;
+  }
+  loadedFor = id;
+  try {
+    renderDetail(data);
+  } catch (err) {
+    setActionMessage("无法读取任务", true);
+  }
+}
+
+function selectRun(id) {
+  var next = String(id || "");
+  if (!next) return;
+  var changed = next !== selectedId;
+  selectedId = next;
+  if (changed) {
+    steerInput.value = "";
+    setActionMessage("");
+    paintDetailPending();
+  }
+  renderRuns(currentRuns);
+  var selected = runList.querySelector(".run.is-selected");
+  if (selected && selected.scrollIntoView) selected.scrollIntoView({ block: "nearest" });
+  loadDetail(next);
+}
+
+async function submitCreate() {
+  createBtn.disabled = true;
+  setText(createError, "");
+  var payload = {
+    repo: repoInput.value,
+    goal: goalInput.value,
+    verify: verifyLines(verifyInput.value),
+    provider: providerInput.value
+  };
+  try {
+    var result = await postJson("/api/runs", payload);
+    if (result.response.status === 201) {
+      goalInput.value = "";
+      setText(createError, "");
+      await loadDoctor();
+      await loadRuns();
+      if (result.data && result.data.run_id != null && String(result.data.run_id) !== "") {
+        selectRun(resolveKey(String(result.data.run_id)));
+      }
+      return;
+    }
+    setText(createError, result.data && result.data.message ? String(result.data.message) : "无法开始监管");
+  } catch (err) {
+    setText(createError, "网络错误，请稍后再试");
+  } finally {
+    createBtn.disabled = false;
+  }
+}
+
+async function mutate(kind) {
+  if (!selectedId) return;
+  if (kind === "stop" && stopBtn.hidden) return;
+  if (kind === "resume" && resumeBtn.hidden) return;
+  var id = selectedId;
+  var sent = steerInput.value;
+  steerBtn.disabled = true;
+  stopBtn.disabled = true;
+  resumeBtn.disabled = true;
+  try {
+    var result;
+    if (kind === "steer") {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/steer", { instruction: steerInput.value });
+    } else if (kind === "stop") {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/stop", {});
+    } else {
+      result = await postJson("/api/runs/" + encodeURIComponent(id) + "/resume", {});
+    }
+    var ok = !!(result.response.ok && result.data && result.data.ok !== false);
+    if (ok && kind === "steer" && steerInput.value === sent) steerInput.value = "";
+    if (result.data && result.data.message) setActionMessage(String(result.data.message), !ok);
+    else setActionMessage(ok ? "" : "操作失败", !ok);
+    await loadRuns();
+    if (selectedId === id) await loadDetail(id);
+  } catch (err) {
+    setActionMessage("网络错误，请稍后再试", true);
+    try {
+      await loadRuns();
+      if (selectedId === id) await loadDetail(id);
+    } catch (ignore) {
+      /* leave the visible error */
+    }
+  } finally {
+    steerBtn.disabled = false;
+    stopBtn.disabled = stopBtn.hidden;
+    resumeBtn.disabled = resumeBtn.hidden;
+  }
+}
+
+async function tick() {
+  if (editing()) return;
+  if (ticking) {
+    tickAgain = true;
+    return;
+  }
+  ticking = true;
+  try {
+    do {
+      tickAgain = false;
+      if (editing()) break;
+      await loadRuns();
+      if (editing()) break;
+      if (selectedId) await loadDetail(selectedId);
+    } while (tickAgain && !editing());
+  } catch (err) {
+    /* polling must not surface as an uncaught error */
+  } finally {
+    ticking = false;
+  }
+}
+
+createForm.addEventListener("submit", function (event) {
+  event.preventDefault();
+  submitCreate();
+});
+
+steerForm.addEventListener("submit", function (event) {
+  event.preventDefault();
+  mutate("steer");
+});
+
+stopBtn.addEventListener("click", function () { mutate("stop"); });
+resumeBtn.addEventListener("click", function () { mutate("resume"); });
+
+runList.addEventListener("click", function (event) {
+  var button = event.target && event.target.closest ? event.target.closest("button.run") : null;
+  if (!button || !runList.contains(button)) return;
+  if (button.dataset.id) selectRun(button.dataset.id);
+});
+
+document.addEventListener("focusout", function (event) {
+  if (!isField(event.target)) return;
+  window.setTimeout(function () {
+    if (!editing()) tick();
+  }, 0);
+});
+
+async function boot() {
+  try {
+    await loadDoctor();
+    await loadRuns();
+  } catch (err) {
+    /* loaders record their own failure text */
+  }
+  window.setInterval(function () { tick(); }, 2000);
+}
+
+boot();
+</script>
+</body>
+</html>

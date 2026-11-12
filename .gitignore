@@ -11,3 +11,5 @@ dist/
 *.pyc
 refs/*/
 .codegraph/
+node_modules/
+

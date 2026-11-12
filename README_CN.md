@@ -6,7 +6,7 @@
 *零外部依赖 • 直连官方 App Server JSON-RPC • 预冻结验证门禁 • 宿主系统级原生集成*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](#安装指南)
+[![Node.js 22+](https://img.shields.io/badge/Node.js-22%2B-brightgreen.svg)](#安装指南)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#系统要求)
 [![Tests: 245 Passing](https://img.shields.io/badge/Tests-245%20Passing-success.svg)](#测试验证)
 [![Codex: 0.152.1+](https://img.shields.io/badge/OpenAI%20Codex-0.152.1%2B-purple.svg)](https://github.com/openai/codex)
@@ -62,7 +62,7 @@
 - 🔒 **受信任控制面物理隔离**：核心状态与验收规则保存在 Git 工作区之外（`~/.local/state/codex-nightwatch/`，`0700` 权限），模型沙箱只能读写信箱，绝无可能篡改验收规则。
 - 🧪 **冻结真实验收门禁**：任务完成（`DONE`）必须严格通过用户预冻结的 `--verify` 命令（如 `pytest -q`、`cargo test`、`git diff --check`），彻底杜绝模型幻觉。
 - 🛡️ **无侵入伴随监听与自动接管（`nightwatch watch`）**：安全监听终端中正在运行的交互式 Codex 会话，在不打断前台的前提下实时统计 Token 与配额，并在触发上限或终端关闭后自动无缝接管夜间续跑。
-- 🔋 **Linux 原生高可靠**：全项目基于 Python 3 标准库（零第三方 pip 依赖），原生支持 `systemctl --user` 服务化守护与 `systemd-inhibit` 阻塞系统休眠。
+- 🔋 **Linux 原生高可靠**：基于 TypeScript / Node 22+，自带本机浏览器控制台，并支持 `systemctl --user` 服务化守护与 `systemd-inhibit` 阻塞系统休眠。
 
 ---
 
@@ -78,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/Igzela/codex-nightwatch-lab/master/
 
 ```bash
 git clone https://github.com/Igzela/codex-nightwatch-lab.git ~/.local/share/codex-nightwatch
-~/.local/share/codex-nightwatch/nightwatch/bin/nightwatch install
+cd ~/.local/share/codex-nightwatch && npm install && npm run build && ln -sfn "$PWD/dist/cli.js" ~/.local/bin/nightwatch
 ```
 
 ### 环境诊断与校验
@@ -98,9 +98,24 @@ systemd-inhibit: available
 
 ---
 
+## 浏览器控制台
+
+不带参数运行 `nightwatch` 会在 http://127.0.0.1:8765 提供页面并打开浏览器。`nightwatch web` 打开同一个本地控制台。
+
+```bash
+nightwatch
+nightwatch web
+nightwatch web --host 127.0.0.1 --port 8765 --no-browser
+nightwatch ui
+```
+
+页面列出各个运行。可以在页面上用冻结的验证命令启动一个目标，然后停止、恢复和 steer 该运行。服务只监听回环地址（`127.0.0.1`）。`nightwatch ui` 仍是终端界面。真正完成目标仍需要 Codex 或 AGY。
+
+---
+
 ## 📖 核心使用模式
 
-### 交互式 TUI（推荐）
+### 交互式 TUI
 
 在终端里不带子命令运行 Nightwatch：
 
@@ -288,7 +303,7 @@ TUI 只是现有持久化接口之上的显示与操作适配层。所有能力�
 | **验收完成门禁** | ❌ 模型自述假装完成 | ❌ 无验证门禁 | **✅ 用户预冻结命令通过才判定 DONE** |
 | **控制面安全性** | ⚠️ 模型可随意修改测试 | ❌ 状态暴露在仓库内 | **✅ 外部 `~/.local/state/` 独立受信任沙箱** |
 | **进程常驻形态** | ❌ 仅前台，掉线暴毙 | ⚠️ Tmux 输入注入 | **✅ user systemd 服务 + 阻塞系统睡眠** |
-| **第三方依赖** | — | Node / pnpm / Tmux | **✅ 零外部依赖（纯 Python 3 标准库）** |
+| **第三方依赖** | — | Node / pnpm / Tmux | **✅ TypeScript / Node 22+** |
 
 ---
 

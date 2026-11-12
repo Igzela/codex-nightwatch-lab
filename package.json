@@ -1,0 +1,33 @@
+{
+  "name": "nightwatch",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Fail-closed supervisor for Codex and AGY, with a local web control plane.",
+  "bin": {
+    "nightwatch": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && mkdir -p dist/web_static && cp src/web_static/index.html dist/web_static/index.html",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test 'tests/**/*.test.ts'",
+    "nightwatch": "tsx src/cli.ts",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "koffi": "^3.3.7"
+  }
+}
